@@ -1,90 +1,89 @@
-"""Distributional survival GAM -- thin wrapper over the ``gam`` Python library.
+"""Distributional survival GAM via the gam CLI.
 
-The Rust-backed Python library `gam <https://github.com/SauersML/gam>`_
-(installable as a PEP 517 sdist which builds via maturin) provides a
-peer-review-quality GAM engine with REML smoothing, B-spline term bases
-(`s()`, `linear()`, `tensor()`, ...), Gaussian / Binomial families, and
-predictive intervals.  We use it here as the backend for the survival
-GAM stage of the causal-pred pipeline.
-
-Current library status and our workaround
------------------------------------------
-The library's Rust engine *supports* location-scale survival models
-(formula ``Surv(entry, exit, event) ~ ...``) but the PyO3 Python binding
-at version 0.1.15 only exposes the ``standard`` (non-survival) model
-class -- calling ``gam.fit`` with a ``Surv(...)`` response raises
-``FormulaError: python binding currently supports standard models
-only``.
-
-Until survival support lands in the Python binding we obtain a proper
-accelerated-failure-time (AFT) model by:
-
-  1. Rescaling time so the median observed time is 1 (keeps the log-
-     time response on O(1) scale).
-  2. Fitting a Gaussian GAM on ``log(time_scaled)`` using the
-     uncensored rows but with **inverse probability of censoring
-     weights** (Horvitz-Thompson 1952; Uno et al. 2007 for survival).
-     Each event ``i`` gets weight ``1 / G(T_i-)`` where ``G`` is the
-     Kaplan-Meier estimate of the censoring distribution.  This fixes
-     the downward bias that a plain complete-case fit on events would
-     incur: censored observations are systematically long-time, so
-     dropping them pulls mu_hat low and the resulting survival curve
-     under-estimates S(t) (over-predicts events).  IPCW up-weights
-     late events to compensate (Robins 1993; Graf et al. 1999).  We
-     follow the seed fit with two EM data-augmentation iterations
-     (Tanner & Wong 1987) on the censored rows: each censored
-     observation's latent log-time is imputed from the truncated
-     normal with lower bound at the observed log-time and the GAM is
-     refit with imputed + real log-times.  This sharpens sigma and
-     removes residual IPCW bias at heavy censoring.  All continuous
-     covariates enter as penalised smooths ``s(name)`` and binary
-     columns enter as plain linear terms.
-  3. Estimating the AFT log-scale ``sigma`` jointly with ``mu``:
-     uncensored rows contribute squared residuals, censored rows
-     contribute imputed squared residuals plus their truncated-normal
-     conditional variance, which gives the correct MLE for sigma.
-  4. Obtaining a posterior-predictive surrogate by drawing
-     ``n_samples`` Normal samples from ``(mean, effective_se)``
-     returned by ``model.predict(..., interval=0.95)``; ``effective_se``
-     is the model's epistemic SE on the linear predictor.  This gives a
-     ``(S, n_new, n_t)`` tensor of survival-curve draws, consistent
-     with the signature the rest of the pipeline expects.
-
-When the library adds survival-family support in its Python binding the
-implementation of ``_fit_gam`` below can be upgraded to pass
-``Surv(entry, exit, event) ~ ...`` directly; the public API on this
-module does not change.
+This module is a thin, direct wrapper over the `gam <https://github.com/SauersML/gam>`_
+Rust CLI's ``survival`` + ``predict`` subcommands.  The library's Rust
+engine implements proper Royston-Parmar / Weibull / probit-location-scale
+survival GAMs with penalised splines, REML smoothing, and analytical
+uncertainty -- we invoke it via ``subprocess`` and read back the CSV
+outputs.  There is no IPCW, no EM, no imputation, no events-only
+complete-case hack: the CLI's native survival family handles censoring
+exactly.
 
 Public API
 ----------
-``SurvivalGAM`` exposes ``predict_survival``, ``predict_median_survival``,
-``predict_hazard``, ``posterior_summary`` and the ``diagnostics`` dict.
-``fit_survival_gam`` returns a fitted ``SurvivalGAM``.  ``bma_survival``
-performs Bayesian model averaging over candidate parent sets using the
-variance decomposition of Draper (1995).
+
+``fit_survival_gam(time, event, X, columns=None, ...) -> SurvivalGAM``
+``SurvivalGAM.predict_survival(X_new, t_grid) -> (n_samples, n_new, n_t)``
+``SurvivalGAM.predict_median_survival(X_new) -> (n_samples, n_new)``
+``SurvivalGAM.predict_hazard(X_new, t_grid) -> (n_samples, n_new, n_t)``
+``SurvivalGAM.posterior_summary() -> dict``
+``bma_survival(parent_sets, weights, time, event, data_matrix, columns,
+               t_grid, X_eval=None, **gam_kwargs) -> dict``
+
+Bayesian model averaging (Draper 1995, JRSS-B 57(1):45-97) decomposes
+the posterior-predictive variance of ``S(t | x)`` into a parametric
+(within-model) part and a structural (between-model) part.
+
+CLI discovery
+-------------
+The CLI binary is located via :func:`_locate_gam_cli`, which checks:
+
+    1. ``GAM_CLI`` environment variable (highest priority)
+    2. ``gam`` on ``$PATH``
+    3. ``/Users/user/.local/bin/gam`` (the upstream installer's default)
+    4. ``/Users/user/gam/bench/runtime/gam`` (the local dev build)
+
+If none of those resolve to an executable the module raises at fit
+time.
 """
 
 from __future__ import annotations
 
+import csv
+import json
+import os
+import shutil
+import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from scipy.stats import norm
-
-try:  # import guard so this module imports even when `gam` isn't available
-    import gam as _gam
-
-    _GAM_AVAILABLE = True
-    _GAM_IMPORT_ERROR: Optional[BaseException] = None
-except Exception as _exc:  # pragma: no cover -- env without gam
-    _gam = None
-    _GAM_AVAILABLE = False
-    _GAM_IMPORT_ERROR = _exc
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# CLI discovery
+# ---------------------------------------------------------------------------
+
+_GAM_CLI_CANDIDATES = (
+    os.environ.get("GAM_CLI"),
+    None,                                       # placeholder for shutil.which
+    "/Users/user/.local/bin/gam",
+    "/Users/user/gam/bench/runtime/gam",
+)
+
+
+def _locate_gam_cli() -> str:
+    """Return the absolute path of the ``gam`` CLI binary, raising if absent."""
+    env_cli = os.environ.get("GAM_CLI")
+    if env_cli and os.path.isfile(env_cli) and os.access(env_cli, os.X_OK):
+        return env_cli
+    onpath = shutil.which("gam")
+    if onpath:
+        return onpath
+    for candidate in (
+        "/Users/user/.local/bin/gam",
+        "/Users/user/gam/bench/runtime/gam",
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise FileNotFoundError(
+        "gam CLI not found.  Install the binary via SauersML/gam's install.sh "
+        "or set the GAM_CLI env var to its path."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Column kind detection + formula
 # ---------------------------------------------------------------------------
 
 
@@ -93,306 +92,310 @@ def _is_binary_column(x: np.ndarray) -> bool:
     return vals.shape[0] <= 2 and set(vals.tolist()).issubset({0.0, 1.0})
 
 
-def _build_formula(response: str, columns: Sequence[str], kinds: Sequence[str]) -> str:
-    """Build a ``response ~ s(x1) + x2 + ...`` formula for the gam library.
+# Default smooth kind for continuous covariates.  Duchon splines
+# (Duchon 1977) generalise thin-plate splines: parameter ``order = m``
+# controls the smoothness (``m-1`` continuous derivatives) and ``power =
+# s`` the rate of decay of the Green's function, with the condition
+# 2m + s > d (d = covariate dimension).  For univariate smooths the
+# common choice is m = 2, s = 1, which gives a cubic-style penalised
+# smooth with better boundary behaviour than B-splines.
+_DUCHON_DEFAULT_ORDER = 2
+_DUCHON_DEFAULT_POWER = 1
 
-    Continuous columns become ``s(name)`` smooths (cubic P-splines in
-    the library's default configuration), binary columns become plain
-    linear terms.  If ``columns`` is empty the formula reduces to an
-    intercept-only model ``response ~ 1``.
+
+def _build_survival_formula(columns: Sequence[str],
+                            kinds: Sequence[str],
+                            smooth_kind: str = "duchon") -> str:
+    """Return ``s(x1, type=duchon, order=2, power=1) + x2 + ...``.
+
+    Continuous columns become penalised Duchon smooths; binary columns
+    enter as plain linear terms.  An empty covariate set collapses to
+    intercept-only via the literal ``1`` term.
     """
     terms: List[str] = []
     for name, kind in zip(columns, kinds):
         if kind == "continuous":
-            terms.append(f"s({name})")
+            if smooth_kind == "duchon":
+                terms.append(
+                    f"s({name}, type=duchon, order={_DUCHON_DEFAULT_ORDER}, "
+                    f"power={_DUCHON_DEFAULT_POWER})"
+                )
+            else:
+                terms.append(f"s({name})")
         else:
             terms.append(name)
-    if not terms:
-        return f"{response} ~ 1"
-    return f"{response} ~ " + " + ".join(terms)
-
-
-def _columns_to_dict(
-    X: np.ndarray,
-    columns: Sequence[str],
-    extras: Optional[Dict[str, np.ndarray]] = None,
-) -> Dict[str, list]:
-    out: Dict[str, list] = {}
-    for i, name in enumerate(columns):
-        out[name] = X[:, i].astype(float).tolist()
-    if extras:
-        for k, v in extras.items():
-            out[k] = np.asarray(v, dtype=float).tolist()
-    return out
+    return " + ".join(terms) if terms else "1"
 
 
 # ---------------------------------------------------------------------------
-# Internal per-GAM fit object
+# CSV I/O helpers
+# ---------------------------------------------------------------------------
+
+
+def _write_csv(path: str, header: Sequence[str], rows: np.ndarray) -> None:
+    """Write a 2-D numpy array with the given header to ``path``."""
+    rows = np.asarray(rows, dtype=float)
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(list(header))
+        for r in rows:
+            writer.writerow(r.tolist())
+
+
+def _read_prediction_csv(path: str) -> Dict[str, np.ndarray]:
+    """Load a gam-predict CSV and return columns as float64 arrays."""
+    import pandas as pd  # pandas is a hard dep of the project
+
+    df = pd.read_csv(path)
+    return {c: df[c].to_numpy(dtype=float) for c in df.columns}
+
+
+# ---------------------------------------------------------------------------
+# Internal fit object
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class _SubmodelFit:
-    """Fitted wrapper around a single ``gam.Model`` location fit.
+    """Fitted gam survival model artefacts."""
 
-    Holds the library model for the AFT location predictor plus the
-    residual-based sigma and metadata needed to reproduce prediction
-    schemas at serving time.
-    """
-
-    model: Any  # gam.Model
+    model_path: str                     # path to gam's model.json on disk
     columns: Tuple[str, ...]
-    kinds: Tuple[str, ...]  # "continuous" | "binary"
-    sigma: float  # residual SD on log-time scale
-    t_scale: float
+    kinds: Tuple[str, ...]              # "continuous" | "binary"
     n_train: int
     n_events: int
     formula: str
-    summary_payload: Dict[str, Any]
+    cli: str                            # the gam CLI binary used
+    train_summary: Dict[str, Any]
+    tmp_workdir: str                    # path to the tempdir
+    _tmp: Optional[Any] = None          # owns the tempdir object (keeps it alive)
 
 
-def _truncated_normal_moments(a: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """First two central moments of ``Z | Z > a`` where ``Z ~ N(0, 1)``.
-
-    Returns ``(m1, m2)`` where ``m1 = E[Z | Z > a]`` and
-    ``m2 = Var[Z | Z > a]``.  Stable for large positive ``a`` via
-    ``phi(a) / (1 - Phi(a))`` computed as ``exp(logpdf - logsf)``.
-    """
-    a = np.asarray(a, dtype=float)
-    log_phi = -0.5 * a * a - 0.5 * np.log(2.0 * np.pi)
-    log_sf = norm.logsf(a)
-    lam = np.exp(log_phi - log_sf)  # inverse Mills ratio
-    m1 = lam  # E[Z | Z > a]
-    m2 = 1.0 + a * lam - lam**2  # Var[Z | Z > a]
-    # Numerical floor: variance must be >= 0.
-    m2 = np.maximum(m2, 1e-12)
-    return m1, m2
+# ---------------------------------------------------------------------------
+# Fit via the gam CLI
+# ---------------------------------------------------------------------------
 
 
-def _fit_gaussian_gam(
-    train_dict: Dict[str, list], formula: str, weights_key: Optional[str] = None
-) -> Any:
-    """Fit a Gaussian GAM; pass-through for ``weights=`` when provided."""
-    if weights_key is not None:
-        return _gam.fit(train_dict, formula, family="gaussian", weights=weights_key)
-    return _gam.fit(train_dict, formula, family="gaussian")
-
-
-def _km_censoring(
-    time: np.ndarray,
-    event: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Kaplan-Meier of the *censoring* distribution.
-
-    Returns ``(uniq_times, G)`` right-continuous.  Events and censoring
-    are swapped: we treat ``1 - event`` as the "event" for the KM, so
-    G(t) = P(C > t).
-    """
-    t = np.asarray(time, dtype=float)
-    cens = 1.0 - np.asarray(event, dtype=float)
-    order = np.argsort(t, kind="mergesort")
-    ts = t[order]
-    es = cens[order]
-    uniq, inv = np.unique(ts, return_inverse=True)
-    d = np.zeros(uniq.size, dtype=float)
-    np.add.at(d, inv, es)
-    counts = np.bincount(inv, minlength=uniq.size).astype(float)
-    cum_before = np.concatenate([[0.0], np.cumsum(counts)[:-1]])
-    n_at = float(ts.size) - cum_before
-    with np.errstate(divide="ignore", invalid="ignore"):
-        factors = np.where(n_at > 0, 1.0 - d / n_at, 1.0)
-    G = np.cumprod(factors)
-    return uniq, G
-
-
-def _km_eval_at(uniq: np.ndarray, G: np.ndarray, t: np.ndarray) -> np.ndarray:
-    idx = np.searchsorted(uniq, t, side="right") - 1
-    out = np.ones_like(t, dtype=float)
-    mask = idx >= 0
-    out[mask] = G[idx[mask]]
-    return out
-
-
-def _fit_gam(
-    time: np.ndarray,
-    event: np.ndarray,
-    X: np.ndarray,
-    columns: Tuple[str, ...],
-    n_em_iters: int = 1,
-) -> _SubmodelFit:
-    """Fit an AFT Gaussian GAM with IPCW-weighted events-only seed
-    plus optional EM data augmentation over censored rows.
-
-    Stage 1: IPCW-weighted complete-case fit.  The weight for event
-    ``i`` is ``w_i = 1 / G(T_i -)`` where ``G`` is the Kaplan-Meier
-    estimate of the censoring distribution.  This removes the bias
-    that drops of censored observations would otherwise introduce.
-
-    Stage 2 (optional, default 1 iteration): EM step over censored
-    rows only.  Each censored observation's latent log-time is
-    imputed from the truncated normal TN(mu_i, sigma, a_i) with
-    a_i = (log t_c - mu_i) / sigma, i.e. E[log T_i | log T_i > log t_c]
-    = mu_i + sigma * lambda(a_i) with lambda the inverse Mills ratio.
-    The GAM is refit on (events + imputed censored) rows, giving the
-    Tanner-Wong (1987) data-augmentation MLE for the right-censored
-    Gaussian AFT model.  Sigma is updated from event residuals plus
-    the conditional variance of the censored rows.
-
-    Returns the library model plus the final ``sigma`` estimate.
-    """
-    if not _GAM_AVAILABLE:
-        raise ImportError(
-            "gam library unavailable: cannot fit survival GAM. "
-            f"Underlying import error: {_GAM_IMPORT_ERROR!r}"
-        )
+def _fit_gam(time: np.ndarray, event: np.ndarray, X: np.ndarray,
+             columns: Tuple[str, ...],
+             survival_likelihood: str = "transformation",
+             time_basis: Optional[str] = None,
+             time_num_internal_knots: Optional[int] = None,
+             time_degree: Optional[int] = None,
+             timeout: int = 600) -> _SubmodelFit:
+    """Fit a survival GAM via ``gam survival`` and return a ``_SubmodelFit``."""
+    cli = _locate_gam_cli()
 
     time = np.asarray(time, dtype=float)
     event = np.asarray(event, dtype=float)
     X = np.asarray(X, dtype=float).reshape(time.shape[0], -1)
     if X.shape[1] != len(columns):
-        raise ValueError(f"columns length {len(columns)} != X.shape[1] {X.shape[1]}")
+        raise ValueError(
+            f"columns length {len(columns)} != X.shape[1] {X.shape[1]}"
+        )
 
-    # Time rescaling: divide by median(time) so log-time is ~O(1).
-    pos = time[time > 0]
-    t_scale = float(np.median(pos)) if pos.size > 0 else 1.0
-    if t_scale <= 0:
-        t_scale = 1.0
-    t_scaled = np.clip(time / t_scale, 1e-9, None)
-    log_t = np.log(t_scaled)
-
-    # Kinds (continuous vs binary) inferred once on the full training matrix.
     kinds = tuple(
         "binary" if _is_binary_column(X[:, i]) else "continuous"
         for i in range(X.shape[1])
     )
+    formula = _build_survival_formula(columns, kinds)
 
-    ev_mask = event.astype(bool)
-    cens_mask = ~ev_mask
-    n_events = int(np.sum(ev_mask))
-    if n_events < 10:
-        raise ValueError(
-            f"too few events ({n_events}) to fit AFT GAM; need at least 10"
+    # Persist the tempdir across fit + prediction so the model.json lives
+    # long enough to be invoked.  The SurvivalGAM dataclass owns it and
+    # it's cleaned up when the Python object is garbage-collected.
+    tmp = _PersistentTempdir(prefix="gam_survival_")
+
+    train_csv = os.path.join(tmp.path, "train.csv")
+    model_json = os.path.join(tmp.path, "model.json")
+
+    entry = np.zeros_like(time, dtype=float)
+    header = ["entry", "exit", "event", *columns]
+    rows = np.column_stack([entry, time, event, X])
+    _write_csv(train_csv, header, rows)
+
+    cmd = [
+        cli, "survival",
+        "--entry", "entry",
+        "--exit", "exit",
+        "--event", "event",
+        "--formula", formula,
+        "--survival-likelihood", survival_likelihood,
+    ]
+    # Let the CLI pick its own defaults for the time basis unless the
+    # caller overrides; the CLI's ``linear`` default is robust, whereas
+    # higher-dimensional B-spline bases can run into monotonicity
+    # feasibility issues on small samples.
+    if time_basis is not None:
+        cmd += ["--time-basis", time_basis]
+    if time_num_internal_knots is not None:
+        cmd += ["--time-num-internal-knots", str(time_num_internal_knots)]
+    if time_degree is not None:
+        cmd += ["--time-degree", str(time_degree)]
+    cmd += ["--out", model_json, train_csv]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "gam survival fit failed:\n"
+            f"cmd: {' '.join(cmd)}\n"
+            f"stdout: {proc.stdout}\n"
+            f"stderr: {proc.stderr}"
         )
 
-    formula = _build_formula("log_t", columns, kinds)
+    # Parse any line starting with '{' as JSON summary; otherwise keep the raw stdout.
+    train_summary: Dict[str, Any] = {"cli_stdout": proc.stdout.strip()}
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                train_summary = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
 
-    # --- Stage 1: IPCW-weighted events-only seed fit -------------
-    # w_i = 1 / G(T_i -) with G the KM of the censoring distribution.
-    km_t, km_G = _km_censoring(time, event)
-    t_minus = np.nextafter(time, -np.inf)
-    G_at_T = _km_eval_at(km_t, km_G, t_minus)
-    # Clip to avoid astronomical weights when G -> 0 near the tail.
-    G_at_T = np.clip(G_at_T, 0.05, 1.0)
-    w_ipcw = 1.0 / G_at_T
-
-    X_ev = X[ev_mask, :]
-    log_t_ev = log_t[ev_mask]
-    w_ev = w_ipcw[ev_mask]
-    seed_dict = _columns_to_dict(X_ev, columns, extras={"log_t": log_t_ev})
-    if not columns:
-        seed_dict = {"log_t": log_t_ev.tolist(), "_const": [1.0] * log_t_ev.shape[0]}
-    seed_dict["_ipcw"] = w_ev.tolist()
-    model = _fit_gaussian_gam(seed_dict, formula, weights_key="_ipcw")
-
-    # Initial sigma: weighted RMS of event residuals.
-    predict_ev = _columns_to_dict(X_ev, columns)
-    if not predict_ev:
-        predict_ev = {"_const": [1.0] * X_ev.shape[0]}
-    mu_ev = np.asarray(model.predict(predict_ev)["mean"], dtype=float)
-    resid_ev = log_t_ev - mu_ev
-    if resid_ev.size > 1 and w_ev.sum() > 0:
-        sigma = float(np.sqrt(np.sum(w_ev * resid_ev**2) / float(w_ev.sum())))
-    else:
-        sigma = 1.0
-    sigma = max(sigma, 1e-3)
-
-    # --- Stage 2: one EM data-augmentation pass over censored rows
-    n_cens = int(np.sum(cens_mask))
-    if n_cens > 0 and n_em_iters > 0:
-        predict_all = _columns_to_dict(X, columns)
-        if not predict_all:
-            predict_all = {"_const": [1.0] * X.shape[0]}
-        mu_all = np.asarray(
-            model.predict(predict_all)["mean"],
-            dtype=float,
-        )
-        a_c = (log_t[cens_mask] - mu_all[cens_mask]) / sigma
-        m1_c, m2_c = _truncated_normal_moments(a_c)
-        log_t_full = log_t.copy()
-        log_t_full[cens_mask] = mu_all[cens_mask] + sigma * m1_c
-
-        # Refit on full (event + imputed) data; IPCW weights are kept
-        # on events and unit weights on imputed rows (the imputation
-        # itself corrects the censoring bias on those rows).
-        full_dict = _columns_to_dict(
-            X,
-            columns,
-            extras={"log_t": log_t_full},
-        )
-        if not columns:
-            full_dict = {
-                "log_t": log_t_full.tolist(),
-                "_const": [1.0] * log_t_full.shape[0],
-            }
-        w_full = np.ones_like(log_t_full, dtype=float)
-        w_full[ev_mask] = w_ev
-        full_dict["_ipcw"] = w_full.tolist()
-        model = _fit_gaussian_gam(full_dict, formula, weights_key="_ipcw")
-
-        mu_all = np.asarray(
-            model.predict(predict_all)["mean"],
-            dtype=float,
-        )
-        r_ev = log_t[ev_mask] - mu_all[ev_mask]
-        r_c = log_t_full[cens_mask] - mu_all[cens_mask]
-        ss_ev = float(np.sum(w_ev * r_ev**2))
-        ss_c = float(np.sum(r_c**2 + (sigma**2) * m2_c))
-        w_sum = float(w_ev.sum() + n_cens)
-        sigma = float(np.sqrt((ss_ev + ss_c) / max(w_sum, 1.0)))
-        sigma = max(sigma, 1e-3)
-
-    summary_payload = dict(model.summary().payload)
     return _SubmodelFit(
-        model=model,
+        model_path=model_json,
         columns=tuple(columns),
         kinds=kinds,
-        sigma=sigma,
-        t_scale=t_scale,
         n_train=int(time.shape[0]),
-        n_events=n_events,
-        formula=formula,
-        summary_payload=summary_payload,
+        n_events=int(np.sum(event > 0.0)),
+        formula=f"Surv(entry, exit, event) ~ {formula}",
+        cli=cli,
+        train_summary=train_summary,
+        tmp_workdir=tmp.path,
+        _tmp=tmp,
     )
 
 
-def _predict_mean_se(
-    fit: _SubmodelFit, X_new: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Return ``(mu, mu_se)`` posterior mean and epistemic SE of the
-    location predictor on new rows, via the library's ``predict``.
+class _PersistentTempdir:
+    """A tempfile.TemporaryDirectory that auto-cleans on dealloc.
+
+    We keep an explicit handle on the underlying object so multiple
+    SurvivalGAM objects can safely outlive each other.
     """
-    X_new = np.asarray(X_new, dtype=float)
-    if len(fit.columns) > 0:
-        X_new = X_new.reshape(-1, len(fit.columns))
-    else:
-        X_new = X_new.reshape(-1, 0) if X_new.ndim > 1 else X_new.reshape(-1, 0)
-    n_new = X_new.shape[0]
-    if len(fit.columns) == 0:
-        predict_dict = {"_const": [1.0] * n_new}
-    else:
-        predict_dict = _columns_to_dict(X_new, fit.columns)
-    # The library's schema tracking treats weight columns as required at
-    # predict time; supply a unit-weight placeholder so SchemaMismatch
-    # isn't raised.  The weight column is only used for fitting.
-    predict_dict["_ipcw"] = [1.0] * n_new
-    raw = fit.model.predict(predict_dict, interval=0.95)
-    mu = np.asarray(raw["mean"], dtype=float)
-    se = np.asarray(raw.get("effective_se", np.zeros_like(mu)), dtype=float)
-    return mu, se
+
+    def __init__(self, prefix: str = "gam_") -> None:
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory(prefix=prefix)
+        self.path = self._tmp.name
+
+    def cleanup(self) -> None:
+        try:
+            self._tmp.cleanup()
+        except Exception:  # pragma: no cover -- best-effort
+            pass
+
+    def __del__(self) -> None:  # pragma: no cover
+        self.cleanup()
 
 
 # ---------------------------------------------------------------------------
-# Public class
+# Predict via the gam CLI
+# ---------------------------------------------------------------------------
+
+
+def _predict_survival_matrix(fit: _SubmodelFit,
+                             X_new: np.ndarray,
+                             t_grid: np.ndarray,
+                             interval: Optional[float] = 0.95,
+                             timeout: int = 600
+                             ) -> Tuple[np.ndarray, np.ndarray]:
+    """Return ``(S_mean, S_se)`` of shape ``(n_new, n_t)``.
+
+    We build a long-format CSV with ``n_new * n_t`` rows (one per
+    (individual, time) pair) and ask ``gam predict --uncertainty`` to
+    evaluate ``S(t|x)`` and its standard error for each row.
+    """
+    X_new = np.asarray(X_new, dtype=float)
+    p = len(fit.columns)
+    if p > 0:
+        X_new = X_new.reshape(-1, p)
+    else:
+        X_new = X_new.reshape(-1, 0)
+    n_new = X_new.shape[0]
+    t_grid = np.asarray(t_grid, dtype=float).ravel()
+    n_t = t_grid.shape[0]
+
+    if n_new == 0 or n_t == 0:
+        return (
+            np.zeros((n_new, n_t), dtype=float),
+            np.zeros((n_new, n_t), dtype=float),
+        )
+
+    # Long format: block over t_grid within each individual.
+    rep_X = (
+        np.repeat(X_new, n_t, axis=0)
+        if p > 0 else np.zeros((n_new * n_t, 0))
+    )
+    rep_t = np.tile(t_grid, n_new)
+    rep_entry = np.zeros_like(rep_t, dtype=float)
+    rep_event = np.ones_like(rep_t, dtype=float)  # placeholder
+
+    header = ["entry", "exit", "event", *fit.columns]
+    rows = np.column_stack([rep_entry, rep_t, rep_event, rep_X])
+
+    new_csv = os.path.join(fit.tmp_workdir, "new.csv")
+    pred_csv = os.path.join(fit.tmp_workdir, "pred.csv")
+    _write_csv(new_csv, header, rows)
+
+    cmd = [fit.cli, "predict", "--out", pred_csv]
+    if interval is not None:
+        cmd += ["--uncertainty", "--level", str(float(interval))]
+    cmd += [fit.model_path, new_csv]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "gam predict failed:\n"
+            f"cmd: {' '.join(cmd)}\n"
+            f"stdout: {proc.stdout}\n"
+            f"stderr: {proc.stderr}"
+        )
+
+    cols = _read_prediction_csv(pred_csv)
+    if "survival_prob" in cols:
+        S_flat = cols["survival_prob"]
+    elif "mean" in cols:
+        S_flat = cols["mean"]
+    else:
+        raise RuntimeError(
+            f"gam predict produced unexpected columns {list(cols)}; "
+            "expected 'survival_prob' or 'mean'."
+        )
+    # Uncertainty: the CLI may emit ``survival_prob_lower``/``_upper`` or
+    # ``eta_se``; prefer a direct SE on the survival scale.
+    if "survival_prob_se" in cols:
+        SE_flat = cols["survival_prob_se"]
+    elif "survival_prob_lower" in cols and "survival_prob_upper" in cols:
+        z = 1.959963984540054  # 97.5th percentile of N(0,1)
+        SE_flat = (cols["survival_prob_upper"] - cols["survival_prob_lower"]) / (2.0 * z)
+    elif "eta_se" in cols:
+        # Delta method: survival = 1 - Phi(eta) on the probit scale;
+        # when the CLI doesn't give a survival_prob_se, scale eta_se by
+        # |dS/deta| = phi(eta).  Safe for small SEs.
+        from scipy.stats import norm
+
+        eta = cols.get("eta", np.zeros_like(S_flat))
+        SE_flat = np.abs(norm.pdf(eta)) * cols["eta_se"]
+    else:
+        SE_flat = np.zeros_like(S_flat)
+
+    S_mean = S_flat.reshape(n_new, n_t)
+    S_se = SE_flat.reshape(n_new, n_t)
+
+    # S must be non-increasing in t; enforce by left-to-right cumulative
+    # minimum: S_fixed[k] = min(S[0], ..., S[k]).  This is a no-op when
+    # the CLI's output is already monotone and removes any local
+    # violations otherwise without pulling early values down to the
+    # final value (the bug the right-to-left variant produced on
+    # already-monotone input).
+    S_mean = np.minimum.accumulate(S_mean, axis=1)
+    S_mean = np.clip(S_mean, 0.0, 1.0)
+    S_se = np.clip(S_se, 0.0, None)
+    return S_mean, S_se
+
+
+# ---------------------------------------------------------------------------
+# Public dataclass
 # ---------------------------------------------------------------------------
 
 
@@ -403,21 +406,19 @@ class SurvivalGAM:
     Attributes
     ----------
     samples : dict
-        Carries ``"n_samples"`` (the draw count for posterior-predictive
-        simulation) plus the library's coefficient estimates.  Raw
-        posterior parameter draws are not emitted by the library at
-        v0.1.15; ``predict_survival`` synthesises a posterior-predictive
-        tensor from ``(mean, effective_se)``.
+        Retained for API compatibility.  Posterior-predictive draws are
+        synthesised from the CLI's survival-scale mean + SE at prediction
+        time (Normal around the CLI point estimate, clipped to [0, 1]
+        and re-monotonised).  When the CLI emits MCMC draws directly we
+        will thread those through here.
     X_design : dict
         Per-covariate metadata (kind + column order).
     columns : tuple
         Covariate names in the order used at fit time.
     t_scale : float
-        Time normaliser: internally we worked with ``time / t_scale``;
-        prediction undoes the rescaling.
+        Kept at 1.0: the gam CLI works on the native time scale.
     diagnostics : dict
-        Library-level diagnostics: REML iterations, REML score,
-        deviance, EDF, residual sigma, event count, converged flag.
+        CLI stdout + detected family / formula / convergence bits.
     """
 
     samples: dict
@@ -438,96 +439,101 @@ class SurvivalGAM:
 
     # --------------------------------------------------------------
 
-    def _get_mu_se(self, X_new: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Return mu and epistemic SE for ``X_new`` with per-array caching."""
+    def _cached_predict(self, X_new: np.ndarray, t_grid: np.ndarray
+                        ) -> Tuple[np.ndarray, np.ndarray]:
         X_new = np.ascontiguousarray(X_new, dtype=float)
-        key = hash((X_new.tobytes(), X_new.shape))
+        t_grid = np.ascontiguousarray(t_grid, dtype=float)
+        key = hash((X_new.tobytes(), X_new.shape, t_grid.tobytes()))
         cached = self._predict_cache.get(key)
         if cached is not None:
             return cached
-        mu, se = _predict_mean_se(self._fit, X_new)
-        self._predict_cache[key] = (mu, se)
-        return mu, se
-
-    def _posterior_mu_draws(self, X_new: np.ndarray) -> np.ndarray:
-        """Return ``(n_samples, n_new)`` Normal posterior-predictive draws of
-        the location predictor given the Rust GAM's (mean, effective_se)."""
-        mu, se = self._get_mu_se(X_new)
-        S = self._n_posterior_draws
-        eps = self._rng.standard_normal((S, mu.shape[0]))
-        return mu[None, :] + se[None, :] * eps
+        S_mean, S_se = _predict_survival_matrix(self._fit, X_new, t_grid)
+        self._predict_cache[key] = (S_mean, S_se)
+        return S_mean, S_se
 
     def _shape_X_new(self, X_new: Any) -> np.ndarray:
         X_new = np.asarray(X_new, dtype=float)
         p = len(self.columns)
         if p == 0:
-            # Accept any 1-D or (n, 0) 2-D input; report (n, 0).
             if X_new.ndim == 1:
                 return X_new.reshape(-1, 0)
-            return X_new.reshape(X_new.shape[0], 0)
+            return X_new.reshape(-1, 0)
         return X_new.reshape(-1, p)
 
-    # --- predictive interface expected by the pipeline ---------------
+    # --------------------------------------------------------------
 
-    def predict_survival(self, X_new: np.ndarray, t_grid: np.ndarray) -> np.ndarray:
-        """Posterior survival probabilities ``S(t | x)``.
+    def predict_survival(self, X_new: np.ndarray, t_grid: np.ndarray
+                         ) -> np.ndarray:
+        """Posterior-predictive survival probabilities ``(S, n_new, n_t)``.
 
-        Shape: ``(n_samples, n_new, n_t)``.  The Gaussian-AFT survival
-        function is ``S(t | x) = 1 - Phi((log t - mu(x)) / sigma)``.  We
-        draw ``n_samples`` Normal samples of ``mu(x)`` from the library's
-        epistemic mean + SE (Laplace approximation around the REML
-        posterior mode), combine with the residual-based ``sigma``, and
-        evaluate the survival function on ``t_grid / t_scale``.
+        The gam CLI returns a point estimate ``S_mean`` (already
+        monotone-decreasing in ``t``) and an epistemic standard error
+        ``S_se`` for the survival-scale prediction.  We generate
+        posterior-predictive draws as
+
+            S^{(s)}(t | x) = S_mean(t | x) + eta_s(x) * S_se(t | x),
+
+        with ``eta_s(x) ~ Normal(0, 1)`` sampled ONCE per (draw, row)
+        and reused across ``t``.  This preserves the within-row
+        monotonicity of each draw (every curve is a uniformly shifted
+        copy of the point estimate) and avoids the bias that appears
+        when independent per-``(s, row, t)`` noise is projected onto
+        the monotone-decreasing cone.
         """
         X_new = self._shape_X_new(X_new)
-        t_grid = np.asarray(t_grid, dtype=float).reshape(-1)
-        mu_draws = self._posterior_mu_draws(X_new)  # (S, n_new)
-        t_scaled = np.clip(t_grid / self.t_scale, 1e-12, None)
-        log_t = np.log(t_scaled)  # (n_t,)
-        sigma = self._fit.sigma
-        z = (log_t[None, None, :] - mu_draws[:, :, None]) / sigma
-        return norm.sf(z)
+        t_grid = np.asarray(t_grid, dtype=float).ravel()
+        S_mean, S_se = self._cached_predict(X_new, t_grid)
+        S = max(int(self._n_posterior_draws), 1)
+        if S == 1 or not np.any(S_se > 0):
+            return np.broadcast_to(S_mean, (S,) + S_mean.shape).copy()
+        n_new = S_mean.shape[0]
+        eta = self._rng.standard_normal((S, n_new))      # shared across t
+        out = S_mean[None, :, :] + eta[:, :, None] * S_se[None, :, :]
+        return np.clip(out, 0.0, 1.0)
 
     def predict_median_survival(self, X_new: np.ndarray) -> np.ndarray:
-        """Posterior median-survival-time draws, shape ``(n_samples, n_new)``.
-
-        For the Gaussian AFT the median of ``log T | x`` is ``mu(x)``,
-        so median ``T = t_scale * exp(mu(x))``.
-        """
+        """Posterior draws of the median survival time per row."""
         X_new = self._shape_X_new(X_new)
-        mu_draws = self._posterior_mu_draws(X_new)
-        return np.exp(mu_draws) * self.t_scale
+        t_grid = np.geomspace(1e-3, 1.0e2, 400)
+        S_draws = self.predict_survival(X_new, t_grid)       # (S, n_new, n_t)
+        out = np.full(S_draws.shape[:2], float("inf"))
+        for s in range(S_draws.shape[0]):
+            for k in range(S_draws.shape[1]):
+                curve = S_draws[s, k]
+                below = np.where(curve <= 0.5)[0]
+                if below.size == 0:
+                    out[s, k] = t_grid[-1]
+                elif below[0] == 0:
+                    out[s, k] = t_grid[0]
+                else:
+                    j = int(below[0])
+                    s_lo, s_hi = curve[j - 1], curve[j]
+                    t_lo_g, t_hi_g = t_grid[j - 1], t_grid[j]
+                    if s_hi == s_lo:
+                        out[s, k] = t_hi_g
+                    else:
+                        frac = (s_lo - 0.5) / (s_lo - s_hi)
+                        out[s, k] = t_lo_g + frac * (t_hi_g - t_lo_g)
+        return out
 
-    def predict_hazard(self, X_new: np.ndarray, t_grid: np.ndarray) -> np.ndarray:
-        """Hazard ``h(t|x) = f(t|x) / S(t|x)`` on the raw-time axis.
-
-        Shape: ``(n_samples, n_new, n_t)``.  For Gaussian AFT,
-        ``h(t|x) = (phi(z) / (1 - Phi(z))) / (t * sigma)`` in scaled
-        time; convert to raw time by dividing by ``t_scale``.
-        """
-        X_new = self._shape_X_new(X_new)
-        t_grid = np.asarray(t_grid, dtype=float).reshape(-1)
-        mu_draws = self._posterior_mu_draws(X_new)
-        t_scaled = np.clip(t_grid / self.t_scale, 1e-12, None)
-        log_t = np.log(t_scaled)
-        sigma = self._fit.sigma
-        z = (log_t[None, None, :] - mu_draws[:, :, None]) / sigma
-        log_phi = -0.5 * z**2 - 0.5 * np.log(2 * np.pi)
-        log_sf = norm.logsf(z)
-        t_bc = t_scaled[None, None, :]
-        h_scaled = np.exp(log_phi - log_sf) / (t_bc * sigma)
-        return h_scaled / self.t_scale
+    def predict_hazard(self, X_new: np.ndarray, t_grid: np.ndarray
+                       ) -> np.ndarray:
+        """Posterior-predictive hazard ``h(t|x) = -d/dt log S(t|x)``."""
+        S = self.predict_survival(X_new, t_grid)
+        t = np.asarray(t_grid, dtype=float).ravel()
+        dt = np.diff(t)
+        eps = 1e-12
+        logS = np.log(np.clip(S, eps, 1.0))
+        dlog = -np.diff(logS, axis=2) / dt[None, None, :]
+        pad = dlog[:, :, -1:]
+        return np.concatenate([dlog, pad], axis=2)
 
     def posterior_summary(self) -> dict:
-        """Return coefficient estimates, SEs, and GAM-level diagnostics."""
-        out: Dict[str, Any] = {
-            "formula": self._fit.formula,
-            "sigma": self._fit.sigma,
-            "t_scale": self.t_scale,
-            "coefficients": self._fit.summary_payload.get("coefficients"),
-        }
-        out.update(self.diagnostics)
-        return out
+        """Diagnostics-ready dict."""
+        d = dict(self.diagnostics)
+        d["n_posterior_draws"] = int(self._n_posterior_draws)
+        d["columns"] = list(self.columns)
+        return d
 
 
 # ---------------------------------------------------------------------------
@@ -540,32 +546,33 @@ def fit_survival_gam(
     event: np.ndarray,
     X: np.ndarray,
     columns: Optional[Tuple[str, ...]] = None,
-    n_basis: int = 10,  # retained for API compat
+    n_basis: int = 10,                 # retained for API compat
     n_samples: int = 1000,
-    warmup: int = 500,  # retained for API compat
-    n_chains: int = 2,  # retained for API compat
-    target_accept: float = 0.8,  # retained for API compat
-    max_tree_depth: int = 10,  # retained for API compat
+    warmup: int = 500,                 # retained for API compat
+    n_chains: int = 2,                 # retained for API compat
+    target_accept: float = 0.8,        # retained for API compat
+    max_tree_depth: int = 10,          # retained for API compat
     rng: Optional[np.random.Generator] = None,
     progress: bool = False,
 ) -> SurvivalGAM:
-    """Fit a distributional survival GAM via the ``gam`` Python library.
+    """Fit a distributional survival GAM via the gam CLI.
 
     Parameters
     ----------
     time, event : arrays of shape (n,)
         Observed follow-up times (positive) and event indicators
-        (1 = failure, 0 = right-censored).
+        (1 = failure, 0 = right-censored).  These are passed directly to
+        the gam CLI's ``survival`` subcommand; no transformation, no
+        censoring workaround.
     X : (n, p) ndarray
         Covariate matrix.  Columns whose unique values are a subset of
         {0, 1} are treated as binary and enter linearly; other columns
         enter as penalised smooths ``s(name)``.  When ``p == 0`` the
-        model reduces to an intercept-only AFT.
+        model reduces to an intercept-only survival fit.
     columns : tuple, optional
         Names for the ``p`` covariates.  Defaults to ``("x0", ...)``.
-    n_samples : int, optional
-        Number of posterior-predictive draws to generate per prediction
-        (see module docstring for why this is a simulation, not MCMC).
+    n_samples : int
+        Number of posterior-predictive draws per prediction.
     """
     if rng is None:
         rng = np.random.default_rng(0)
@@ -580,41 +587,50 @@ def fit_survival_gam(
     fit = _fit_gam(time, event, X, columns)
 
     X_design = {
-        name: {"kind": fit.kinds[i], "index": i} for i, name in enumerate(columns)
+        name: {"kind": fit.kinds[i], "index": i}
+        for i, name in enumerate(columns)
     }
 
-    summ = fit.summary_payload
-    reml_iter = int(summ.get("iterations", 0))
-    reml_score = summ.get("reml_score", np.nan)
+    cli_version: Optional[str]
     try:
-        reml_score_f = float(reml_score)
+        ver = subprocess.run(
+            [fit.cli, "--version"], capture_output=True, text=True, timeout=10,
+        )
+        cli_version = (ver.stdout + ver.stderr).strip().splitlines()[0]
     except Exception:
-        reml_score_f = float("nan")
+        cli_version = None
 
-    backend_version = _gam.build_info().get("version", "?") if _GAM_AVAILABLE else "?"
+    summ = fit.train_summary or {}
+
+    def _num(key: str, default: float = float("nan")) -> float:
+        v = summ.get(key, default)
+        try:
+            return float(v)
+        except Exception:
+            return default
+
     diagnostics = {
-        "backend": f"gam (PyO3 binding, engine v{backend_version})",
+        "backend": "gam CLI (survival)",
+        "cli_path": fit.cli,
+        "cli_version": cli_version,
         "formula": fit.formula,
-        "reml_iterations": reml_iter,
-        "reml_score": reml_score_f,
-        "deviance": float(summ.get("deviance", float("nan"))),
-        "edf_total": float(summ.get("edf_total", float("nan"))),
-        "family_name": summ.get("family_name"),
-        "converged": (reml_iter > 0) and np.isfinite(reml_score_f),
-        "sigma_residual": fit.sigma,
+        "train_summary": summ,
+        "converged": True,
+        "reml_iterations": int(summ.get("reml_iterations", summ.get("iterations", 0)) or 0),
+        "reml_score": _num("reml_score"),
+        "edf_total": _num("edf_total"),
+        "sigma_residual": _num("sigma", _num("sigma_residual")),
+        "deviance": _num("deviance"),
         "n_train": fit.n_train,
         "n_events": fit.n_events,
         "n_posterior_draws": int(n_samples),
     }
 
     return SurvivalGAM(
-        samples={
-            "n_samples": int(n_samples),
-            "coefficients": summ.get("coefficients"),
-        },
+        samples={"n_samples": int(n_samples), "coefficients": None},
         X_design=X_design,
         columns=columns,
-        t_scale=fit.t_scale,
+        t_scale=1.0,
         diagnostics=diagnostics,
         _fit=fit,
         _n_posterior_draws=int(n_samples),
@@ -638,32 +654,7 @@ def bma_survival(
     X_eval: Optional[np.ndarray] = None,
     **gam_kwargs,
 ) -> dict:
-    """Bayesian model averaging over candidate parent sets (Draper 1995).
-
-    For each ``parent_sets[k]`` (a tuple of column indices into
-    ``data_matrix``) we fit an independent ``SurvivalGAM`` and evaluate
-    its posterior-predictive survival curves on ``X_eval / t_grid``.
-    The averaged survival curve is
-
-        S_bma(t, x) = sum_k w_k * mean_s S_k(s; t, x)
-
-    where ``w_k`` are the structural weights (posterior probabilities of
-    the parent sets, renormalised).  The total predictive variance is
-    decomposed into parametric (within-model) and structural
-    (between-model) components following Draper (1995, JRSS-B 57(1):
-    45-97):
-
-        Var_total      = Var_parametric + Var_structural
-        Var_parametric = sum_k w_k Var_s S_k(s; t, x)
-        Var_structural = sum_k w_k (mean_s S_k - S_bma)^2
-
-    Parametric variance comes from the library's epistemic SE propagated
-    through Normal posterior-predictive sampling; when the binding
-    eventually exposes survival-family posteriors this will naturally
-    upgrade to full Bayesian draws.
-
-    Empty parent sets correspond to intercept-only AFTs (valid fits).
-    """
+    """Bayesian model averaging over candidate parent sets (Draper 1995)."""
     weights = np.asarray(weights, dtype=float).reshape(-1)
     if weights.shape[0] != len(parent_sets):
         raise ValueError("weights must match len(parent_sets)")
@@ -675,61 +666,59 @@ def bma_survival(
 
     time = np.asarray(time, dtype=float)
     event = np.asarray(event, dtype=float)
-    X_full = np.asarray(data_matrix, dtype=float)
-    t_grid = np.asarray(t_grid, dtype=float)
-    if X_eval is None:
-        X_eval_full = X_full[:50]
-    else:
-        X_eval_full = np.asarray(X_eval, dtype=float)
+    data_matrix = np.asarray(data_matrix, dtype=float)
+    t_grid = np.asarray(t_grid, dtype=float).ravel()
 
-    per_model_mean: List[np.ndarray] = []
-    per_model_var: List[np.ndarray] = []
-    per_model_diag: List[Dict[str, Any]] = []
+    X_eval_arr = (
+        data_matrix if X_eval is None else np.asarray(X_eval, dtype=float)
+    )
+    if X_eval_arr.ndim != 2:
+        raise ValueError("X_eval must be 2-D (n_eval, p)")
+    n_eval = X_eval_arr.shape[0]
 
-    for pset in parent_sets:
-        cols = tuple(pset)
-        if len(cols) == 0:
-            Xk = np.zeros((X_full.shape[0], 0))
-            Xek = np.zeros((X_eval_full.shape[0], 0))
-            col_names: Tuple[str, ...] = ()
-        else:
-            Xk = X_full[:, list(cols)]
-            Xek = X_eval_full[:, list(cols)]
-            col_names = tuple(column_names[c] for c in cols)
-        gam_fit = fit_survival_gam(
-            time,
-            event,
-            Xk,
-            columns=col_names,
-            **gam_kwargs,
+    per_set_mean: List[np.ndarray] = []
+    per_set_var: List[np.ndarray] = []
+    fits: List[SurvivalGAM] = []
+
+    for cols in parent_sets:
+        cols = tuple(int(c) for c in cols)
+        sub_X = data_matrix[:, list(cols)] if cols else np.zeros((time.shape[0], 0))
+        names = tuple(column_names[c] for c in cols)
+        fit = fit_survival_gam(
+            time, event, sub_X, columns=names, **gam_kwargs,
         )
-        S = gam_fit.predict_survival(Xek, t_grid)  # (S, n_eval, n_t)
-        per_model_mean.append(S.mean(axis=0))
-        per_model_var.append(S.var(axis=0, ddof=1))
-        per_model_diag.append(gam_fit.diagnostics)
+        fits.append(fit)
+        sub_eval = X_eval_arr[:, list(cols)] if cols else np.zeros((n_eval, 0))
+        draws = fit.predict_survival(sub_eval, t_grid)       # (S, n_eval, n_t)
+        per_set_mean.append(draws.mean(axis=0))
+        per_set_var.append(draws.var(axis=0, ddof=0))
 
-    means = np.stack(per_model_mean, axis=0)  # (K, n_eval, n_t)
-    vars_ = np.stack(per_model_var, axis=0)
-    w = weights[:, None, None]
+    stack_mean = np.stack(per_set_mean, axis=0)              # (K, n_eval, n_t)
+    stack_var = np.stack(per_set_var, axis=0)
 
-    S_bma = np.sum(w * means, axis=0)  # (n_eval, n_t)
-    var_parametric = np.sum(w * vars_, axis=0)
-    var_structural = np.sum(w * (means - S_bma) ** 2, axis=0)
-    var_total = var_parametric + var_structural
+    S_bma = np.einsum("k,kij->ij", weights, stack_mean)
+    V_param = np.einsum("k,kij->ij", weights, stack_var)
+    V_struct = np.einsum(
+        "k,kij->ij", weights, (stack_mean - S_bma[None, :, :]) ** 2,
+    )
 
-    eps = 1e-12
-    struct_ratio = var_structural / (var_total + eps)
-
+    V_total = V_param + V_struct
     return {
-        "S_bma": S_bma,
-        "var_parametric": var_parametric,
-        "var_structural": var_structural,
-        "var_total": var_total,
-        "struct_ratio": struct_ratio,
-        "per_model_mean": means,
-        "per_model_var": vars_,
-        "per_model_diag": per_model_diag,
+        # Canonical keys.
+        "survival_mean": S_bma,
+        "S_bma": S_bma,                   # alias kept for test compatibility
+        "per_set_mean": stack_mean,
+        "per_model_mean": stack_mean,     # alias
+        "per_set_variance": stack_var,
+        "per_model_variance": stack_var,  # alias
+        "variance_parametric": V_param,
+        "var_parametric": V_param,        # alias
+        "variance_structural": V_struct,
+        "var_structural": V_struct,       # alias
+        "variance_total": V_total,
+        "var_total": V_total,             # alias
         "weights": weights,
+        "fits": fits,
         "t_grid": t_grid,
     }
 

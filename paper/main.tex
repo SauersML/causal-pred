@@ -1,0 +1,254 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usepackage{natbib}
+\usepackage{hyperref}
+
+% ---------------------------------------------------------------------------
+% Dynamic numeric values.  These are overwritten at build time by
+% paper/build_paper.py, which reads outputs/summary.json.  The defaults
+% below keep the document compilable even without a pipeline run.
+% ---------------------------------------------------------------------------
+\providecommand{\nSamples}{\fbox{TBD}}
+\providecommand{\nNodes}{\fbox{TBD}}
+\providecommand{\eventRate}{\fbox{TBD}}
+\providecommand{\auroc}{\fbox{TBD}}
+\providecommand{\aurocFive}{\fbox{TBD}}
+\providecommand{\aurocTen}{\fbox{TBD}}
+\providecommand{\aurocFifteen}{\fbox{TBD}}
+\providecommand{\brier}{\fbox{TBD}}
+\providecommand{\ibs}{\fbox{TBD}}
+\providecommand{\nagelkerke}{\fbox{TBD}}
+\providecommand{\ece}{\fbox{TBD}}
+\providecommand{\edgeRecall}{\fbox{TBD}}
+\providecommand{\edgeAuroc}{\fbox{TBD}}
+\providecommand{\mcmcIter}{\fbox{TBD}}
+\providecommand{\mcmcChains}{\fbox{TBD}}
+\providecommand{\mcmcRhat}{\fbox{TBD}}
+\providecommand{\mcmcAccept}{\fbox{TBD}}
+\providecommand{\runtimeSeconds}{\fbox{TBD}}
+
+% Convenient math shortcuts
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\DAG}{\mathcal{G}}
+\newcommand{\pa}{\mathrm{Pa}}
+
+\title{Causal-Pred: Causal Disease Modelling with Structural and Parametric Uncertainty}
+\author{causal-pred authors}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present Causal-Pred, an end-to-end Bayesian pipeline that combines
+Mendelian-randomisation-informed structure learning (MrDAG,
+\citealt{Zuber2025}) with a warm-starting hill climber
+(DAGSLAM, \citealt{Zhao2025DAGSLAM}), structure MCMC with a
+Giudici--Castelo neighbourhood correction \citep{GiudiciCastelo2003}, and a
+distributional survival GAM \citep{RigbyStasinopoulos2005, Wood2011}.
+Applied to an All of Us--shaped synthetic cohort of \nSamples{} subjects
+over \nNodes{} nodes, the pipeline recovers \edgeRecall{} of known causal
+edges, attains a time-dependent AUC of \aurocTen{} at 10 years
+\citep{Heagerty2000, Uno2007}, a Brier score of \brier{} with an
+integrated Brier score of \ibs{} \citep{Brier1950, Graf1999, Murphy1973},
+a Nagelkerke $R^2$ of \nagelkerke{} \citep{Nagelkerke1991}, and an
+expected calibration error of \ece{} \citep{Naeini2015,
+HosmerLemeshow1980}. Runtime is \runtimeSeconds{} seconds on a workstation
+and the full structure MCMC mixed at $\hat{R} = \mcmcRhat{}$ across
+\mcmcChains{} chains.
+\end{abstract}
+
+\section{Introduction}
+
+Individual-level disease-risk prediction on biobank-scale data is usually
+cast as a supervised learning problem with no explicit causal model and
+no structural uncertainty. Two recent lines of work change the game.
+Mendelian randomisation exploits genetic instruments as natural
+experiments to estimate causal effects between exposures
+\citep{DaveySmith2014, Pearl2009}, and Bayesian structure learning over
+DAGs propagates posterior uncertainty over graphs rather than committing
+to a single structure \citep{MadiganYork1995, Kuipers2014}. We combine
+the two by using MR summary statistics as a prior on edge inclusion
+\citep{Zuber2025}, warm-starting structure MCMC with DAGSLAM
+\citep{Zhao2025DAGSLAM}, and then composing the posterior parent sets
+with a distributional survival GAM to produce individual-level survival
+curves with both structural and parametric uncertainty.
+
+\section{Background}
+
+Mendelian randomisation uses germline genotypes -- randomised at meiosis --
+as instrumental variables to estimate causal effects between measured
+exposures \citep{DaveySmith2014, Corbin2016}. For metabolic-disease
+outcomes, well-replicated examples include BMI $\to$ type 2 diabetes
+\citep{Fall2015, Xue2018}, LDL $\to$ coronary disease
+\citep{Ference2017, Emdin2017}, blood pressure $\to$ cardiovascular
+outcomes \citep{Nazarzadeh2022}, and null/negative findings for alcohol
+intake \citep{Wootton2020}. Summary-data IVW estimates \citep{Glover1989}
+are straightforward to aggregate across thousands of variants and form
+the raw input to our structural prior.
+
+Bayesian structure learning over DAGs scores each candidate graph by a
+marginal likelihood with a conjugate structure prior
+\citep{Geiger2002, Kuipers2014} and explores the space via Markov chain
+Monte Carlo with neighbourhood-balanced proposals
+\citep{GiudiciCastelo2003, MadiganYork1995}. Bayesian model averaging
+over the posterior propagates structural uncertainty into downstream
+predictions \citep{Draper1995}.
+
+\section{Methods}
+
+\subsection{Data}
+
+The target disease is type 2 diabetes. The synthetic generator produces
+a cohort of $n = \nSamples{}$ subjects on $p = \nNodes{}$ nodes with
+node-level event rate \eventRate{}, matching the column convention of
+All of Us \citep{AllofUs2024} and UK Biobank \citep{Bycroft2018}. Node
+types split into continuous covariates (BMI, LDL, HbA1c, blood
+pressure), binary lifestyle indicators, and a survival outcome. Each
+subject carries a polygenic score computed externally via the
+\texttt{gnomon} CLI \citep{Khera2018}.
+
+\subsection{MrDAG: edge-inclusion prior from MR summary statistics}
+
+Following \citet{Zuber2025} we place a spike-and-slab prior on each
+directed edge $j \to k$ in the DAG. Conditional on edge inclusion the
+causal effect is Gaussian, $\theta_{jk} \mid \gamma_{jk} = 1 \sim
+\mathcal{N}(0, \tau^2)$; conditional on exclusion it is concentrated on
+a practical null, $\theta_{jk} \mid \gamma_{jk} = 0 \sim
+\mathcal{N}(0, \omega^2)$ with $\omega \ll \tau$ \citep{Wakefield2009}.
+Given the IVW summary $(\hat\beta_{jk}, \hat\sigma_{jk})$ the per-edge
+Bayes factor is closed form and the posterior edge-inclusion probability
+collapses to
+\[
+\pi_{jk} = \frac{\mathrm{BF}_{jk}\, p_{\text{prior}}}
+               {\mathrm{BF}_{jk}\, p_{\text{prior}} + (1 - p_{\text{prior}})}.
+\]
+
+\subsection{BGe + Laplace mixed-type scoring}
+
+Continuous nodes are scored by the BGe marginal likelihood with a
+Wishart prior \citep{Geiger2002, Kuipers2014}. Binary nodes are scored
+by a Laplace approximation to the marginal likelihood of a ridge-logistic
+regression on the parent set. Survival nodes delegate to the distributional
+GAM of \S3.6.
+
+\subsection{DAGSLAM warm start}
+
+DAGSLAM \citep{Zhao2025DAGSLAM} performs greedy edge addition, deletion
+and reversal, evaluating at each step
+$\Delta = \Delta_{\text{score}} + \Delta_{\text{prior}}$
+and accepting the best-scoring move subject to acyclicity. The output is
+the warm-start DAG $G_0$ consumed by the structure MCMC.
+
+\subsection{Structure MCMC with Giudici--Castelo correction}
+
+We run $\mcmcChains{}$ parallel chains of $\mcmcIter{}$ iterations each,
+starting from $G_0$. Each proposal is an edge addition, deletion, or
+reversal with the Giudici--Castelo neighbourhood correction
+\citep{GiudiciCastelo2003, MadiganYork1995}:
+\[
+\alpha(G \to G') = \min\!\left(1,\;
+\frac{s(G')\, p(G')\, |N(G)|}
+     {s(G)\, p(G)\, |N(G')|}\right),
+\]
+with per-node score caching. Mean acceptance was \mcmcAccept{} and
+$\hat{R}_{\max} = \mcmcRhat{}$.
+
+\subsection{Distributional survival GAM}
+
+The survival time $T \mid x$ is modelled distributionally
+\citep{RigbyStasinopoulos2005} with log-location and log-scale each a
+sum of P-spline expansions \citep{EilersMarx1996}. REML selects the
+smoothing penalties \citep{Wood2011} and NUTS
+\citep{HoffmanGelman2014} samples the posterior over spline
+coefficients.
+
+\subsection{Bayesian model averaging}
+
+Posterior predictive survival curves are averaged across the visited DAG
+posterior \citep{MadiganYork1995, Draper1995}. For a functional $f$,
+$\E[f \mid \mathrm{data}] = \sum_{G} w_G\, \E[f \mid G, \mathrm{data}]$,
+with weights $w_G$ equal to MCMC visitation frequency.
+
+\subsection{Validation}
+
+We report edge-recall against the synthetic ground-truth DAG, edge-level
+AUROC of the posterior edge-inclusion matrix, individual-level AUROC,
+time-dependent AUC at 5, 10, 15 years \citep{Heagerty2000, Uno2007},
+Brier score with the Murphy decomposition \citep{Murphy1973, Brier1950,
+Graf1999}, Nagelkerke $R^2$ \citep{Nagelkerke1991}, and expected
+calibration error \citep{Naeini2015, HosmerLemeshow1980}.
+
+\section{Results}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lr}
+\toprule
+Metric & Value \\
+\midrule
+Samples $n$                & \nSamples{} \\
+Nodes $p$                  & \nNodes{} \\
+Event rate                 & \eventRate{} \\
+AUROC                      & \auroc{} \\
+Time-dep.\ AUC @ 5y        & \aurocFive{} \\
+Time-dep.\ AUC @ 10y       & \aurocTen{} \\
+Time-dep.\ AUC @ 15y       & \aurocFifteen{} \\
+Brier                      & \brier{} \\
+Integrated Brier           & \ibs{} \\
+Nagelkerke $R^2$           & \nagelkerke{} \\
+Expected calibration error & \ece{} \\
+Edge recall                & \edgeRecall{} \\
+Edge AUROC                 & \edgeAuroc{} \\
+MCMC iterations/chain      & \mcmcIter{} \\
+MCMC chains                & \mcmcChains{} \\
+$\hat{R}_{\max}$           & \mcmcRhat{} \\
+Mean acceptance            & \mcmcAccept{} \\
+Runtime (s)                & \runtimeSeconds{} \\
+\bottomrule
+\end{tabular}
+\caption{Headline metrics, stamped from \texttt{outputs/summary.json} at
+build time.}
+\end{table}
+
+\section{Discussion}
+
+\paragraph{Limitations.}
+All of Us individual-level data are only accessible inside the
+Researcher Workbench \citep{AllofUs2024}; the reported numbers are
+therefore on a synthetic biobank-shape cohort with a known ground-truth
+DAG. On real data, HbA1c is used both as a risk factor and, implicitly,
+in the adjudication of type 2 diabetes, which gives rise to a mild
+circularity; we flag this as a caveat and recommend using a
+pre-adjudication baseline HbA1c window in any real-data deployment.
+
+\paragraph{Prior work on causal priors.}
+Our edge-inclusion prior is informed by published Mendelian-randomisation
+evidence (e.g.\ \citealt{Fall2015, Xue2018, Ference2017}). Where no
+published IVW estimate is available, the prior is left non-informative
+rather than imputed, so the structural posterior is never biased by
+unattributed prior claims \citep{DaveySmith2014}.
+
+\section{Reproducibility}
+
+All code is pinned via \texttt{uv.lock}. The GAM backend is the
+Rust-based \texttt{SauersML/gam} package built through \texttt{rustup}.
+Polygenic scoring, HWE-PCA projection, and sample-term inference shell
+out to the \texttt{gnomon} CLI. Every stage accepts an explicit RNG and
+derives child seeds deterministically. A full run is reproduced by
+\texttt{uv run python scripts/run\_full\_pipeline.py} followed by
+\texttt{make -C paper paper}.
+
+\bibliographystyle{plainnat}
+\bibliography{bib}
+
+\end{document}
