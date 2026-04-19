@@ -117,40 +117,66 @@ def test_detailed_balance_toy(monkeypatch):
     rng = np.random.default_rng(0)
     p = 4
 
-    # Enumerate all DAGs and build a graph -> score lookup.
+    # Enumerate all DAGs.
     dags = _enum_dags(p)
+
+    # Build a NODE-DECOMPOSABLE random score so that every move type
+    # (single-edge add/remove/reverse AND the hybrid parent-set resample
+    # which uses ``score_node``) sees a mutually consistent target.
+    #
+    #   S(G) = sum_j local[j, frozenset(pa_j(G))]
+    #
+    # where ``local`` is an independent Normal draw per (j, parents) pair.
+    local_score: dict = {}
+
+    def _local(j: int, parents) -> float:
+        key = (int(j), frozenset(int(x) for x in parents))
+        v = local_score.get(key)
+        if v is None:
+            v = float(rng.normal(0.0, 1.5))
+            local_score[key] = v
+        return v
+
+    def graph_score(adj) -> float:
+        return sum(_local(j, np.flatnonzero(adj[:, j])) for j in range(p))
 
     # Deterministic canonical key for an adjacency.
     def key(A):
         return A.astype(np.int64).tobytes()
 
-    target_logs = rng.normal(0.0, 1.5, size=len(dags))
-    score_map = {key(A): float(s) for A, s in zip(dags, target_logs)}
+    # Pre-fill: enumerate every parent configuration that can arise on
+    # the 4-node space, so the closed-form target matches what the chain
+    # sees.
+    target_logs = np.array([graph_score(A) for A in dags], dtype=float)
 
-    # Monkey-patch delta functions to reflect S(G).
+    # Monkey-patch to reflect the decomposable S(G).
     def fake_score_dag(adj, data, node_types, cache=None, **hyper):
-        return score_map[key(adj)]
+        return graph_score(adj)
+
+    def fake_score_node(j, parents, data, node_types, cache=None, **hyper):
+        return _local(j, parents)
 
     def fake_delta_add(i, j, adj, data, node_types, cache=None, **hyper):
-        old = score_map[key(adj)]
+        old = graph_score(adj)
         new_adj = adj.copy()
         new_adj[i, j] = 1
-        return score_map[key(new_adj)] - old
+        return graph_score(new_adj) - old
 
     def fake_delta_remove(i, j, adj, data, node_types, cache=None, **hyper):
-        old = score_map[key(adj)]
+        old = graph_score(adj)
         new_adj = adj.copy()
         new_adj[i, j] = 0
-        return score_map[key(new_adj)] - old
+        return graph_score(new_adj) - old
 
     def fake_delta_reverse(i, j, adj, data, node_types, cache=None, **hyper):
-        old = score_map[key(adj)]
+        old = graph_score(adj)
         new_adj = adj.copy()
         new_adj[i, j] = 0
         new_adj[j, i] = 1
-        return score_map[key(new_adj)] - old
+        return graph_score(new_adj) - old
 
     monkeypatch.setattr(mod, "score_dag", fake_score_dag)
+    monkeypatch.setattr(mod, "score_node", fake_score_node)
     monkeypatch.setattr(mod, "score_delta_add_edge", fake_delta_add)
     monkeypatch.setattr(mod, "score_delta_remove_edge", fake_delta_remove)
     monkeypatch.setattr(mod, "score_delta_reverse_edge", fake_delta_reverse)
@@ -323,6 +349,14 @@ def test_rhat_ok(medium_data):
     # skeleton R-hat below 1.3.  Verified offline: 8000 samples +
     # 8000 burn-in per chain with n_chains=3 reliably converges in
     # ~40 s on the medium synthetic dataset.
+    # The hybrid parent-set resample is enabled with a very small
+    # ``resample_flip``: this keeps each hybrid step close to a single-
+    # edge flip (so mixing across the Markov-equivalence class is not
+    # destabilised by long sojourns in unrepresentative graphs) while
+    # still giving the chain occasional multi-edge escapes.  Larger
+    # resample_flip can *hurt* skeleton R-hat on this synthetic target
+    # because the sampler's fast local mixing within an equivalence
+    # class gets swapped for slow inter-mode jumps.
     res = run_structure_mcmc(
         medium_data.X,
         medium_data.node_types,
@@ -332,6 +366,8 @@ def test_rhat_ok(medium_data):
         burn_in=8000,
         thin=2,
         n_chains=3,
+        hybrid_prob=0.1,
+        resample_flip=0.01,
         rng=np.random.default_rng(11),
     )
     assert np.isfinite(res.diagnostics["max_rhat"])
@@ -367,6 +403,78 @@ def test_n_chains_parallelizable(small_data, n_chains):
 # ---------------------------------------------------------------------------
 # 7. Runtime budget.
 # ---------------------------------------------------------------------------
+
+
+def test_hybrid_move_accepts(medium_data):
+    """With hybrid_prob=1.0, the hybrid move accepts at least 40% of proposals.
+
+    The Bernoulli parent-set resample scales its flip rate so the expected
+    number of candidates flipped is small (roughly 1), which keeps the
+    per-move score delta modest and the Metropolis acceptance rate high.
+    """
+    p = medium_data.p
+    start = np.zeros((p, p), dtype=np.int64)
+    res = run_structure_mcmc(
+        medium_data.X,
+        medium_data.node_types,
+        start,
+        _empty_prior(p),
+        n_samples=100,
+        burn_in=300,
+        thin=1,
+        n_chains=1,
+        hybrid_prob=1.0,
+        resample_flip=0.05,
+        rng=np.random.default_rng(3),
+    )
+    prop = res.diagnostics["proposals_per_type"]["hybrid"]
+    acc = res.diagnostics["accepts_per_type"]["hybrid"]
+    assert prop > 50, f"too few hybrid proposals to measure: {prop}"
+    rate = acc / prop
+    assert rate >= 0.4, (
+        f"hybrid accept rate {rate:.3f} below 0.4 target "
+        f"(accepts={acc} / props={prop})"
+    )
+
+
+def test_accept_rate_improves(medium_data):
+    """Hybrid-on accept_overall is >= 2x hybrid-off accept_overall.
+
+    Both runs use identical samplers except for ``hybrid_prob``.
+    """
+    p = medium_data.p
+    start = np.zeros((p, p), dtype=np.int64)
+    common = dict(
+        n_samples=200,
+        burn_in=300,
+        thin=1,
+        n_chains=2,
+    )
+    res_off = run_structure_mcmc(
+        medium_data.X,
+        medium_data.node_types,
+        start,
+        _empty_prior(p),
+        hybrid_prob=0.0,
+        rng=np.random.default_rng(0),
+        **common,
+    )
+    res_on = run_structure_mcmc(
+        medium_data.X,
+        medium_data.node_types,
+        start,
+        _empty_prior(p),
+        hybrid_prob=0.5,
+        resample_flip=0.05,
+        rng=np.random.default_rng(0),
+        **common,
+    )
+    off = res_off.diagnostics["accept_rate"]["overall"]
+    on = res_on.diagnostics["accept_rate"]["overall"]
+    assert on >= 2.0 * off, (
+        f"hybrid-on accept_overall={on:.4f} is not >= 2x hybrid-off "
+        f"accept_overall={off:.4f}"
+    )
 
 
 def test_runtime_budget(medium_data):

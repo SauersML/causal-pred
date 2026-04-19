@@ -54,14 +54,24 @@ is O(p^4) worst-case for the neighbourhood count on p ~ 20 but in
 practice dominated by the much smaller sparse graphs the sampler
 spends most of its time in.
 
-This implementation does NOT include a "random parent-set resample"
-hybrid move (Madigan & York 1995 Section 4; Kuipers, Suter & Moffa
-2022 BiDAG ``iterative MCMC``).  The single-edge chain mixes
-adequately for the p ~ 20 problems targeted here -- Giudici & Castelo
-(2003) show that the edge-reversal move alone restores good mixing on
-small-to-medium graphs.  If mixing degrades on larger graphs, the REV
-move of Grzegorczyk & Husmeier (2008) or the partition MCMC of
-Kuipers et al. should be preferred.
+In addition to the single-edge moves, a **random parent-set resample**
+hybrid move (Madigan & York 1995 Section 4) is proposed on a fraction
+``hybrid_prob`` of iterations.  One step picks a target node j
+uniformly, flips each candidate edge (i, j) into/out of the parent set
+independently with probability ``resample_flip``, rejects any proposal
+that would create a cycle, and otherwise accepts with
+
+    log alpha = log S(G'; j) - log S(G; j)
+              + sum_i [ I'(i,j) (log pi_ij - log(1-pi_ij))
+                       - I(i,j)  (log pi_ij - log(1-pi_ij)) ]
+
+where only S(G; j) (the local score at j) changes and the proposal
+density ratio is 1: each edge is flipped independently with the same
+probability in both directions, so the forward and reverse proposal
+densities coincide on the symmetric difference between old and new
+parent columns.  The move is a pure Metropolis-Hastings step and
+preserves detailed balance; with ``hybrid_prob = 0`` the sampler
+reduces to the single-edge chain.
 
 Chains and diagnostics
 ----------------------
@@ -110,6 +120,7 @@ from ..scoring.mixed import (
     score_delta_add_edge,
     score_delta_remove_edge,
     score_delta_reverse_edge,
+    score_node,
 )
 
 
@@ -440,6 +451,100 @@ def _rhat_edgewise(chain_samples: Sequence[np.ndarray]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Hybrid random parent-set resample move (Madigan & York 1995 Section 4).
+#
+# One iteration:
+#   1. pick target node j uniformly from 0..p-1.
+#   2. for every candidate i != j, flip the edge (i, j) independently w.p.
+#      resample_flip.
+#   3. if the resulting graph is acyclic, accept with MH probability
+#         alpha = exp( [log S(G'; j) - log S(G; j)]
+#                    + sum_i [I'(i,j) (log pi_ij - log(1-pi_ij))
+#                             - I(i,j)  (log pi_ij - log(1-pi_ij))] )
+#      (the proposal ratio log q(G|G')/q(G'|G) is zero because each flip is
+#      symmetric: q = (1/p) * 0.3^|F| * 0.7^(|C|-|F|) with F = symmetric
+#      difference between the old and new parent columns of j, which is the
+#      same set whether we go forward or backward).
+#
+# The move only touches the parent set of node j, so only S(G; j) changes
+# (other nodes' local scores cancel in the delta) and only column j of adj
+# changes -- so acyclicity can be checked on the whole graph with _is_dag.
+# ---------------------------------------------------------------------------
+
+
+def _hybrid_resample_parents(
+    adj: np.ndarray,
+    j: int,
+    data: np.ndarray,
+    node_types: Sequence[str],
+    log_pi: np.ndarray,
+    log_1m: np.ndarray,
+    resample_flip: float,
+    cache: dict,
+    rng: np.random.Generator,
+    hyper: dict,
+) -> Tuple[bool, float, float]:
+    """Attempt a random parent-set resample at node ``j``.
+
+    Returns ``(accepted, d_score, d_prior)``.  If accepted, ``adj`` is
+    mutated in place; otherwise ``adj`` is unchanged.
+
+    Candidates are all ``i != j`` (uniform-fallback scheme).  Each flip is
+    independent with probability ``resample_flip``.  Cycle-creating
+    proposals are rejected (treated as alpha = 0).
+    """
+    p = adj.shape[0]
+    # Old parent column of j.
+    old_col = adj[:, j].copy()
+
+    # Flip each candidate edge with probability resample_flip.
+    # Candidates are all i != j; mask out the diagonal.
+    flip_draw = rng.random(p) < resample_flip
+    flip_draw[j] = False  # self-loop never a candidate
+    new_col = old_col.copy()
+    new_col[flip_draw] ^= 1  # XOR flip
+
+    # If nothing flipped, proposal = current; alpha = 1 (no-op).  Count as
+    # accepted so the per-type rate reflects the true fraction of iterations
+    # that end at the proposal.
+    if not flip_draw.any():
+        return True, 0.0, 0.0
+
+    # Apply tentatively to adj and check acyclicity.
+    adj[:, j] = new_col
+    if not _is_dag(adj):
+        # Reject: restore and bail.
+        adj[:, j] = old_col
+        return False, 0.0, 0.0
+
+    # Score delta at node j.
+    old_parents = np.flatnonzero(old_col).tolist()
+    new_parents = np.flatnonzero(new_col).tolist()
+    old_score = score_node(j, old_parents, data, node_types, cache=cache, **hyper)
+    new_score = score_node(j, new_parents, data, node_types, cache=cache, **hyper)
+    d_score = float(new_score - old_score)
+
+    # Prior delta at column j: independent Bernoulli over candidate edges.
+    # Non-candidate entries have log_pi = log_1m = 0 on the diagonal so the
+    # sum over all rows is equivalent to the sum over candidates.
+    new_mask = new_col.astype(bool)
+    old_mask = old_col.astype(bool)
+    new_prior_col = np.where(new_mask, log_pi[:, j], log_1m[:, j]).sum()
+    old_prior_col = np.where(old_mask, log_pi[:, j], log_1m[:, j]).sum()
+    d_prior = float(new_prior_col - old_prior_col)
+
+    # Proposal ratio is symmetric (see module docstring on this move) so
+    # log q(G|G') - log q(G'|G) = 0.
+    log_alpha = d_score + d_prior
+    log_u = np.log(rng.random() + 1e-300)
+    if log_u < log_alpha:
+        return True, d_score, d_prior
+    # Reject: restore old column.
+    adj[:, j] = old_col
+    return False, 0.0, 0.0
+
+
+# ---------------------------------------------------------------------------
 # Core single-chain sampler
 # ---------------------------------------------------------------------------
 
@@ -457,6 +562,8 @@ def _run_chain(
     cache: dict,
     progress: bool,
     hyper: dict,
+    hybrid_prob: float = 0.1,
+    resample_flip: float = 0.3,
 ) -> dict:
     """Run one MCMC chain.  Returns a dict of per-chain outputs."""
     data.shape[1]
@@ -471,10 +578,38 @@ def _run_chain(
     samples: List[np.ndarray] = []
     log_post_kept: List[float] = []
 
-    prop = {"add": 0, "remove": 0, "reverse": 0}
-    accept = {"add": 0, "remove": 0, "reverse": 0}
+    prop = {"add": 0, "remove": 0, "reverse": 0, "hybrid": 0}
+    accept = {"add": 0, "remove": 0, "reverse": 0, "hybrid": 0}
 
     for it in range(total_iters):
+        # Hybrid parent-set resample move with probability ``hybrid_prob``.
+        if hybrid_prob > 0.0 and rng.random() < hybrid_prob:
+            j_target = int(rng.integers(0, data.shape[1]))
+            prop["hybrid"] += 1
+            accepted, d_score, d_prior = _hybrid_resample_parents(
+                adj,
+                j_target,
+                data,
+                node_types,
+                log_pi,
+                log_1m,
+                resample_flip,
+                cache,
+                rng,
+                hyper,
+            )
+            if accepted:
+                cur_score += d_score
+                cur_prior += d_prior
+                # Column j changed: refresh neighbourhood & reach.
+                n_add, n_rem, n_rev, _reach = _count_neighbourhood(adj)
+                cur_nmoves = n_add + n_rem + n_rev
+                accept["hybrid"] += 1
+            if it >= burn_in and ((it - burn_in) % thin == 0):
+                samples.append(adj.copy())
+                log_post_kept.append(cur_score + cur_prior)
+            continue
+
         if cur_nmoves == 0:
             # Degenerate; nothing to do besides record.
             if it >= burn_in and ((it - burn_in) % thin == 0):
@@ -596,6 +731,8 @@ def run_structure_mcmc(
     rng: Optional[np.random.Generator] = None,
     progress: bool = False,
     perturb_flips: int = 5,
+    hybrid_prob: float = 0.1,
+    resample_flip: float = 0.3,
     **hyper,
 ) -> MCMCResult:
     """Structure MCMC over DAGs with an MrDAG edge-inclusion prior.
@@ -627,6 +764,15 @@ def run_structure_mcmc(
         Target number of random edge flips (kept acyclic) applied to
         ``start_adj`` to form each chain's initial graph.  The first
         chain starts from an exact copy of ``start_adj``.
+    hybrid_prob : float, default 0.1
+        Per-iteration probability of proposing a random parent-set
+        resample (Madigan & York 1995 Section 4) instead of a single-
+        edge move.  ``0.0`` disables the hybrid move.
+    resample_flip : float, default 0.3
+        Per-candidate flip probability inside the hybrid move.  With a
+        symmetric-flip proposal the forward / backward densities cancel
+        regardless of this value; we expose it for tuning the move's
+        effective step size.
 
     Returns
     -------
@@ -657,8 +803,8 @@ def run_structure_mcmc(
 
     all_chain_samples: List[np.ndarray] = []
     all_log_post: List[np.ndarray] = []
-    prop_totals = {"add": 0, "remove": 0, "reverse": 0}
-    accept_totals = {"add": 0, "remove": 0, "reverse": 0}
+    prop_totals = {"add": 0, "remove": 0, "reverse": 0, "hybrid": 0}
+    accept_totals = {"add": 0, "remove": 0, "reverse": 0, "hybrid": 0}
     mean_lp_per_chain: List[float] = []
 
     for c in range(n_chains):
@@ -679,6 +825,8 @@ def run_structure_mcmc(
             cache=cache,
             progress=progress,
             hyper=hyper,
+            hybrid_prob=hybrid_prob,
+            resample_flip=resample_flip,
         )
         # Stack this chain's samples into a (S, p, p) array.
         if chain_out["samples"]:

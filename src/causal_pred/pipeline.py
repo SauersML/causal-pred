@@ -290,6 +290,8 @@ def _run_mcmc(
         burn_in=burn_in,
         thin=thin,
         n_chains=n_chains,
+        hybrid_prob=0.3,
+        resample_flip=0.01,
         rng=np.random.default_rng(seed + 4),
     )
     edge_probs = np.asarray(result.edge_probs, dtype=float)
