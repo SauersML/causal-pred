@@ -47,6 +47,10 @@ figures:
 	else \
 		echo "[paper] no $(PLOT_SRC); run the pipeline first." ; \
 	fi
+	@if [ -f "$(REPO_ROOT)/outputs/benchmarks.png" ]; then \
+		cp -f $(REPO_ROOT)/outputs/benchmarks.png $(FIG_DST)/ ; \
+		echo "[paper] copied outputs/benchmarks.png -> $(FIG_DST)/" ; \
+	fi
 
 clean:
 	rm -f main.aux main.bbl main.blg main.log main.out main.toc main.fdb_latexmk main.fls main.synctex.gz

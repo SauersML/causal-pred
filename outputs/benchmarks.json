@@ -1,0 +1,166 @@
+{
+  "dataset": {
+    "n": 1500,
+    "p": 18,
+    "event_rate": 0.42533333333333334
+  },
+  "baselines": {
+    "kaplan_meier": {
+      "nagelkerke_at_10y": -0.014405048019965092,
+      "time_dep_auc": {
+        "times": [
+          5.0,
+          10.0,
+          15.0
+        ],
+        "auc": [
+          0.5,
+          0.4999999999999999,
+          0.5
+        ],
+        "integrated_auc": 0.4999999999999999
+      },
+      "ibs": 0.15837286036849182,
+      "ibs_km": 0.15837286036849182,
+      "scaled_brier": 1.0,
+      "runtime_s": 0.0028072499990230426,
+      "model": "kaplan_meier",
+      "note": "Population-level marginal survival; identical prediction per individual, so Nagelkerke R^2 and AUC are not meaningful."
+    },
+    "cox_ph": {
+      "nagelkerke_at_10y": 0.16730669904082948,
+      "time_dep_auc": {
+        "times": [
+          5.0,
+          10.0,
+          15.0
+        ],
+        "auc": [
+          0.7302428474896384,
+          0.7414579042813207,
+          0.7489596824796845
+        ],
+        "integrated_auc": 0.740529584632991
+      },
+      "ibs": 0.1316816058844344,
+      "ibs_km": 0.15837286036849182,
+      "scaled_brier": 0.8314657295324848,
+      "runtime_s": 0.1865152909886092,
+      "model": "cox_ph",
+      "covariates": [
+        "PGS_T2D",
+        "PGS_BMI",
+        "PGS_LDL",
+        "PGS_HbA1c",
+        "age",
+        "sex",
+        "ancestry_PC1",
+        "family_history_T2D",
+        "years_smoking",
+        "physical_activity",
+        "diet_quality",
+        "BMI",
+        "LDL",
+        "HbA1c",
+        "systolic_BP",
+        "hypertension",
+        "cardiovascular_disease"
+      ],
+      "n_params": 17,
+      "llf": -4032.225756832047
+    },
+    "naive_logistic": {
+      "nagelkerke_at_10y": 0.18635155402022177,
+      "time_dep_auc": {
+        "times": [
+          5.0,
+          10.0,
+          15.0
+        ],
+        "auc": [
+          0.7383756860621281,
+          0.7451773903175615,
+          0.7419072137479714
+        ],
+        "integrated_auc": 0.7426594201113057
+      },
+      "ibs": 0.14147108375096953,
+      "ibs_km": 0.15837286036849182,
+      "scaled_brier": 0.8932785795609405,
+      "runtime_s": 0.007187708004494198,
+      "model": "naive_logistic",
+      "covariates": [
+        "PGS_T2D",
+        "PGS_BMI",
+        "PGS_LDL",
+        "PGS_HbA1c",
+        "age",
+        "sex",
+        "ancestry_PC1",
+        "family_history_T2D",
+        "years_smoking",
+        "physical_activity",
+        "diet_quality",
+        "BMI",
+        "LDL",
+        "HbA1c",
+        "systolic_BP",
+        "hypertension",
+        "cardiovascular_disease"
+      ],
+      "n_positives": 277,
+      "t_eval": 10.0
+    },
+    "mr_ivw": {
+      "model": "mr_ivw",
+      "edge_auprc": 0.5298130372043416,
+      "edge_auroc": 0.709375,
+      "bonferroni_alpha": 0.0019230769230769232,
+      "n_tests": 26,
+      "significant_edges": 12,
+      "confusion": {
+        "tp": 7,
+        "fp": 5,
+        "fn": 3,
+        "tn": 11
+      },
+      "n_ground_truth_in_usable": 10,
+      "runtime_s": 0.0009549999958835542
+    },
+    "causal_pred": {
+      "model": "causal_pred",
+      "status": "ok",
+      "nagelkerke_at_10y": 0.24465522045716762,
+      "time_dep_auc": {
+        "times": [
+          5.0,
+          10.0,
+          15.0
+        ],
+        "auc": [
+          0.7351838697983522,
+          0.8278698777449566,
+          0.8114977836425002
+        ],
+        "integrated_auc": 0.8006053522326914
+      },
+      "ibs": 0.12712349133559805,
+      "edge_auroc": 0.8780594405594405,
+      "edge_auprc": 0.5457105250376805,
+      "runtime_s": 23.029204332997324
+    }
+  },
+  "run_config": {
+    "n": 1500,
+    "seed": 20260416,
+    "mcmc_iter": 1500,
+    "mcmc_chains": 4,
+    "gam_samples": 200,
+    "gam_warmup": 100,
+    "skip_full_pipeline": false,
+    "use_real_gwas": true
+  },
+  "git_sha": "0c8e968",
+  "timestamp": "2026-04-19T01:50:55Z",
+  "total_runtime_s": 23.919391791001544
+}
