@@ -439,6 +439,8 @@ def run_causal_pred(
 
         if rng is None:
             rng = np.random.default_rng(20260416)
+        # ``run_pipeline`` takes an integer ``seed`` rather than an RNG object.
+        seed = int(rng.integers(0, 2**31 - 1))
 
         # We re-use the provided dataset -- run_pipeline regenerates its
         # own.  Here we just wrap it and measure.  For tight integration
@@ -450,7 +452,7 @@ def run_causal_pred(
             mcmc_chains=mcmc_chains,
             gam_samples=gam_samples,
             gam_warmup=gam_warmup,
-            rng=rng,
+            seed=seed,
             verbose=False,
         )
 

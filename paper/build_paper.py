@@ -37,6 +37,10 @@ from typing import Any, Mapping
 # - Format is a Python format spec (applied via format(value, fmt)) used only
 #   for floats; ints and strings are stringified directly.
 # - Missing or NaN values fall back to \fbox{TBD}.
+# Dotted paths look up against a merged {summary.json, benchmarks.json}
+# namespace where benchmark entries sit under "baselines.<name>.<key>" and
+# time_dep_auc values are also surfaced as ``time_dep_auc_at_10`` for
+# convenience (nearest grid point to 10 y).
 MACRO_MAP: tuple[tuple[str, str, str], ...] = (
     ("nSamples", "dataset.n", ",d"),
     ("nNodes", "dataset.p", "d"),
@@ -56,6 +60,22 @@ MACRO_MAP: tuple[tuple[str, str, str], ...] = (
     ("mcmcRhat", "mcmc.max_rhat", ".2f"),
     ("mcmcAccept", "mcmc.mean_accept", ".2f"),
     ("runtimeSeconds", "runtime_seconds", ".1f"),
+    # -- benchmark table (from outputs/benchmarks.json) --------------------
+    ("benchKMNagelkerke", "baselines.kaplan_meier.nagelkerke_at_10y", ".3f"),
+    ("benchKMTdAuc", "baselines.kaplan_meier.time_dep_auc_at_10", ".3f"),
+    ("benchKMIbs", "baselines.kaplan_meier.ibs", ".3f"),
+    ("benchCoxNagelkerke", "baselines.cox_ph.nagelkerke_at_10y", ".3f"),
+    ("benchCoxTdAuc", "baselines.cox_ph.time_dep_auc_at_10", ".3f"),
+    ("benchCoxIbs", "baselines.cox_ph.ibs", ".3f"),
+    ("benchLogisticNagelkerke", "baselines.naive_logistic.nagelkerke_at_10y", ".3f"),
+    ("benchLogisticTdAuc", "baselines.naive_logistic.time_dep_auc_at_10", ".3f"),
+    ("benchLogisticIbs", "baselines.naive_logistic.ibs", ".3f"),
+    ("benchMRAuprc", "baselines.mr_ivw.edge_auprc", ".3f"),
+    ("benchMRAuroc", "baselines.mr_ivw.edge_auroc", ".3f"),
+    ("benchCausalPredNagelkerke", "baselines.causal_pred.nagelkerke_at_10y", ".3f"),
+    ("benchCausalPredTdAuc", "baselines.causal_pred.time_dep_auc_at_10", ".3f"),
+    ("benchCausalPredIbs", "baselines.causal_pred.ibs", ".3f"),
+    ("benchCausalPredEdgeAuprc", "baselines.causal_pred.edge_auprc", ".3f"),
 )
 
 TBD = r"\fbox{TBD}"
@@ -73,9 +93,37 @@ BLOCK_END_MARK = "% Convenient math shortcuts"
 
 
 def _lookup(summary: Mapping[str, Any], path: str) -> Any:
-    """Walk a dotted path through nested dicts; return None if missing."""
+    """Walk a dotted path through nested dicts; return None if missing.
+
+    Supports a small number of synthetic keys on top of raw dict walking:
+    * ``time_dep_auc_at_<T>`` under a baseline node resolves to the entry of
+      ``time_dep_auc.auc`` whose matching ``time_dep_auc.times`` entry is
+      nearest to ``T`` (integer years).
+    """
     node: Any = summary
-    for part in path.split("."):
+    parts = path.split(".")
+    for i, part in enumerate(parts):
+        if (
+            isinstance(node, Mapping)
+            and part.startswith("time_dep_auc_at_")
+            and "time_dep_auc" in node
+        ):
+            try:
+                target = float(part.split("_at_", 1)[1])
+            except ValueError:
+                return None
+            td = node["time_dep_auc"]
+            if not isinstance(td, Mapping):
+                return None
+            times = td.get("times") or []
+            aucs = td.get("auc") or []
+            if not times or len(times) != len(aucs):
+                return None
+            best = min(
+                range(len(times)),
+                key=lambda k: abs(float(times[k]) - target),
+            )
+            return aucs[best]
         if isinstance(node, Mapping) and part in node:
             node = node[part]
         else:
@@ -139,11 +187,31 @@ def stamp_tex(tex_source: str, summary: Mapping[str, Any]) -> str:
     return tex_source[:anchor] + new_block + tex_source[anchor:]
 
 
+def _merge(dst: dict, src: Mapping[str, Any]) -> dict:
+    """Shallow-merge ``src`` into ``dst`` without overwriting existing dict
+    subtrees; nested dicts are merged recursively so that summary.json and
+    benchmarks.json can share the same namespace (e.g. both contributing a
+    ``dataset`` section) without clobbering each other."""
+    for k, v in src.items():
+        if k in dst and isinstance(dst[k], dict) and isinstance(v, Mapping):
+            _merge(dst[k], v)
+        else:
+            dst[k] = v
+    return dst
+
+
 def main(argv: list[str] | None = None) -> int:
     repo_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--summary", type=Path, default=repo_root / "outputs" / "summary.json"
+        "--summary",
+        type=Path,
+        action="append",
+        default=None,
+        help=(
+            "Summary JSON to stamp from; may be given multiple times. "
+            "Defaults to outputs/summary.json and outputs/benchmarks.json."
+        ),
     )
     parser.add_argument("--tex", type=Path, default=repo_root / "paper" / "main.tex")
     parser.add_argument(
@@ -154,11 +222,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.summary.exists():
-        with args.summary.open() as fh:
-            summary = json.load(fh)
+    summary_paths: list[Path]
+    if args.summary:
+        summary_paths = list(args.summary)
     else:
-        summary = {}
+        summary_paths = [
+            repo_root / "outputs" / "summary.json",
+            repo_root / "outputs" / "benchmarks.json",
+        ]
+
+    summary: dict = {}
+    loaded: list[str] = []
+    for path in summary_paths:
+        if not path.exists():
+            continue
+        with path.open() as fh:
+            _merge(summary, json.load(fh))
+        loaded.append(str(path))
 
     tex_source = args.tex.read_text()
     stamped = stamp_tex(tex_source, summary)
@@ -166,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
     out_path.write_text(stamped)
     print(
         f"[build_paper] wrote {out_path} ({len(stamped):,} bytes, "
-        f"summary keys={list(summary)})"
+        f"summary sources={loaded}, top-level keys={list(summary)})"
     )
     return 0
 
