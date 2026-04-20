@@ -564,6 +564,7 @@ def _run_chain(
     hyper: dict,
     hybrid_prob: float = 0.1,
     resample_flip: float = 0.3,
+    resample_flip_burn: Optional[float] = None,
 ) -> dict:
     """Run one MCMC chain.  Returns a dict of per-chain outputs."""
     data.shape[1]
@@ -581,7 +582,19 @@ def _run_chain(
     prop = {"add": 0, "remove": 0, "reverse": 0, "hybrid": 0}
     accept = {"add": 0, "remove": 0, "reverse": 0, "hybrid": 0}
 
+    # Effective hybrid flip rate per iteration: during burn-in we optionally
+    # use ``resample_flip_burn`` (if provided) to take larger exploratory
+    # jumps, then step down to ``resample_flip`` for sampling.  Detailed
+    # balance still holds: each kernel applied at a given iteration is
+    # symmetric in its proposal density, so the chain's stationary
+    # distribution under the final kernel is unchanged by the burn-in
+    # schedule (burn-in samples are discarded regardless).
     for it in range(total_iters):
+        flip_it = (
+            resample_flip
+            if (resample_flip_burn is None or it >= burn_in)
+            else float(resample_flip_burn)
+        )
         # Hybrid parent-set resample move with probability ``hybrid_prob``.
         if hybrid_prob > 0.0 and rng.random() < hybrid_prob:
             j_target = int(rng.integers(0, data.shape[1]))
@@ -593,7 +606,7 @@ def _run_chain(
                 node_types,
                 log_pi,
                 log_1m,
-                resample_flip,
+                flip_it,
                 cache,
                 rng,
                 hyper,
@@ -733,6 +746,7 @@ def run_structure_mcmc(
     perturb_flips: int = 5,
     hybrid_prob: float = 0.1,
     resample_flip: float = 0.3,
+    resample_flip_burn: Optional[float] = None,
     **hyper,
 ) -> MCMCResult:
     """Structure MCMC over DAGs with an MrDAG edge-inclusion prior.
@@ -773,6 +787,13 @@ def run_structure_mcmc(
         symmetric-flip proposal the forward / backward densities cancel
         regardless of this value; we expose it for tuning the move's
         effective step size.
+    resample_flip_burn : float, optional
+        If provided, the hybrid-move flip probability used during the
+        burn-in window (``it < burn_in``).  After burn-in the move
+        switches to ``resample_flip``.  A larger value here (e.g. 0.1)
+        lets chains take big exploratory jumps during burn-in so they
+        concentrate in the same posterior mode before the sampling
+        phase starts, which helps R-hat on multi-modal targets.
 
     Returns
     -------
@@ -827,6 +848,7 @@ def run_structure_mcmc(
             hyper=hyper,
             hybrid_prob=hybrid_prob,
             resample_flip=resample_flip,
+            resample_flip_burn=resample_flip_burn,
         )
         # Stack this chain's samples into a (S, p, p) array.
         if chain_out["samples"]:
