@@ -1,0 +1,12 @@
+{
+  "gam_samples": 500,
+  "gam_warmup": 250,
+  "mcmc_chains": 4,
+  "mcmc_iter": 5000,
+  "n": 5000,
+  "output_dir": "/Users/user/causal-pred/outputs",
+  "seed": 20260416,
+  "target": "T2D",
+  "use_real_gwas": true,
+  "verbose": false
+}
