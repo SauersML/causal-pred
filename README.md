@@ -91,18 +91,3 @@ uv run pytest -q
 
 See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for full instructions, CLI flags,
 real-genotype scoring with `gnomon`, and troubleshooting.
-
-## Dependencies
-
-`numpy`, `scipy`, `pandas`, `scikit-learn`, `networkx`, `statsmodels`,
-`matplotlib`, and the Rust-backed `gam` Python library from
-[SauersML/gam](https://github.com/SauersML/gam).
-
-## Disclaimer
-
-*All of Us* individual-level data is **not** usable here — it requires a
-Researcher Workbench and cannot be downloaded. This repo generates an
-AoU-shaped synthetic dataset with known ground-truth causal structure so the
-full pipeline runs end-to-end and validation metrics are computable. The
-pipeline is written to ingest real biobank data once a local loader supplies
-it in the column convention documented in `docs/ARCHITECTURE.md`.
