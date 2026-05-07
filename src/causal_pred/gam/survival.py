@@ -92,36 +92,31 @@ def _is_binary_column(x: np.ndarray) -> bool:
     return vals.shape[0] <= 2 and set(vals.tolist()).issubset({0.0, 1.0})
 
 
-# Default smooth kind for continuous covariates.  Duchon splines
-# (Duchon 1977) generalise thin-plate splines: parameter ``order = m``
-# controls the smoothness (``m-1`` continuous derivatives) and ``power =
-# s`` the rate of decay of the Green's function, with the condition
-# 2m + s > d (d = covariate dimension).  For univariate smooths the
-# common choice is m = 2, s = 1, which gives a cubic-style penalised
-# smooth with better boundary behaviour than B-splines.
-_DUCHON_DEFAULT_ORDER = 2
-_DUCHON_DEFAULT_POWER = 1
+# Default smooth kind for continuous covariates.  We use penalised
+# B-splines (P-splines, Eilers & Marx 1996) -- ``s(x, type=ps,
+# knots=N)`` -- which is the gam CLI's canonical univariate smooth in
+# its own benchmark suite (see ``gam/bench/run_suite.py``).  Pure
+# Duchon (the previous default) requires ``power < dimension/2`` and
+# so is not usable for univariate smooths in the current CLI version.
+_PSPLINE_DEFAULT_KNOTS = 10
 
 
 def _build_survival_formula(columns: Sequence[str],
                             kinds: Sequence[str],
-                            smooth_kind: str = "duchon") -> str:
-    """Return ``s(x1, type=duchon, order=2, power=1) + x2 + ...``.
+                            smooth_kind: str = "ps") -> str:
+    """Return ``s(x1, type=ps, knots=10) + x2 + ...``.
 
-    Continuous columns become penalised Duchon smooths; binary columns
-    enter as plain linear terms.  An empty covariate set collapses to
+    Continuous columns become penalised P-splines; binary columns enter
+    as plain linear terms.  An empty covariate set collapses to
     intercept-only via the literal ``1`` term.
     """
     terms: List[str] = []
     for name, kind in zip(columns, kinds):
         if kind == "continuous":
-            if smooth_kind == "duchon":
-                terms.append(
-                    f"s({name}, type=duchon, order={_DUCHON_DEFAULT_ORDER}, "
-                    f"power={_DUCHON_DEFAULT_POWER})"
-                )
+            if smooth_kind == "ps":
+                terms.append(f"s({name}, type=ps, knots={_PSPLINE_DEFAULT_KNOTS})")
             else:
-                terms.append(f"s({name})")
+                terms.append(f"s({name}, type={smooth_kind})")
         else:
             terms.append(name)
     return " + ".join(terms) if terms else "1"
@@ -213,29 +208,31 @@ def _fit_gam(time: np.ndarray, event: np.ndarray, X: np.ndarray,
     rows = np.column_stack([entry, time, event, X])
     _write_csv(train_csv, header, rows)
 
+    # The gam CLI is formula-first: ``gam fit [OPTIONS] <DATA> <FORMULA>``.
+    # Survival mode is selected automatically when the LHS is
+    # ``Surv(entry, exit, event)``; the entry/exit/event column names come
+    # from inside the formula, so there are no separate column flags.
+    formula_full = f"Surv(entry, exit, event) ~ {formula}"
+
     cmd = [
-        cli, "survival",
-        "--entry", "entry",
-        "--exit", "exit",
-        "--event", "event",
-        "--formula", formula,
+        cli, "fit",
         "--survival-likelihood", survival_likelihood,
     ]
     # Let the CLI pick its own defaults for the time basis unless the
-    # caller overrides; the CLI's ``linear`` default is robust, whereas
-    # higher-dimensional B-spline bases can run into monotonicity
-    # feasibility issues on small samples.
+    # caller overrides.  The CLI default is ``ispline`` with degree 3 and
+    # 8 internal knots; on small samples a coarser basis can be more
+    # robust.
     if time_basis is not None:
         cmd += ["--time-basis", time_basis]
     if time_num_internal_knots is not None:
         cmd += ["--time-num-internal-knots", str(time_num_internal_knots)]
     if time_degree is not None:
         cmd += ["--time-degree", str(time_degree)]
-    cmd += ["--out", model_json, train_csv]
+    cmd += ["--out", model_json, train_csv, formula_full]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0:
         raise RuntimeError(
-            "gam survival fit failed:\n"
+            "gam fit failed:\n"
             f"cmd: {' '.join(cmd)}\n"
             f"stdout: {proc.stdout}\n"
             f"stderr: {proc.stderr}"
@@ -361,21 +358,26 @@ def _predict_survival_matrix(fit: _SubmodelFit,
             f"gam predict produced unexpected columns {list(cols)}; "
             "expected 'survival_prob' or 'mean'."
         )
-    # Uncertainty: the CLI may emit ``survival_prob_lower``/``_upper`` or
-    # ``eta_se``; prefer a direct SE on the survival scale.
-    if "survival_prob_se" in cols:
-        SE_flat = cols["survival_prob_se"]
+    # Uncertainty.  The current gam CLI emits the survival-prob lower /
+    # upper interval bounds under the canonical names ``mean_lower`` /
+    # ``mean_upper`` (the survival writer clamps both to [0, 1]) plus an
+    # ``effective_se`` on the eta scale.  We prefer a direct SE on the
+    # survival scale, so derive it from the symmetric Wald interval
+    # whenever both bounds are present; otherwise fall back to scaling
+    # ``effective_se`` by |dS/deta| = phi(eta) under the probit link.
+    if "mean_lower" in cols and "mean_upper" in cols:
+        z = 1.959963984540054  # 97.5th percentile of N(0, 1)
+        SE_flat = (cols["mean_upper"] - cols["mean_lower"]) / (2.0 * z)
     elif "survival_prob_lower" in cols and "survival_prob_upper" in cols:
-        z = 1.959963984540054  # 97.5th percentile of N(0,1)
+        # Older CLI versions used these names; accept for back-compat.
+        z = 1.959963984540054
         SE_flat = (cols["survival_prob_upper"] - cols["survival_prob_lower"]) / (2.0 * z)
-    elif "eta_se" in cols:
-        # Delta method: survival = 1 - Phi(eta) on the probit scale;
-        # when the CLI doesn't give a survival_prob_se, scale eta_se by
-        # |dS/deta| = phi(eta).  Safe for small SEs.
+    elif "effective_se" in cols or "eta_se" in cols:
         from scipy.stats import norm
 
         eta = cols.get("eta", np.zeros_like(S_flat))
-        SE_flat = np.abs(norm.pdf(eta)) * cols["eta_se"]
+        eta_se = cols.get("effective_se", cols.get("eta_se"))
+        SE_flat = np.abs(norm.pdf(eta)) * eta_se
     else:
         SE_flat = np.zeros_like(S_flat)
 
