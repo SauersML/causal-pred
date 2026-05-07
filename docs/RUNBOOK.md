@@ -30,19 +30,14 @@ This writes `outputs/summary.json` and a handful of PNGs under
 
 ## Run the full pipeline
 
-The peer-review grade run. Larger `n`, more MCMC samples, more NUTS draws
-from the distributional GAM, and complete validation metrics:
+The pipeline is a single fixed path: cohort wide CSV (resolved via the
+local-then-bucket cache) -> DAGSLAM hill-climb -> structure MCMC -> save
+artefacts under `outputs/`. There are no command-line flags; defaults
+are the configuration. To override hyperparameters, edit
+``run_pipeline``'s defaults in `src/causal_pred/pipeline.py`.
 
 ```sh
 uv run python scripts/run_full_pipeline.py
-```
-
-Useful flags (inspect `--help` for the full list):
-
-```sh
-uv run python scripts/run_full_pipeline.py --help
-uv run python scripts/run_full_pipeline.py --seed 17
-uv run python scripts/run_full_pipeline.py --n-samples 50000
 ```
 
 ## Paper rebuild
@@ -155,16 +150,15 @@ If that fails with a linker or `cc` error, install rustup and rerun
 `uv sync --dev`.
 
 ### R-hat larger than 1.1 in MCMC
-Too few MCMC samples or bad warm-start. Increase `--mcmc-iter` or supply
-a better warm-start via `dagslam`:
-
-```sh
-uv run python scripts/run_full_pipeline.py --mcmc-iter 50000
-```
+Too few MCMC samples or bad warm-start. Bump ``mcmc_samples`` /
+``mcmc_burn_in`` defaults in
+``src/causal_pred/pipeline.py``'s ``run_pipeline`` signature, or supply
+a better warm-start via ``dagslam`` and rerun
+``scripts/run_full_pipeline.py``.
 
 ### Memory pressure
-Reduce `--n-samples` and `--n-posterior-draws` in
-`scripts/run_full_pipeline.py`. The distributional GAM is the largest
+Reduce ``mcmc_samples`` and ``mcmc_chains`` defaults in
+``run_pipeline``. The distributional GAM is the largest
 allocator; dropping NUTS draws from 2000 to 500 is usually enough.
 
 ### `NotImplementedError: partial availability`

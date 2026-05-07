@@ -55,13 +55,29 @@ before touching more than one module.
 ## Module by module
 
 ### `data/`
-Ingest layer. `synthetic.py` generates an AoU-shaped matrix with a known
-ground-truth DAG so the pipeline and its metrics are meaningful end-to-end.
-`nodes.py` is the single source of truth for `NODE_NAMES` (length `p`) and
-the parallel `node_types` tuple. `real_gwas.py` holds literature-derived
-IVW beta / SE / SNP-count cells with PMID/DOI. `polygenic.py` shells out to
-the `gnomon` CLI for scoring and HWE-PCA ancestry projection; it never
-reimplements scoring in Python.
+Ingest layer. There is one data-loading entry point used by
+`pipeline.run_pipeline`: it dispatches on the `data_source` argument
+to either the synthetic generator or the cohort CSV loader, but each
+returns the same `SyntheticDataset` shape so downstream stages have a
+single contract. `synthetic.py` generates an AoU-shaped matrix with a
+known ground-truth DAG -- still used by tests and by historical
+benchmarks. `nodes.py` is the single source of truth for the synthetic
+schema's `NODE_NAMES` (length 18) and the parallel `node_types` tuple.
+`real_gwas.py` holds literature-derived IVW beta / SE / SNP-count cells
+with PMID/DOI. `polygenic.py` shells out to the `gnomon` CLI for
+scoring and HWE-PCA ancestry projection; it never reimplements scoring
+in Python. `cohort.py` is the cohort-data branch of the same loader:
+it accepts OMOP-shaped condition + measurement frames, labels rows by
+DAG node (BMI, HbA1c, HDL, LDL, triglycerides, systolic BP),
+normalises units (mmol/L -> mg/dL, mmol/mol -> NGSP %), drops
+physiologically impossible values, removes extreme outliers per-node
+via a conservative IQR rule, collapses repeated measures by median,
+and merges with a binary T2D node from the condition frame to produce
+a 7-node wide CSV. A two-tier cache (`resolve_cohort_csv`: local dir
+first, then `$WORKSPACE_BUCKET/data/` via `gsutil cp`) skips the build
+when the CSVs are already on disk or in the bucket; `load_cohort_dataset`
+returns a `SyntheticDataset` ready to flow through MrDAG -> DAGSLAM ->
+MCMC -> GAM.
 
 ### `mrdag/`
 Produces an edge-inclusion posterior matrix `pi` of shape `(p, p)` from

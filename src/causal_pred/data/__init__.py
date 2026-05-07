@@ -9,6 +9,19 @@ from .nodes import (
     adjacency_from_edges,
     edges_as_index_pairs,
 )
+from .cohort import (
+    COHORT_NODES,
+    COHORT_NODE_TYPES,
+    PLAUSIBILITY_BOUNDS,
+    CACHE_FILENAMES,
+    CohortBuildResult,
+    build_cohort_dataset,
+    load_cohort_csv,
+    load_cohort_dataset,
+    resolve_cohort_csv,
+    write_cohort_cache,
+    load_or_build_cohort,
+)
 
 __all__ = [
     "NODES",
@@ -20,4 +33,15 @@ __all__ = [
     "ALL_GROUND_TRUTH_EDGES",
     "adjacency_from_edges",
     "edges_as_index_pairs",
+    "COHORT_NODES",
+    "COHORT_NODE_TYPES",
+    "PLAUSIBILITY_BOUNDS",
+    "CACHE_FILENAMES",
+    "CohortBuildResult",
+    "build_cohort_dataset",
+    "load_cohort_csv",
+    "load_cohort_dataset",
+    "resolve_cohort_csv",
+    "write_cohort_cache",
+    "load_or_build_cohort",
 ]
