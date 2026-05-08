@@ -35,16 +35,19 @@ then mirrors those small outputs to `$WORKSPACE_BUCKET/results/causal-pred/lates
 
 The pipeline is a single fixed path: cohort wide CSV (resolved via the
 local `data/` cache, then `$WORKSPACE_BUCKET/data/`) -> load/build cached
-microarray PRS with `gnomon` -> MrDAG priors -> DAGSLAM hill-climb ->
-structure MCMC -> save artefacts under `outputs/`. There are no command-line
-flags and `run_pipeline()` takes no configuration arguments; edit the constants
-in `src/causal_pred/pipeline.py` when the production configuration changes.
+microarray PRS with `gnomon` -> build a baseline-censored EHR panel -> promote
+shared genome/EHR crosscoder features -> MrDAG priors -> DAGSLAM hill-climb ->
+structure MCMC -> gamfit survival GAM over posterior parent sets -> per-person
+survival curves and causal pathway probabilities under `outputs/`. There are
+no command-line flags and `run_pipeline()` takes no configuration arguments;
+edit the constants in `src/causal_pred/pipeline.py` when the production
+configuration changes.
 
 Reusable intermediates live under `data/intermediates/causal-pred/` and are
 mirrored to `$WORKSPACE_BUCKET/intermediates/causal-pred/` when the workspace
 bucket is available. The cache key includes the augmented matrix, MrDAG prior,
-and pipeline constants, so precomputed DAGSLAM/MCMC results are loaded only
-when they match the current run.
+and pipeline constants, so precomputed crosscoder, DAGSLAM, MCMC, and survival
+GAM results are loaded only when they match the current run.
 
 ```sh
 uv run python scripts/run_full_pipeline.py
@@ -147,7 +150,7 @@ Do NOT swap in the legacy pure-Python GAM library; see CLAUDE.md.
 ### `gnomon` missing
 The wrapper raises `NotImplementedError` naming the missing binary. Install
 it to `/Users/user/.local/bin/gnomon` and re-run. Nothing in this repo
-should fall back to a Python reimplementation of the scoring pipeline.
+should substitute a Python reimplementation of the scoring pipeline.
 
 ### `rustc` missing
 `SauersML/gam` needs a Rust toolchain to build its wheel. Install with:

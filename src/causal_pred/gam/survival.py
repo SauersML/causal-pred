@@ -1,10 +1,10 @@
-"""Distributional survival GAM via the gam Python library.
+"""Distributional survival GAM via the gamfit Python library.
 
-This module is a thin wrapper over the ``gam`` Python library (PyO3
+This module is a thin wrapper over the ``gamfit`` Python library (PyO3
 bindings to SauersML/gam's Rust engine). The library implements the
 penalised-spline survival GAM with REML smoothing and analytical
 uncertainty; we feed it pandas frames and read back the dense
-survival surface via :class:`gam.SurvivalPrediction`. There is no IPCW,
+survival surface via :class:`gamfit.SurvivalPrediction`. There is no IPCW,
 no EM, no imputation, no events-only complete-case hack: the library's
 native survival likelihood handles censoring exactly.
 
@@ -101,7 +101,11 @@ def _fit_gam(
     """
     time = np.asarray(time, dtype=float)
     event = np.asarray(event, dtype=float)
-    X = np.asarray(X, dtype=float).reshape(time.shape[0], -1)
+    X = np.asarray(X, dtype=float)
+    if X.size == 0:
+        X = X.reshape(time.shape[0], 0)
+    else:
+        X = X.reshape(time.shape[0], -1)
     if X.shape[1] != len(columns):
         raise ValueError(
             f"columns length {len(columns)} != X.shape[1] {X.shape[1]}"
@@ -162,7 +166,8 @@ def _predict_survival_matrix(
     if p > 0:
         X_new = np.asarray(X_new, dtype=float).reshape(-1, p)
     else:
-        X_new = np.asarray(X_new, dtype=float).reshape(-1, 0)
+        X_new = np.asarray(X_new, dtype=float)
+        X_new = X_new.reshape(X_new.shape[0], 0) if X_new.ndim == 2 else X_new.reshape(0, 0)
     n_new = X_new.shape[0]
     t_grid = np.asarray(t_grid, dtype=float).ravel()
     n_t = t_grid.shape[0]
@@ -239,13 +244,17 @@ class SurvivalGAM:
         X_new = np.asarray(X_new, dtype=float)
         p = len(self.columns)
         if p == 0:
-            return X_new.reshape(-1, 0)
+            return (
+                X_new.reshape(X_new.shape[0], 0)
+                if X_new.ndim == 2
+                else X_new.reshape(0, 0)
+            )
         return X_new.reshape(-1, p)
 
     def predict_survival(self, X_new: np.ndarray, t_grid: np.ndarray) -> np.ndarray:
         """Posterior-predictive survival probabilities ``(n_samples, n_new, n_t)``.
 
-        The gam library returns a single point estimate of ``S(t | x)``
+        The gamfit library returns a single point estimate of ``S(t | x)``
         with no per-cell standard error; we broadcast the same surface
         across the requested ``n_samples`` axis to keep the shape
         contract that downstream BMA / validation code expects.
@@ -314,7 +323,7 @@ def fit_survival_gam(
     rng: Optional[np.random.Generator] = None,
     progress: bool = False,
 ) -> SurvivalGAM:
-    """Fit a distributional survival GAM via the gam Python library.
+    """Fit a distributional survival GAM via the gamfit Python library.
 
     Parameters
     ----------
@@ -337,7 +346,11 @@ def fit_survival_gam(
 
     time = np.asarray(time, dtype=float)
     event = np.asarray(event, dtype=float)
-    X = np.asarray(X, dtype=float).reshape(time.shape[0], -1)
+    X = np.asarray(X, dtype=float)
+    if X.size == 0:
+        X = X.reshape(time.shape[0], 0)
+    else:
+        X = X.reshape(time.shape[0], -1)
     if columns is None:
         columns = tuple(f"x{i}" for i in range(X.shape[1]))
     columns = tuple(columns)
@@ -351,24 +364,47 @@ def fit_survival_gam(
 
     summ = fit.train_summary or {}
 
-    def _num(key: str, default: float = float("nan")) -> float:
-        v = summ.get(key, default)
-        try:
-            return float(v)
-        except Exception:
+    def _summary_float(key: str, default: float = float("nan")) -> float:
+        value = summ.get(key)
+        if value is None:
             return default
+        if isinstance(value, (bool, np.bool_)):
+            raise TypeError(f"gamfit summary field {key!r} must be numeric, got bool")
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            return float(value)
+        raise TypeError(
+            f"gamfit summary field {key!r} must be numeric or None, "
+            f"got {type(value).__name__}"
+        )
+
+    def _summary_int(*keys: str, default: int = 0) -> int:
+        for key in keys:
+            value = summ.get(key)
+            if value is None:
+                continue
+            if isinstance(value, (bool, np.bool_)):
+                raise TypeError(f"gamfit summary field {key!r} must be an integer, got bool")
+            if isinstance(value, (int, np.integer)):
+                return int(value)
+            if isinstance(value, (float, np.floating)) and float(value).is_integer():
+                return int(value)
+            raise TypeError(
+                f"gamfit summary field {key!r} must be an integer or None, "
+                f"got {type(value).__name__}"
+            )
+        return default
 
     diagnostics = {
-        "backend": "gam Python library",
+        "backend": "gamfit",
         "library_version": gam.build_info().get("version"),
         "formula": fit.formula,
         "train_summary": summ,
         "converged": True,
-        "reml_iterations": int(_num("reml_iterations", _num("iterations", 0)) or 0),
-        "reml_score": _num("reml_score"),
-        "edf_total": _num("edf_total"),
-        "sigma_residual": _num("sigma_residual"),
-        "deviance": _num("deviance"),
+        "reml_iterations": _summary_int("reml_iterations", "iterations"),
+        "reml_score": _summary_float("reml_score"),
+        "edf_total": _summary_float("edf_total"),
+        "sigma_residual": _summary_float("sigma_residual"),
+        "deviance": _summary_float("deviance"),
         "n_train": fit.n_train,
         "n_events": fit.n_events,
         "n_posterior_draws": int(n_samples),

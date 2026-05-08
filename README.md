@@ -24,17 +24,23 @@ which makes the validation framework meaningful even on synthetic data.
 
 ```text
   External GWAS            AoU cohort CSV + microarray genotypes
-  summary stats            from the workspace/local caches
+  summary stats            + baseline-censored EHR stream
         |                            |
         v                            v
       MrDAG  -- edge priors pi -->  gnomon-scored PRS nodes
-                     |                         |
+                     |              + TopK crosscoder features
                      +----------+--------------+
                                 v
                   DAGSLAM warm start -> Structure MCMC
                                 |
                                 v
-                  posterior edge probabilities + validation
+                    posterior parent sets + pathways
+                                |
+                                v
+                    gamfit distributional survival GAM
+                                |
+                                v
+         per-person survival curves + causal pathway probabilities
 ```
 
 ## Layout
@@ -68,8 +74,11 @@ uv sync --dev
 
 Run the real cohort pipeline. It resolves the cohort CSV locally first, copies
 from `$WORKSPACE_BUCKET/data/` on AoU when needed, prepares or restores the
-gnomon-scored PRS matrix, and reuses keyed MrDAG/DAGSLAM/MCMC intermediates
-from `data/intermediates/causal-pred/` or the workspace bucket:
+gnomon-scored PRS matrix, builds the baseline-censored EHR feature stream,
+promotes shared genome/EHR crosscoder features, then runs
+MrDAG -> DAGSLAM -> structure MCMC -> gamfit survival GAM. Keyed
+intermediates are reused from `data/intermediates/causal-pred/` or the
+workspace bucket:
 
 ```sh
 uv run python scripts/run_full_pipeline.py

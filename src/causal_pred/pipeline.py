@@ -121,13 +121,33 @@ CAUSAL_PATH_MAX_DEPTH = 5
 
 COHORT_TO_MR_NODE = {
     "type2_diabetes": "T2D",
+    "age": "age",
+    "sex": "sex",
+    "ancestry_pc1": "ancestry_PC1",
+    "family_history_t2d": "family_history_T2D",
+    "years_smoking": "years_smoking",
+    "physical_activity": "physical_activity",
+    "diet_quality": "diet_quality",
     "bmi": "BMI",
     "hba1c": "HbA1c",
     "ldl_cholesterol": "LDL",
     "systolic_bp": "systolic_BP",
+    "hypertension": "hypertension",
+    "cardiovascular_disease": "cardiovascular_disease",
+    "pgs_t2d": "PGS_T2D",
+    "pgs_bmi": "PGS_BMI",
+    "pgs_ldl": "PGS_LDL",
+    "pgs_hba1c": "PGS_HbA1c",
 }
 
 MR_TO_COHORT_NODE = {v: k for k, v in COHORT_TO_MR_NODE.items()}
+
+PGS_ANCHOR_PRIORS = {
+    ("PGS_T2D", "T2D"): 0.95,
+    ("PGS_BMI", "BMI"): 0.95,
+    ("PGS_LDL", "LDL"): 0.95,
+    ("PGS_HbA1c", "HbA1c"): 0.95,
+}
 
 
 @dataclass
@@ -153,6 +173,8 @@ class PipelineResult:
     threshold: float = THRESHOLD_DEFAULT
     survival_time_grid: np.ndarray = field(default_factory=lambda: np.zeros(0))
     survival_mean: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
+    survival_lower: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
+    survival_upper: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
     survival_diagnostics: dict[str, Any] = field(default_factory=dict)
     survival_parent_columns: tuple[str, ...] = field(default_factory=tuple)
     causal_pathways: list[dict[str, Any]] = field(default_factory=list)
@@ -491,10 +513,76 @@ def _load_or_build_prs_panel(
     return panel, str(path)
 
 
+def _ehr_panel_key(person_ids: Sequence[str]) -> str:
+    return _short_hash(
+        {
+            "version": PIPELINE_CONFIG_VERSION,
+            "person_ids": [str(p) for p in person_ids],
+        }
+    )
+
+
+def _load_or_build_ehr_panel(
+    cache: WorkspaceCache,
+    person_ids: Sequence[str],
+    logger: logging.Logger,
+) -> EhrPanel:
+    filename = f"ehr-panel-{_ehr_panel_key(person_ids)}.npz"
+    path = cache.fetch(filename)
+    if path.is_file():
+        with np.load(path, allow_pickle=False) as z:
+            logger.info("[ehr] using cache %s", path)
+            return EhrPanel(
+                matrix=z["matrix"],
+                person_id=z["person_id"].astype(str),
+                feature_names=tuple(json.loads(str(z["feature_names_json"].item()))),
+                feature_kinds=tuple(json.loads(str(z["feature_kinds_json"].item()))),
+            )
+
+    logger.info("[ehr] fetching OMOP long frames and building baseline panel")
+    frames = fetch_omop_long_frames(person_ids=person_ids)
+    visit_long = frames.get("visit_long")
+    if visit_long is None or len(visit_long) == 0:
+        raise RuntimeError("OMOP visit_long returned no rows; cannot define EHR baseline")
+    baseline_dt = resolve_baseline_dt(person_ids, visit_long)
+    panel = build_ehr_panel(
+        person_ids=person_ids,
+        baseline_dt=baseline_dt,
+        condition_long=frames.get("condition_long"),
+        drug_long=frames.get("drug_long"),
+        measurement_long=frames.get("measurement_long"),
+        visit_long=visit_long,
+    )
+    if panel.m == 0:
+        raise RuntimeError("EHR panel has zero features; crosscoder cannot run")
+    _atomic_npz(
+        path,
+        matrix=panel.matrix,
+        person_id=panel.person_id.astype(str),
+        feature_names_json=np.array(json.dumps(list(panel.feature_names))),
+        feature_kinds_json=np.array(json.dumps(list(panel.feature_kinds))),
+    )
+    cache.store(path)
+    logger.info("[ehr] panel n=%d m=%d", panel.n, panel.m)
+    return panel
+
+
 def _prs_node_name(original: str, used: set[str]) -> str:
     stem = re.sub(r"[^0-9A-Za-z]+", "_", str(original)).strip("_").lower()
     if not stem:
         stem = "score"
+    canonical = None
+    if "hba1c" in stem or "hemoglobin_a1c" in stem or "glycated" in stem:
+        canonical = "pgs_hba1c"
+    elif "t2d" in stem or "diabetes" in stem:
+        canonical = "pgs_t2d"
+    elif "bmi" in stem or "body_mass" in stem:
+        canonical = "pgs_bmi"
+    elif "ldl" in stem:
+        canonical = "pgs_ldl"
+    if canonical is not None and canonical not in used:
+        used.add(canonical)
+        return canonical
     if not stem.startswith("pgs_"):
         stem = f"pgs_{stem}"
     stem = stem[:48].rstrip("_")
@@ -526,12 +614,15 @@ def _augment_with_prs_nodes(
 
     pid = np.asarray([str(p) for p in person_ids])
     aligned = prs_df.reindex(pid)
-    y = data.X[:, data.columns.index("type2_diabetes")].astype(float)
-    if np.nanstd(y) == 0.0:
-        raise ValueError("type2_diabetes has zero variance after cohort loading")
 
+    # Deterministic, outcome-independent selection. Filter PRS columns by
+    # completeness and non-zero variance, then take the first PRS_NODES in
+    # alphabetical column order. Ranking by correlation with type2_diabetes
+    # would cherry-pick the columns most predictive of the outcome and bias
+    # the DAG search toward exactly the PRS->T2D edges we want to discover;
+    # that is target leakage in a causal-inference setup.
     min_required = min(PRS_MIN_COMPLETE_ROWS, data.n)
-    candidates: list[tuple[float, float, str, np.ndarray]] = []
+    candidates: list[tuple[str, float, np.ndarray]] = []
     for col in aligned.columns:
         vals = pd.to_numeric(aligned[col], errors="coerce").to_numpy(dtype=float)
         finite = np.isfinite(vals)
@@ -540,17 +631,10 @@ def _augment_with_prs_nodes(
             continue
         if int(finite.sum()) < min_required:
             continue
-        v = vals[finite]
-        sd = float(v.std(ddof=0))
+        sd = float(vals[finite].std(ddof=0))
         if sd == 0.0:
             continue
-        yc = y[finite]
-        if float(yc.std(ddof=0)) == 0.0:
-            continue
-        z = (v - float(v.mean())) / sd
-        corr = float(abs(np.corrcoef(z, yc)[0, 1]))
-        if np.isfinite(corr):
-            candidates.append((corr, present_rate, str(col), vals))
+        candidates.append((str(col), present_rate, vals))
 
     if len(candidates) < PRS_NODES:
         raise ValueError(
@@ -558,11 +642,11 @@ def _augment_with_prs_nodes(
             f"required {PRS_NODES}"
         )
 
-    candidates.sort(key=lambda row: (row[0], row[1], row[2]), reverse=True)
+    candidates.sort(key=lambda row: row[0])
     chosen = candidates[:PRS_NODES]
 
     keep = np.ones(data.n, dtype=bool)
-    for _corr, _present, _col, vals in chosen:
+    for _col, _present, vals in chosen:
         keep &= np.isfinite(vals)
     if int(keep.sum()) < min_required:
         raise ValueError(
@@ -572,17 +656,15 @@ def _augment_with_prs_nodes(
 
     prs_cols = []
     original_names = []
-    correlations = []
     present_rates = []
     used_names = set(data.columns)
-    for corr, present, col, vals in chosen:
+    for col, present, vals in chosen:
         raw = vals[keep].astype(float)
         sd = float(raw.std(ddof=0))
         if sd == 0.0:
             raise ValueError(f"selected PRS column became constant after row filter: {col}")
         prs_cols.append((raw - float(raw.mean())) / sd)
         original_names.append(col)
-        correlations.append(corr)
         present_rates.append(present)
 
     X_keep = data.X[keep]
@@ -610,12 +692,108 @@ def _augment_with_prs_nodes(
         "prs_columns_selected": int(len(prs_names)),
         "prs_original_names": original_names,
         "prs_node_names": list(prs_names),
-        "prs_abs_corr_with_t2d": correlations,
         "prs_present_rate": present_rates,
         "prs_max_missing": float(PRS_MAX_MISSING),
         "prs_min_complete_rows": int(min_required),
     }
     return augmented, pid[keep], meta
+
+
+def _load_or_run_genscore_features(
+    cache: WorkspaceCache,
+    data: SyntheticDataset,
+    person_ids: Sequence[str],
+    prs_df: pd.DataFrame,
+    ehr_panel: EhrPanel,
+    logger: logging.Logger,
+) -> tuple[SyntheticDataset, np.ndarray, dict[str, Any]]:
+    key = _genscore_key(data, person_ids, prs_df, ehr_panel)
+    filename = f"genscore-{key}.npz"
+    path = cache.fetch(filename)
+    if path.is_file():
+        with np.load(path, allow_pickle=False) as z:
+            logger.info("[genscore] using cache %s", path)
+            columns = tuple(json.loads(str(z["columns_json"].item())))
+            node_types = tuple(json.loads(str(z["node_types_json"].item())))
+            meta = json.loads(str(z["meta_json"].item()))
+            dataset = SyntheticDataset(
+                X=z["X"],
+                time=z["time"],
+                event=z["event"].astype(int),
+                columns=columns,
+                node_types=node_types,
+                ground_truth_adj=z["ground_truth_adj"].astype(int),
+            )
+            return dataset, z["person_id"].astype(str), meta
+
+    logger.info("[genscore] training TopK crosscoder and promoting shared features")
+    t0 = time.time()
+    aug_result, model = run_genscore(
+        base_dataset=data,
+        base_person_ids=person_ids,
+        prs_df=prs_df,
+        ehr_panel=ehr_panel,
+        n_promote=GENSCORE_N_PROMOTE,
+        genome_share_min=GENSCORE_GENOME_SHARE_MIN,
+        genome_share_max=GENSCORE_GENOME_SHARE_MAX,
+        min_activation_rate=GENSCORE_MIN_ACTIVATION_RATE,
+        crosscoder_kwargs=GENSCORE_CROSSCODER_KWARGS,
+        rng=np.random.default_rng(PIPELINE_SEED + 10),
+    )
+    sel = aug_result.feature_selection
+    top_genome_loadings: dict[str, list[dict[str, float]]] = {}
+    top_ehr_loadings: dict[str, list[dict[str, float]]] = {}
+    for feature_idx, feature_name in zip(sel.indices.tolist(), sel.names):
+        g_weights = model.W_d_G[int(feature_idx)]
+        e_weights = model.W_d_E[int(feature_idx)]
+        g_order = np.argsort(-np.abs(g_weights))[:10]
+        e_order = np.argsort(-np.abs(e_weights))[:10]
+        top_genome_loadings[str(feature_name)] = [
+            {"feature": str(prs_df.columns[j]), "weight": float(g_weights[j])}
+            for j in g_order
+        ]
+        top_ehr_loadings[str(feature_name)] = [
+            {"feature": str(ehr_panel.feature_names[j]), "weight": float(e_weights[j])}
+            for j in e_order
+        ]
+    meta = {
+        "crosscoder_d": int(model.d),
+        "crosscoder_k": int(model.k),
+        "promoted_indices": sel.indices.tolist(),
+        "promoted_names": list(sel.names),
+        "promoted_genome_share": sel.genome_share.tolist(),
+        "promoted_activation_rate": sel.activation_rate.tolist(),
+        "base_n": int(aug_result.base_n),
+        "augmented_n": int(aug_result.augmented_n),
+        "ehr_feature_count": int(ehr_panel.m),
+        "promoted_feature_top_genome_loadings": top_genome_loadings,
+        "promoted_feature_top_ehr_loadings": top_ehr_loadings,
+        "loss_history_step": list(model.history["step"]),
+        "loss_history_main": list(model.history["loss_main"]),
+        "loss_history_aux": list(model.history["loss_aux"]),
+        "frac_dead_history": list(model.history["frac_dead"]),
+        "runtime_s": time.time() - t0,
+    }
+    dataset = aug_result.dataset
+    _atomic_npz(
+        path,
+        X=dataset.X,
+        time=dataset.time,
+        event=dataset.event,
+        ground_truth_adj=dataset.ground_truth_adj,
+        person_id=aug_result.kept_person_id.astype(str),
+        columns_json=np.array(json.dumps(list(dataset.columns))),
+        node_types_json=np.array(json.dumps(list(dataset.node_types))),
+        meta_json=np.array(json.dumps(_json_sanitise(meta))),
+    )
+    cache.store(path)
+    logger.info(
+        "[genscore] promoted=%d n=%d p=%d",
+        len(sel.names),
+        dataset.n,
+        dataset.p,
+    )
+    return dataset, aug_result.kept_person_id.astype(str), meta
 
 
 def _mrdag_cache_key() -> str:
@@ -668,6 +846,12 @@ def _mrdag_prior_for_data(mrdag_pi: np.ndarray, columns: Sequence[str]) -> np.nd
             pi = mrdag_pi[NODE_INDEX[mr_parent], NODE_INDEX[mr_child]]
             if np.isfinite(pi):
                 prior[i, j] = float(pi)
+            anchor = PGS_ANCHOR_PRIORS.get((mr_parent, mr_child))
+            if anchor is not None:
+                prior[i, j] = float(anchor)
+            reverse_anchor = PGS_ANCHOR_PRIORS.get((mr_child, mr_parent))
+            if reverse_anchor is not None:
+                prior[i, j] = 1.0 - float(reverse_anchor)
     np.fill_diagonal(prior, np.nan)
     return prior
 
@@ -725,7 +909,7 @@ def _load_or_run_mcmc(
     start_adj: np.ndarray,
     pi_prior: np.ndarray,
     logger: logging.Logger,
-) -> tuple[np.ndarray, dict[str, Any], float]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any], float]:
     filename = f"mcmc-{key}.npz"
     path = cache.fetch(filename)
     if path.is_file():
@@ -733,6 +917,7 @@ def _load_or_run_mcmc(
             logger.info("[mcmc] using cache %s", path)
             return (
                 z["edge_probs"],
+                z["samples"].astype(int),
                 json.loads(str(z["diagnostics_json"].item())),
                 float(z["runtime_s"].item()),
             )
@@ -753,14 +938,20 @@ def _load_or_run_mcmc(
     )
     runtime_s = time.time() - t0
     diagnostics = dict(result.diagnostics)
+    samples = (
+        np.stack(result.samples, axis=0).astype(np.int8)
+        if result.samples
+        else np.zeros((0, data.p, data.p), dtype=np.int8)
+    )
     _atomic_npz(
         path,
         edge_probs=np.asarray(result.edge_probs, dtype=float),
+        samples=samples,
         diagnostics_json=np.array(json.dumps(_json_sanitise(diagnostics))),
         runtime_s=np.array(runtime_s),
     )
     cache.store(path)
-    return np.asarray(result.edge_probs, dtype=float), diagnostics, runtime_s
+    return np.asarray(result.edge_probs, dtype=float), samples, diagnostics, runtime_s
 
 
 def _known_edges_for_columns(columns: Sequence[str]) -> tuple[tuple[str, str], ...]:
@@ -790,6 +981,264 @@ def _validate_edges(
         rng=rng,
     )
     out["known_edges"] = [list(edge) for edge in known_edges]
+    return out
+
+
+def _target_index(columns: Sequence[str], target: str) -> int:
+    if target not in columns:
+        raise ValueError(f"target column {target!r} is absent from {tuple(columns)!r}")
+    return int(tuple(columns).index(target))
+
+
+def _posterior_parent_sets(
+    samples: np.ndarray,
+    target_idx: int,
+    *,
+    top_k: int,
+) -> tuple[list[tuple[int, ...]], np.ndarray, list[int]]:
+    if samples.ndim != 3:
+        raise ValueError(f"MCMC samples must be (s, p, p), got {samples.shape}")
+    if samples.shape[0] == 0:
+        raise RuntimeError("posterior parent sets require MCMC graph samples")
+    counts: dict[tuple[int, ...], int] = {}
+    for sample in samples:
+        parents = tuple(int(i) for i in np.flatnonzero(sample[:, target_idx]))
+        parents = tuple(i for i in parents if i != target_idx)
+        counts[parents] = counts.get(parents, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:top_k]
+    parent_sets = [k for k, _v in ranked]
+    raw_counts = [int(v) for _k, v in ranked]
+    weights = np.asarray(raw_counts, dtype=float)
+    weights /= float(weights.sum())
+    return parent_sets, weights, raw_counts
+
+
+def _survival_time_grid(time_arr: np.ndarray) -> np.ndarray:
+    t = np.asarray(time_arr, dtype=float)
+    if not np.all(np.isfinite(t)) or np.any(t <= 0.0):
+        raise ValueError("survival GAM requires finite positive follow-up times")
+    t_min = max(float(np.quantile(t, 0.02)), 1e-3)
+    t_max = float(np.max(t))
+    if t_max <= t_min:
+        raise ValueError("survival follow-up times have no usable range")
+    return np.linspace(t_min, t_max, SURVIVAL_TIME_GRID_POINTS)
+
+
+def _weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> np.ndarray:
+    order = np.argsort(values, axis=0)
+    sorted_vals = np.take_along_axis(values, order, axis=0)
+    sorted_w = np.take_along_axis(
+        np.broadcast_to(weights[:, None, None], values.shape), order, axis=0
+    )
+    cdf = np.cumsum(sorted_w, axis=0)
+    pick = np.argmax(cdf >= q, axis=0)
+    return np.take_along_axis(sorted_vals, pick[None, :, :], axis=0)[0]
+
+
+def _survival_metrics(
+    time_arr: np.ndarray,
+    event_arr: np.ndarray,
+    survival_mean: np.ndarray,
+    t_grid: np.ndarray,
+) -> dict[str, Any]:
+    eval_times = np.asarray(SURVIVAL_EVAL_TIMES, dtype=float)
+    t_idx = int(np.argmin(np.abs(t_grid - 10.0)))
+    p_event = 1.0 - survival_mean[:, t_idx]
+    y_event = ((time_arr <= 10.0) & (event_arr == 1)).astype(int)
+    calibration = calibration_metrics(y_event, p_event, n_bins=10, strategy="quantile")
+    td = time_dependent_auc(
+        time=time_arr,
+        event=event_arr,
+        risk_score=p_event,
+        eval_times=eval_times,
+    )
+    br = brier_score(
+        time=time_arr,
+        event=event_arr,
+        survival_pred=survival_mean,
+        eval_times=t_grid,
+    )
+    return {
+        "nagelkerke_r2_at_10y": float(nagelkerke_r2(y_event, p_event)),
+        "calibration_at_10y": calibration,
+        "time_dependent_auc": {
+            "times": td["times"],
+            "auc": td["auc"],
+            "integrated_auc": float(td["integrated_auc"]),
+        },
+        "brier": br,
+    }
+
+
+def _load_or_run_survival_gam(
+    cache: WorkspaceCache,
+    key: str,
+    data: SyntheticDataset,
+    samples: np.ndarray,
+    logger: logging.Logger,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    tuple[str, ...],
+    dict[str, Any],
+    float,
+]:
+    filename = f"survival-gam-{key}.npz"
+    path = cache.fetch(filename)
+    if path.is_file():
+        with np.load(path, allow_pickle=False) as z:
+            logger.info("[gam] using cache %s", path)
+            return (
+                z["t_grid"],
+                z["survival_mean"],
+                z["survival_lower"],
+                z["survival_upper"],
+                tuple(json.loads(str(z["parent_columns_json"].item()))),
+                json.loads(str(z["diagnostics_json"].item())),
+                float(z["runtime_s"].item()),
+            )
+
+    if not np.any(data.time > 0.0):
+        raise RuntimeError("survival GAM requires time/event columns in the cohort CSV")
+    if not np.any(data.event == 1):
+        raise RuntimeError("survival GAM requires at least one observed disease event")
+
+    target_idx = _target_index(data.columns, SURVIVAL_TARGET_COLUMN)
+    parent_sets, weights, parent_set_counts = _posterior_parent_sets(
+        samples,
+        target_idx,
+        top_k=min(CAUSAL_PATH_TOP_K, 8),
+    )
+    t_grid = _survival_time_grid(data.time)
+    per_model = []
+    fit_summaries = []
+    t0 = time.time()
+    logger.info("[gam] fitting %d gamfit survival parent-set models", len(parent_sets))
+    for parent_set, weight, count in zip(parent_sets, weights, parent_set_counts):
+        cols = tuple(data.columns[i] for i in parent_set)
+        X = data.X[:, list(parent_set)] if parent_set else np.zeros((data.n, 0))
+        fit = fit_survival_gam(
+            data.time,
+            data.event,
+            X,
+            columns=cols,
+            n_samples=GAM_N_SAMPLES,
+            rng=np.random.default_rng(PIPELINE_SEED + 20),
+        )
+        draws = fit.predict_survival(X, t_grid)
+        mean = draws.mean(axis=0)
+        per_model.append(mean)
+        diag = fit.posterior_summary()
+        diag["posterior_parent_set_weight"] = float(weight)
+        diag["posterior_parent_set_count"] = int(count)
+        diag["parent_columns"] = list(cols)
+        fit_summaries.append(diag)
+
+    stack = np.stack(per_model, axis=0)
+    survival_mean = np.einsum("k,knt->nt", weights, stack)
+    survival_lower = _weighted_quantile(stack, weights, 0.05)
+    survival_upper = _weighted_quantile(stack, weights, 0.95)
+    variance_structural = np.einsum(
+        "k,knt->nt", weights, (stack - survival_mean[None, :, :]) ** 2
+    )
+    runtime_s = time.time() - t0
+    diagnostics = {
+        "backend": "gamfit",
+        "n_parent_sets": int(len(parent_sets)),
+        "parent_sets": [
+            {
+                "columns": [data.columns[i] for i in ps],
+                "weight": float(w),
+                "count": int(c),
+            }
+            for ps, w, c in zip(parent_sets, weights, parent_set_counts)
+        ],
+        "fit_summaries": fit_summaries,
+        "variance_structural_mean": float(np.mean(variance_structural)),
+        "metrics": _survival_metrics(data.time, data.event, survival_mean, t_grid),
+    }
+    parent_columns = tuple(
+        dict.fromkeys(col for ps in parent_sets for col in (data.columns[i] for i in ps))
+    )
+    _atomic_npz(
+        path,
+        t_grid=t_grid,
+        survival_mean=survival_mean,
+        survival_lower=survival_lower,
+        survival_upper=survival_upper,
+        variance_structural=variance_structural,
+        parent_columns_json=np.array(json.dumps(list(parent_columns))),
+        diagnostics_json=np.array(json.dumps(_json_sanitise(diagnostics))),
+        runtime_s=np.array(runtime_s),
+    )
+    cache.store(path)
+    return (
+        t_grid,
+        survival_mean,
+        survival_lower,
+        survival_upper,
+        parent_columns,
+        diagnostics,
+        runtime_s,
+    )
+
+
+def _top_paths_to_target(
+    edge_probs: np.ndarray,
+    target_idx: int,
+) -> list[tuple[tuple[int, ...], float]]:
+    parents = [[] for _ in range(edge_probs.shape[0])]
+    for j in range(edge_probs.shape[0]):
+        for i in range(edge_probs.shape[0]):
+            if i == j:
+                continue
+            prob = float(edge_probs[i, j])
+            if np.isfinite(prob) and prob >= CAUSAL_PATH_MIN_EDGE_PROB:
+                parents[j].append((i, prob))
+    found: list[tuple[tuple[int, ...], float]] = []
+
+    def dfs(node: int, path: tuple[int, ...], prob: float) -> None:
+        if len(path) > CAUSAL_PATH_MAX_DEPTH:
+            return
+        if len(path) >= 2:
+            found.append((tuple(reversed(path)), prob))
+        for parent, edge_prob in parents[node]:
+            if parent in path:
+                continue
+            dfs(parent, path + (parent,), prob * edge_prob)
+
+    dfs(target_idx, (target_idx,), 1.0)
+    best: dict[tuple[int, ...], float] = {}
+    for path, prob in found:
+        best[path] = max(best.get(path, 0.0), float(prob))
+    ranked = sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))
+    return ranked[:CAUSAL_PATH_TOP_K]
+
+
+def _causal_pathway_probabilities(
+    edge_probs: np.ndarray,
+    samples: np.ndarray,
+    columns: Sequence[str],
+) -> list[dict[str, Any]]:
+    target_idx = _target_index(columns, CAUSAL_PATH_TARGET)
+    if samples.ndim != 3 or samples.shape[0] == 0:
+        raise RuntimeError("causal pathway probabilities require MCMC graph samples")
+    paths = _top_paths_to_target(edge_probs, target_idx)
+    out = []
+    for path, marginal_product in paths:
+        present = np.ones(samples.shape[0], dtype=bool)
+        for parent, child in zip(path[:-1], path[1:]):
+            present &= samples[:, parent, child].astype(bool)
+        posterior_prob = float(present.mean())
+        out.append(
+            {
+                "path": [columns[i] for i in path],
+                "posterior_probability": posterior_prob,
+                "marginal_edge_product": float(marginal_product),
+            }
+        )
     return out
 
 
@@ -824,6 +1273,21 @@ def run_pipeline() -> PipelineResult:
     )
 
     t0 = time.time()
+    ehr_panel = _load_or_build_ehr_panel(cache, kept_person_ids, logger)
+    timings["ehr"] = time.time() - t0
+
+    t0 = time.time()
+    data, kept_person_ids, genscore_meta = _load_or_run_genscore_features(
+        cache,
+        data,
+        kept_person_ids,
+        prs_df,
+        ehr_panel,
+        logger,
+    )
+    timings["genscore"] = time.time() - t0
+
+    t0 = time.time()
     mrdag_pi, mrdag_diagnostics = _load_or_run_mrdag(cache, logger)
     mrdag_prior = _mrdag_prior_for_data(mrdag_pi, data.columns)
     timings["mrdag"] = time.time() - t0
@@ -837,7 +1301,7 @@ def run_pipeline() -> PipelineResult:
         int(dagslam["n_edges"]),
     )
 
-    edge_probs, mcmc_diagnostics, mcmc_runtime = _load_or_run_mcmc(
+    edge_probs, mcmc_samples, mcmc_diagnostics, mcmc_runtime = _load_or_run_mcmc(
         cache,
         key,
         data,
@@ -856,13 +1320,32 @@ def run_pipeline() -> PipelineResult:
     thresholded = (edge_probs >= THRESHOLD_DEFAULT).astype(int)
     np.fill_diagonal(thresholded, 0)
 
+    (
+        survival_time_grid,
+        survival_mean,
+        survival_lower,
+        survival_upper,
+        survival_parent_columns,
+        survival_diagnostics,
+        survival_runtime,
+    ) = _load_or_run_survival_gam(cache, key, data, mcmc_samples, logger)
+    timings["gam"] = survival_runtime
+
+    causal_pathways = _causal_pathway_probabilities(
+        edge_probs,
+        mcmc_samples,
+        data.columns,
+    )
+
     validation = _validate_edges(
         edge_probs,
         data.columns,
         rng=np.random.default_rng(PIPELINE_SEED + 4),
     )
+    validation["survival"] = survival_diagnostics.get("metrics", {})
 
     return PipelineResult(
+        person_ids=tuple(str(p) for p in kept_person_ids),
         columns=tuple(data.columns),
         node_types=tuple(data.node_types),
         data_summary={
@@ -875,6 +1358,7 @@ def run_pipeline() -> PipelineResult:
             "prs_path": prs_path,
             "prs_sha256": _file_sha256(Path(prs_path)),
             "person_id_rows_after_prs": int(kept_person_ids.size),
+            "person_id_rows_final": int(kept_person_ids.size),
         },
         mrdag_pi=mrdag_pi,
         mrdag_prior=mrdag_prior,
@@ -883,12 +1367,20 @@ def run_pipeline() -> PipelineResult:
         dagslam_log_score=float(dagslam["log_score"]),
         dagslam_n_edges=int(dagslam["n_edges"]),
         mcmc_edge_probs=edge_probs,
+        mcmc_samples=mcmc_samples,
         mcmc_diagnostics=mcmc_diagnostics,
         thresholded_adjacency=thresholded,
         threshold=float(THRESHOLD_DEFAULT),
+        survival_time_grid=survival_time_grid,
+        survival_mean=survival_mean,
+        survival_lower=survival_lower,
+        survival_upper=survival_upper,
+        survival_diagnostics=survival_diagnostics,
+        survival_parent_columns=survival_parent_columns,
+        causal_pathways=causal_pathways,
         validation=validation,
         timings=timings,
-        genscore_features={"prs_path": prs_path, **prs_meta},
+        genscore_features={"prs_path": prs_path, **prs_meta, **genscore_meta},
         cache_key=key,
     )
 
@@ -936,8 +1428,20 @@ def save_result(
     np.save(paths["dagslam_adjacency"], result.dagslam_adjacency)
     paths["mcmc_edge_probs"] = str(out / "mcmc_edge_probs.npy")
     np.save(paths["mcmc_edge_probs"], result.mcmc_edge_probs)
+    paths["mcmc_samples"] = str(out / "mcmc_samples.npy")
+    np.save(paths["mcmc_samples"], result.mcmc_samples)
     paths["thresholded_adjacency"] = str(out / "thresholded_adjacency.npy")
     np.save(paths["thresholded_adjacency"], result.thresholded_adjacency)
+    paths["survival_time_grid"] = str(out / "survival_time_grid.npy")
+    np.save(paths["survival_time_grid"], result.survival_time_grid)
+    paths["survival_mean"] = str(out / "survival_mean.npy")
+    np.save(paths["survival_mean"], result.survival_mean)
+    paths["survival_lower"] = str(out / "survival_lower.npy")
+    np.save(paths["survival_lower"], result.survival_lower)
+    paths["survival_upper"] = str(out / "survival_upper.npy")
+    np.save(paths["survival_upper"], result.survival_upper)
+    paths["disease_risk_mean"] = str(out / "disease_risk_mean.npy")
+    np.save(paths["disease_risk_mean"], 1.0 - result.survival_mean)
 
     paths["greedy_edges_csv"] = str(out / "greedy_edges.csv")
     with open(paths["greedy_edges_csv"], "w") as fh:
@@ -959,6 +1463,36 @@ def save_result(
         for parent, child, prob in _edge_prob_long(result.mcmc_edge_probs, columns):
             fh.write(f"{parent},{child},{prob}\n")
 
+    paths["survival_curves_long_csv"] = str(out / "survival_curves_long.csv")
+    with open(paths["survival_curves_long_csv"], "w") as fh:
+        fh.write(
+            "person_id,time,survival_mean,survival_lower,survival_upper,"
+            "disease_risk_mean\n"
+        )
+        for row_idx, person_id in enumerate(result.person_ids):
+            for time_idx, t in enumerate(result.survival_time_grid):
+                s_mean = float(result.survival_mean[row_idx, time_idx])
+                s_lower = float(result.survival_lower[row_idx, time_idx])
+                s_upper = float(result.survival_upper[row_idx, time_idx])
+                fh.write(
+                    f"{person_id},{float(t)},{s_mean},{s_lower},{s_upper},"
+                    f"{1.0 - s_mean}\n"
+                )
+
+    paths["causal_pathways_csv"] = str(out / "causal_pathway_probabilities.csv")
+    with open(paths["causal_pathways_csv"], "w") as fh:
+        fh.write("rank,path,posterior_probability,marginal_edge_product\n")
+        for rank, row in enumerate(result.causal_pathways, start=1):
+            path_txt = " -> ".join(row["path"])
+            fh.write(
+                f"{rank},{path_txt},{row['posterior_probability']},"
+                f"{row['marginal_edge_product']}\n"
+            )
+
+    paths["crosscoder_features_json"] = str(out / "crosscoder_features.json")
+    with open(paths["crosscoder_features_json"], "w") as fh:
+        json.dump(_json_sanitise(result.genscore_features), fh, indent=2, sort_keys=True)
+
     diagnostics = {
         k: v
         for k, v in result.mcmc_diagnostics.items()
@@ -974,6 +1508,9 @@ def save_result(
         "dagslam_n_edges": result.dagslam_n_edges,
         "mcmc_diagnostics": diagnostics,
         "threshold": result.threshold,
+        "survival_parent_columns": list(result.survival_parent_columns),
+        "survival_diagnostics": result.survival_diagnostics,
+        "causal_pathways": result.causal_pathways,
         "validation": result.validation,
         "timings": result.timings,
         "genscore_features": result.genscore_features,

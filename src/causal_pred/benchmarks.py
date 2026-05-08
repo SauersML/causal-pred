@@ -428,72 +428,31 @@ def run_causal_pred(
     auc_times: Sequence[float] = DEFAULT_AUC_TIMES,
     rng: Optional[np.random.Generator] = None,
 ) -> dict:
-    """Run the full causal-pred pipeline and return its benchmark row.
+    """Return the causal-pred benchmark row for the synthetic benchmark.
 
-    Gracefully returns ``{"status": "skipped", ...}`` if any stage raises
-    ``NotImplementedError`` (e.g. MCMC or GAM not yet wired up).
+    The production causal-pred path now has one fixed AoU entry point
+    (``scripts/run_full_pipeline.py``) because it must align the cohort CSV
+    with microarray-derived PRS. It is not a synthetic-data injectable
+    baseline, so the benchmark records that distinction explicitly.
     """
     t0 = time.perf_counter()
-    try:
-        from .pipeline import run_pipeline
-
-        if rng is None:
-            rng = np.random.default_rng(20260416)
-        # ``run_pipeline`` takes an integer ``seed`` rather than an RNG object.
-        seed = int(rng.integers(0, 2**31 - 1))
-
-        # We re-use the provided dataset -- run_pipeline regenerates its
-        # own.  Here we just wrap it and measure.  For tight integration
-        # the caller should already have matched n / seeds.
-        result = run_pipeline(
-            n=data.n,
-            use_real_gwas=use_real_gwas,
-            mcmc_iter=mcmc_iter,
-            mcmc_chains=mcmc_chains,
-            gam_samples=gam_samples,
-            gam_warmup=gam_warmup,
-            seed=seed,
-            verbose=False,
-        )
-
-        # Validation already computed on the eval split inside run_pipeline.
-        val = result.validation
-        td = val.get("time_dependent_auc", {})
-        br = val.get("brier", {})
-
-        out = {
-            "model": "causal_pred",
-            "status": "ok",
-            "nagelkerke_at_10y": float(val.get("nagelkerke_r2_at_10y", float("nan"))),
-            "time_dep_auc": {
-                "times": [float(x) for x in td.get("times", [])],
-                "auc": [float(x) for x in td.get("auc", [])],
-                "integrated_auc": float(td.get("integrated_auc", float("nan"))),
-            },
-            "ibs": float(br.get("ibs", float("nan"))),
-            "edge_auroc": float(
-                val.get("known_edge_recovery", {}).get("auroc", float("nan"))
-            ),
-            "edge_auprc": float(
-                val.get("known_edge_recovery", {}).get("auprc", float("nan"))
-            ),
-            "runtime_s": float(time.perf_counter() - t0),
-        }
-        return out
-    except NotImplementedError as exc:
-        return {
-            "model": "causal_pred",
-            "status": "skipped",
-            "reason": f"NotImplementedError: {exc}",
-            "runtime_s": float(time.perf_counter() - t0),
-        }
-    except Exception as exc:
-        return {
-            "model": "causal_pred",
-            "status": "failed",
-            "error": f"{type(exc).__name__}: {exc}",
-            "runtime_s": float(time.perf_counter() - t0),
-        }
+    _ = (
+        data,
+        mcmc_iter,
+        mcmc_chains,
+        gam_samples,
+        gam_warmup,
+        use_real_gwas,
+        t_grid,
+        auc_times,
+        rng,
+    )
+    return {
+        "model": "causal_pred",
+        "status": "skipped",
+        "reason": "production path requires AoU cohort + microarray PRS; run scripts/run_full_pipeline.py",
+        "runtime_s": float(time.perf_counter() - t0),
+    }
 
 
 # ---------------------------------------------------------------------------
