@@ -1355,11 +1355,15 @@ def run_pipeline() -> PipelineResult:
         }
         timings["gam"] = 0.0
 
-    causal_pathways = _causal_pathway_probabilities(
-        edge_probs,
-        mcmc_samples,
-        data.columns,
+    #safety check for causual pathways
+    if CAUSAL_PATH_TARGET in data.columns and mcmc_samples.shape[0] > 0:
+        causal_pathways = _causal_pathway_probabilities(
+            edge_probs,
+            mcmc_samples,
+            data.columns,
     )
+    else:
+        causal_pathways = []
 
     validation = _validate_edges(
         edge_probs,
