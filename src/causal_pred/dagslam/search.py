@@ -45,7 +45,7 @@ Public API mirrors the docstring in :mod:`causal_pred.dagslam.__init__`:
 
     run_dagslam(data, node_types, max_parents=6, max_iter=500,
                 restarts=5, tabu_tenure=10, rng=None, verbose=False,
-                **hyper) -> DAGSLAMResult
+                pi_prior=None, **hyper) -> DAGSLAMResult
 
 References
 ----------
@@ -132,6 +132,56 @@ def _is_dag(adj: np.ndarray) -> bool:
             if in_deg[v] == 0:
                 stack.append(int(v))
     return seen == adj.shape[0]
+
+
+# ---------------------------------------------------------------------------
+# Edge prior utilities
+# ---------------------------------------------------------------------------
+
+
+def _prepare_edge_logit_prior(
+    pi_prior: Optional[np.ndarray],
+    p: int,
+) -> np.ndarray:
+    """Return per-edge log-odds for the optional MrDAG prior.
+
+    Non-finite entries mean "no MrDAG evidence" and map to Bernoulli(0.5),
+    which has zero log-odds.  The diagonal is forced to zero because
+    self-edges are structurally forbidden.
+    """
+    if pi_prior is None:
+        edge_logit = np.zeros((p, p), dtype=float)
+    else:
+        pi = np.asarray(pi_prior, dtype=float).copy()
+        if pi.shape != (p, p):
+            raise ValueError(f"pi_prior has shape {pi.shape}, expected ({p}, {p})")
+        pi = np.where(np.isfinite(pi), pi, 0.5)
+        np.fill_diagonal(pi, 0.5)
+        pi = np.clip(pi, 1e-12, 1.0 - 1e-12)
+        edge_logit = np.log(pi) - np.log1p(-pi)
+
+    np.fill_diagonal(edge_logit, 0.0)
+    return edge_logit
+
+
+def _relative_log_prior(adj: np.ndarray, edge_logit: np.ndarray) -> float:
+    """Graph prior score up to a graph-independent Bernoulli constant."""
+    return float(np.sum(adj * edge_logit))
+
+
+def _delta_prior_of_move(
+    move: Tuple[str, int, int],
+    edge_logit: np.ndarray,
+) -> float:
+    """Relative log-prior delta for one add, remove, or reverse move."""
+    kind, i, j = move
+    if kind == "add":
+        return float(edge_logit[i, j])
+    if kind == "remove":
+        return float(-edge_logit[i, j])
+    if kind == "reverse":
+        return float(edge_logit[j, i] - edge_logit[i, j])
+    raise ValueError(f"unknown move kind {kind!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -238,19 +288,24 @@ def _delta_of_move(
     node_types: Sequence[str],
     cache: dict,
     hyper: dict,
+    edge_logit: np.ndarray,
 ) -> float:
     kind, i, j = move
     if kind == "add":
-        return score_delta_add_edge(i, j, adj, data, node_types, cache=cache, **hyper)
-    if kind == "remove":
-        return score_delta_remove_edge(
+        d_score = score_delta_add_edge(
             i, j, adj, data, node_types, cache=cache, **hyper
         )
-    if kind == "reverse":
-        return score_delta_reverse_edge(
+    elif kind == "remove":
+        d_score = score_delta_remove_edge(
             i, j, adj, data, node_types, cache=cache, **hyper
         )
-    raise ValueError(f"unknown move kind {kind!r}")
+    elif kind == "reverse":
+        d_score = score_delta_reverse_edge(
+            i, j, adj, data, node_types, cache=cache, **hyper
+        )
+    else:
+        raise ValueError(f"unknown move kind {kind!r}")
+    return float(d_score + _delta_prior_of_move(move, edge_logit))
 
 
 def _apply_move(adj: np.ndarray, move: Tuple[str, int, int]) -> None:
@@ -281,6 +336,7 @@ def _single_climb(
     cache: dict,
     hyper: dict,
     verbose: bool,
+    edge_logit: np.ndarray,
 ) -> Tuple[np.ndarray, float, dict]:
     """One hill-climb from ``start_adj``.  Mutates ``cache``.
 
@@ -289,7 +345,10 @@ def _single_climb(
     p = data.shape[1]
     adj = start_adj.astype(np.int64, copy=True)
     # Anchor the running score once; then maintain it via delta updates.
-    cur_score = float(score_dag(adj, data, node_types, cache=cache, **hyper))
+    cur_score = float(
+        score_dag(adj, data, node_types, cache=cache, **hyper)
+        + _relative_log_prior(adj, edge_logit)
+    )
 
     best_adj = adj.copy()
     best_score = cur_score
@@ -315,7 +374,7 @@ def _single_climb(
 
         for m in moves:
             try:
-                d = _delta_of_move(m, adj, data, node_types, cache, hyper)
+                d = _delta_of_move(m, adj, data, node_types, cache, hyper, edge_logit)
             except Exception as exc:  # defensive -- never propagate
                 skipped_moves.append(
                     {
@@ -422,6 +481,7 @@ def run_dagslam(
     tabu_tenure: int = 10,
     rng=None,
     verbose: bool = False,
+    pi_prior: Optional[np.ndarray] = None,
     **hyper,
 ) -> DAGSLAMResult:
     """DAGSLAM hill-climbing structure search.
@@ -446,6 +506,10 @@ def run_dagslam(
         If ``None``, ``np.random.default_rng()`` is used.
     verbose : bool
         If True, prints progress.
+    pi_prior : array-like, shape (p, p), optional
+        Per-edge MrDAG inclusion probabilities.  Finite entries add an
+        independent Bernoulli log-odds prior to the greedy search objective;
+        non-finite entries are treated as neutral 0.5 probabilities.
     **hyper
         Extra hyperparameters forwarded to the scoring module (e.g.
         ``alpha_mu`` for BGe, ``tau2`` for the Laplace logistic).
@@ -456,6 +520,7 @@ def run_dagslam(
     """
     X = np.ascontiguousarray(np.asarray(data, dtype=np.float64))
     n, p = X.shape
+    edge_logit = _prepare_edge_logit_prior(pi_prior, p)
     if len(node_types) != p:
         raise ValueError(
             f"node_types has length {len(node_types)} but data has {p} columns"
@@ -497,6 +562,7 @@ def run_dagslam(
             cache=cache,
             hyper=hyper,
             verbose=verbose,
+            edge_logit=edge_logit,
         )
 
         info["restart"] = r
@@ -514,7 +580,10 @@ def run_dagslam(
     )
 
     # Final authoritative rescore.
-    final_score = float(score_dag(global_best_adj, X, node_types, cache=cache, **hyper))
+    final_score = float(
+        score_dag(global_best_adj, X, node_types, cache=cache, **hyper)
+        + _relative_log_prior(global_best_adj, edge_logit)
+    )
     if not np.isfinite(final_score):
         raise RuntimeError("DAGSLAM produced a non-finite final score")
     assert abs(final_score - global_best_score) < 1e-6, (

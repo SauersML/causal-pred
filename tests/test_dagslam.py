@@ -90,6 +90,45 @@ def test_output_is_dag(small_data):
         pass
 
 
+def test_mrdag_prior_can_drive_greedy_search(monkeypatch):
+    from causal_pred.dagslam import search as search_mod
+
+    monkeypatch.setattr(search_mod, "score_dag", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(
+        search_mod,
+        "score_delta_add_edge",
+        lambda *_args, **_kwargs: 0.0,
+    )
+    monkeypatch.setattr(
+        search_mod,
+        "score_delta_remove_edge",
+        lambda *_args, **_kwargs: 0.0,
+    )
+    monkeypatch.setattr(
+        search_mod,
+        "score_delta_reverse_edge",
+        lambda *_args, **_kwargs: 0.0,
+    )
+
+    pi_prior = np.full((3, 3), 0.5, dtype=float)
+    np.fill_diagonal(pi_prior, np.nan)
+    pi_prior[0, 1] = 0.99
+    X = np.zeros((8, 3), dtype=float)
+    result = run_dagslam(
+        X,
+        ("continuous", "continuous", "continuous"),
+        max_parents=2,
+        max_iter=5,
+        restarts=1,
+        rng=np.random.default_rng(9),
+        pi_prior=pi_prior,
+    )
+
+    assert result.adjacency[0, 1] == 1
+    assert result.n_edges == 1
+    assert result.log_score > 0.0
+
+
 # ---------------------------------------------------------------------------
 # 2. Beats empty: closes >=90% of the empty->truth gap.
 #

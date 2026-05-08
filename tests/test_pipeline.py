@@ -189,6 +189,8 @@ def test_pipeline_runs_end_to_end(tmp_path, monkeypatch):
         "survival_lower.npy",
         "survival_upper.npy",
         "disease_risk_mean.npy",
+        "mrdag_pi_long.csv",
+        "mrdag_prior_long.csv",
         "greedy_edges.csv",
         "mcmc_thresholded_edges.csv",
         "mcmc_edge_probabilities_long.csv",
@@ -210,6 +212,31 @@ def test_pipeline_runs_end_to_end(tmp_path, monkeypatch):
     assert summary["genscore_features"]["promoted_names"] == ["feat_0000"]
     assert summary["survival_diagnostics"]["backend"] == "gamfit"
     assert "survival" in summary["validation"]
+
+
+def test_acyclic_threshold_skips_cycle_closing_edges():
+    from causal_pred import pipeline
+
+    edge_probs = np.array(
+        [
+            [0.0, 0.90, 0.10],
+            [0.20, 0.0, 0.80],
+            [0.70, 0.30, 0.0],
+        ]
+    )
+
+    adj = pipeline._acyclic_threshold_from_edge_probs(edge_probs, threshold=0.5)
+
+    np.testing.assert_array_equal(
+        adj,
+        np.array(
+            [
+                [0, 1, 0],
+                [0, 0, 1],
+                [0, 0, 0],
+            ]
+        ),
+    )
 
 
 def test_pipeline_determinism(tmp_path, monkeypatch):

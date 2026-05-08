@@ -81,7 +81,7 @@ PGS_PANEL_DIRNAME = "pgs_panel"
 GNOMON_OUT_DIRNAME = "gnomon_score"
 GENOTYPE_CACHE_DIR = str(Path.home() / "causal-pred" / "genomes")
 
-PIPELINE_CONFIG_VERSION = "2026-05-08.single-path.5"
+PIPELINE_CONFIG_VERSION = "2026-05-08.single-path.6"
 PIPELINE_SEED = 20260416
 PIPELINE_VERBOSE = False
 
@@ -1592,6 +1592,7 @@ def _load_or_run_dagslam(
     cache: WorkspaceCache,
     key: str,
     data: SyntheticDataset,
+    pi_prior: np.ndarray,
     logger: logging.Logger,
 ) -> dict[str, Any]:
     filename = f"dagslam-{key}.npz"
@@ -1616,6 +1617,7 @@ def _load_or_run_dagslam(
         restarts=DAGSLAM_RESTARTS,
         rng=np.random.default_rng(PIPELINE_SEED + 2),
         verbose=PIPELINE_VERBOSE,
+        pi_prior=pi_prior,
     )
     runtime_s = time.time() - t0
     _atomic_npz(
@@ -2093,7 +2095,7 @@ def run_pipeline() -> PipelineResult:
 
     with _phase(logger, "dagslam"):
         key = _run_key(data, mrdag_prior)
-        dagslam = _load_or_run_dagslam(cache, key, data, logger)
+        dagslam = _load_or_run_dagslam(cache, key, data, mrdag_prior, logger)
         timings["dagslam"] = float(dagslam["runtime_s"])
         logger.info(
             "[dagslam] log_score=%.3f n_edges=%d",
@@ -2126,8 +2128,7 @@ def run_pipeline() -> PipelineResult:
             float(THRESHOLD_DEFAULT),
         )
 
-    thresholded = (edge_probs >= THRESHOLD_DEFAULT).astype(int)
-    np.fill_diagonal(thresholded, 0)
+    thresholded = _acyclic_threshold_from_edge_probs(edge_probs, THRESHOLD_DEFAULT)
 
     with _phase(logger, "gam"):
         (
@@ -2147,11 +2148,14 @@ def run_pipeline() -> PipelineResult:
         )
         _log_survival_metrics(logger, survival_diagnostics)
 
-    causal_pathways = _causal_pathway_probabilities(
-        edge_probs,
-        mcmc_samples,
-        data.columns,
-    )
+    if CAUSAL_PATH_TARGET in data.columns and mcmc_samples.shape[0] > 0:
+        causal_pathways = _causal_pathway_probabilities(
+            edge_probs,
+            mcmc_samples,
+            data.columns,
+        )
+    else:
+        causal_pathways = []
     _log_causal_pathways(logger, causal_pathways)
 
     validation = _validate_edges(
@@ -2498,6 +2502,50 @@ def _adj_to_edge_list(
     return rows
 
 
+def _is_reachable_local(adj: np.ndarray, src: int, dst: int) -> bool:
+    if src == dst:
+        return True
+    p = adj.shape[0]
+    seen = np.zeros(p, dtype=bool)
+    seen[src] = True
+    stack = [int(src)]
+    while stack:
+        u = stack.pop()
+        for v in np.flatnonzero(adj[u]):
+            v = int(v)
+            if v == dst:
+                return True
+            if not seen[v]:
+                seen[v] = True
+                stack.append(v)
+    return False
+
+
+def _acyclic_threshold_from_edge_probs(
+    edge_probs: np.ndarray,
+    threshold: float,
+) -> np.ndarray:
+    """Build a thresholded DAG by greedily adding high-probability edges."""
+    probs = np.asarray(edge_probs, dtype=float)
+    if probs.ndim != 2 or probs.shape[0] != probs.shape[1]:
+        raise ValueError(f"edge_probs must be square, got shape {probs.shape}")
+    p = probs.shape[0]
+    adj = np.zeros((p, p), dtype=int)
+    candidates: list[tuple[float, int, int]] = []
+    for i in range(p):
+        for j in range(p):
+            if i == j:
+                continue
+            prob = float(probs[i, j])
+            if np.isfinite(prob) and prob >= threshold:
+                candidates.append((prob, i, j))
+    candidates.sort(key=lambda row: (-row[0], row[1], row[2]))
+    for _prob, i, j in candidates:
+        if not _is_reachable_local(adj, j, i):
+            adj[i, j] = 1
+    return adj
+
+
 def _edge_prob_long(
     edge_probs: np.ndarray, columns: Sequence[str]
 ) -> list[tuple[str, str, float]]:
@@ -2526,6 +2574,25 @@ def save_result(
     np.save(paths["mrdag_pi"], result.mrdag_pi)
     paths["mrdag_prior"] = str(out / "mrdag_prior.npy")
     np.save(paths["mrdag_prior"], result.mrdag_prior)
+    if result.mrdag_pi.shape != (len(NODE_NAMES), len(NODE_NAMES)):
+        raise ValueError(
+            "mrdag_pi shape must match NODE_NAMES: "
+            f"{result.mrdag_pi.shape} != {(len(NODE_NAMES), len(NODE_NAMES))}"
+        )
+    paths["mrdag_pi_long_csv"] = str(out / "mrdag_pi_long.csv")
+    with open(paths["mrdag_pi_long_csv"], "w") as fh:
+        fh.write("parent,child,mrdag_pi\n")
+        for i, parent in enumerate(NODE_NAMES):
+            for j, child in enumerate(NODE_NAMES):
+                if i == j:
+                    continue
+                fh.write(f"{parent},{child},{float(result.mrdag_pi[i, j])}\n")
+
+    paths["mrdag_prior_long_csv"] = str(out / "mrdag_prior_long.csv")
+    with open(paths["mrdag_prior_long_csv"], "w") as fh:
+        fh.write("parent,child,mrdag_prior\n")
+        for parent, child, prob in _edge_prob_long(result.mrdag_prior, columns):
+            fh.write(f"{parent},{child},{prob}\n")
     paths["dagslam_adjacency"] = str(out / "dagslam_adjacency.npy")
     np.save(paths["dagslam_adjacency"], result.dagslam_adjacency)
     paths["mcmc_edge_probs"] = str(out / "mcmc_edge_probs.npy")
