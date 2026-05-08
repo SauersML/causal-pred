@@ -33,6 +33,8 @@ import warnings
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 
 from .data.nodes import NODE_INDEX, NODE_NAMES, CANONICAL_EDGES
 from .data.synthetic import SyntheticDataset
@@ -241,9 +243,6 @@ def run_naive_logistic(
     extrapolation -- the integrated Brier is meaningful primarily as a
     sanity check that naive logistic is worse than Cox.
     """
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.preprocessing import StandardScaler
-
     t0 = time.perf_counter()
     X, names = _covariate_matrix(data)
 

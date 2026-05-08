@@ -531,6 +531,9 @@ def test_fetch_omop_long_frames_uploads_workspace_parquets(tmp_path, monkeypatch
             self.df = df
             self.job_id = "job-test"
 
+        def result(self):
+            return self
+
         def to_dataframe(self, **kwargs):
             assert kwargs == {"create_bqstorage_client": True}
             return self.df.copy()
@@ -627,6 +630,9 @@ def test_fetch_omop_long_frames_aggregates_conditions_before_download(
     class FakeJob:
         def __init__(self, df):
             self.df = df
+
+        def result(self):
+            return self
 
         def to_dataframe(self, **kwargs):
             assert kwargs == {"create_bqstorage_client": True}
