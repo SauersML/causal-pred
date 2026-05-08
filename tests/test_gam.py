@@ -1,27 +1,18 @@
-"""Tests for the distributional survival GAM (gam-library backend).
+"""Tests for the distributional survival GAM (gamfit-library backend).
 
-The survival GAM delegates to the ``gam`` Python library (PyO3 bindings
-to SauersML/gam's Rust engine).  These tests keep the surface compact:
-we sanity-check the library is importable, that a small fit completes
-within the laptop's budget, shapes are correct, and BMA weights behave.
+The survival GAM delegates to the ``gamfit`` Python library (PyO3
+bindings to SauersML/gam's Rust engine). These tests keep the surface
+compact: we sanity-check the library is importable, that a small fit
+completes within the laptop's budget, shapes are correct, and BMA
+weights behave.
 """
 
 from __future__ import annotations
 
 import time as _time
 
+import gamfit
 import numpy as np
-import pytest
-
-try:
-    import gam as _gam_lib
-
-    _HAS_GAM = True
-except Exception:  # pragma: no cover -- env without gam
-    _gam_lib = None
-    _HAS_GAM = False
-
-needs_gam = pytest.mark.skipif(not _HAS_GAM, reason="gam library not installed")
 
 
 # ---------------------------------------------------------------------------
@@ -29,10 +20,8 @@ needs_gam = pytest.mark.skipif(not _HAS_GAM, reason="gam library not installed")
 # ---------------------------------------------------------------------------
 
 
-@needs_gam
 def test_gam_import():
-    info = _gam_lib.build_info()
-    assert info.get("available") is True, info
+    info = gamfit.build_info()
     # Must expose the capabilities we rely on.
     caps = info.get("capabilities", [])
     assert "fit" in caps and "predict" in caps and "summary" in caps, caps
@@ -43,7 +32,6 @@ def test_gam_import():
 # ---------------------------------------------------------------------------
 
 
-@needs_gam
 def test_fit_smoke(medium_data):
     """Fit on ~300 rows with 3 covariates and check runtime + monotonicity."""
     from causal_pred.data.nodes import NODE_INDEX
@@ -100,7 +88,6 @@ def test_fit_smoke(medium_data):
 # ---------------------------------------------------------------------------
 
 
-@needs_gam
 def test_predict_shape(small_data):
     """Check (n_samples, n_new, n_t) shape contracts."""
     from causal_pred.data.nodes import NODE_INDEX
@@ -143,7 +130,6 @@ def test_predict_shape(small_data):
 # ---------------------------------------------------------------------------
 
 
-@needs_gam
 def test_bma_weights(small_data):
     from causal_pred.data.nodes import NODE_INDEX
     from causal_pred.gam.survival import bma_survival
@@ -194,7 +180,6 @@ def test_bma_weights(small_data):
 # ---------------------------------------------------------------------------
 
 
-@needs_gam
 def test_censoring_sanity():
     """Fit runs cleanly whether censoring rate is 0 or ~50%.
 
