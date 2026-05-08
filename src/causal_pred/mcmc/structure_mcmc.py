@@ -119,7 +119,7 @@ References
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from itertools import combinations
+from itertools import combinations, product
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -742,6 +742,94 @@ def _gibbs_resample_edge_pair(
     return True, float(new_score - old_score), float(new_prior - old_prior)
 
 
+def _internal_prior(
+    adj: np.ndarray,
+    nodes: Sequence[int],
+    log_pi: np.ndarray,
+    log_1m: np.ndarray,
+) -> float:
+    total = 0.0
+    for u in nodes:
+        for v in nodes:
+            if u == v:
+                continue
+            total += float(log_pi[u, v] if adj[u, v] else log_1m[u, v])
+    return float(total)
+
+
+def _gibbs_resample_node_block(
+    adj: np.ndarray,
+    nodes: Sequence[int],
+    data: np.ndarray,
+    node_types: Sequence[str],
+    log_pi: np.ndarray,
+    log_1m: np.ndarray,
+    max_parents: Optional[int],
+    cache: dict,
+    rng: np.random.Generator,
+    hyper: dict,
+) -> Tuple[bool, float, float]:
+    """Exact Gibbs update for all directed edges inside a small node block."""
+    block = tuple(int(x) for x in nodes)
+    if len(set(block)) < 2:
+        return True, 0.0, 0.0
+
+    old_score = 0.0
+    for node in block:
+        parents = tuple(int(k) for k in np.flatnonzero(adj[:, node]))
+        old_score += score_node(node, parents, data, node_types, cache=cache, **hyper)
+    old_prior = _internal_prior(adj, block, log_pi, log_1m)
+
+    base = adj.copy()
+    for u in block:
+        for v in block:
+            if u != v:
+                base[u, v] = 0
+
+    unordered_pairs = list(combinations(block, 2))
+    states: List[Tuple[np.ndarray, float, float]] = []
+    log_weights: List[float] = []
+    for choices in product((0, 1, 2), repeat=len(unordered_pairs)):
+        cand = base.copy()
+        for choice, (u, v) in zip(choices, unordered_pairs):
+            if choice == 1:
+                cand[u, v] = 1
+            elif choice == 2:
+                cand[v, u] = 1
+        if max_parents is not None and int(cand[:, block].sum(axis=0).max()) > int(
+            max_parents
+        ):
+            continue
+        if not _is_dag(cand):
+            continue
+        score = 0.0
+        for node in block:
+            parents = tuple(int(k) for k in np.flatnonzero(cand[:, node]))
+            score += score_node(node, parents, data, node_types, cache=cache, **hyper)
+        prior = _internal_prior(cand, block, log_pi, log_1m)
+        states.append((cand, float(score), float(prior)))
+        log_weights.append(float(score + prior))
+
+    if not states:
+        raise RuntimeError("node-block Gibbs update had no legal states")
+
+    weights_log = np.asarray(log_weights, dtype=float)
+    weights = np.exp(weights_log - float(weights_log.max()))
+    total = float(weights.sum())
+    if not np.isfinite(total) or total <= 0.0:
+        raise RuntimeError("node-block Gibbs weights are not finite")
+    idx = int(np.searchsorted(np.cumsum(weights), rng.random() * total, side="right"))
+    idx = min(idx, len(states) - 1)
+    new_adj, new_score, new_prior = states[idx]
+
+    for u in block:
+        for v in block:
+            if u != v:
+                adj[u, v] = new_adj[u, v]
+    assert _is_dag(adj), "node-block Gibbs update produced a non-DAG"
+    return True, float(new_score - old_score), float(new_prior - old_prior)
+
+
 # ---------------------------------------------------------------------------
 # Core single-chain sampler
 # ---------------------------------------------------------------------------
@@ -766,6 +854,8 @@ def _run_chain(
     exact_parent_resample: bool = False,
     max_parents: Optional[int] = None,
     edge_resample_prob: float = 0.0,
+    block_resample_prob: float = 0.0,
+    block_size: int = 3,
 ) -> dict:
     """Run one MCMC chain.  Returns a dict of per-chain outputs."""
     data.shape[1]
@@ -782,8 +872,16 @@ def _run_chain(
     samples: List[np.ndarray] = []
     log_post_kept: List[float] = []
 
-    prop = {"add": 0, "remove": 0, "reverse": 0, "hybrid": 0, "edge_gibbs": 0}
+    prop = {
+        "add": 0,
+        "remove": 0,
+        "reverse": 0,
+        "hybrid": 0,
+        "edge_gibbs": 0,
+        "block_gibbs": 0,
+    }
     accept = {"add": 0, "remove": 0, "reverse": 0, "hybrid": 0, "edge_gibbs": 0}
+    accept["block_gibbs"] = 0
 
     # Effective hybrid flip rate per iteration: during burn-in we optionally
     # use ``resample_flip_burn`` (if provided) to take larger exploratory
@@ -799,7 +897,37 @@ def _run_chain(
             else float(resample_flip_burn)
         )
         kernel_u = rng.random()
-        if edge_resample_prob > 0.0 and kernel_u < edge_resample_prob:
+        if block_resample_prob > 0.0 and kernel_u < block_resample_prob:
+            size = min(max(2, int(block_size)), data.shape[1])
+            nodes = rng.choice(data.shape[1], size=size, replace=False)
+            prop["block_gibbs"] += 1
+            accepted, d_score, d_prior = _gibbs_resample_node_block(
+                adj,
+                [int(x) for x in nodes],
+                data,
+                node_types,
+                log_pi,
+                log_1m,
+                max_parents,
+                cache,
+                rng,
+                hyper,
+            )
+            if accepted:
+                cur_score += d_score
+                cur_prior += d_prior
+                n_add, n_rem, n_rev, _reach = _count_neighbourhood(
+                    adj, max_parents=max_parents
+                )
+                cur_nmoves = n_add + n_rem + n_rev
+                accept["block_gibbs"] += 1
+            if it >= burn_in and ((it - burn_in) % thin == 0):
+                samples.append(adj.copy())
+                log_post_kept.append(cur_score + cur_prior)
+            continue
+
+        edge_cutoff = block_resample_prob + edge_resample_prob
+        if edge_resample_prob > 0.0 and kernel_u < edge_cutoff:
             i, j = rng.choice(data.shape[1], size=2, replace=False)
             prop["edge_gibbs"] += 1
             accepted, d_score, d_prior = _gibbs_resample_edge_pair(
@@ -831,7 +959,7 @@ def _run_chain(
         # Hybrid parent-set resample move with probability ``hybrid_prob``.
         if (
             hybrid_prob > 0.0
-            and kernel_u < edge_resample_prob + hybrid_prob
+            and kernel_u < block_resample_prob + edge_resample_prob + hybrid_prob
         ):
             j_target = int(rng.integers(0, data.shape[1]))
             prop["hybrid"] += 1
@@ -1011,6 +1139,8 @@ def run_structure_mcmc(
     exact_parent_resample: bool = False,
     max_parents: Optional[int] = None,
     edge_resample_prob: float = 0.0,
+    block_resample_prob: float = 0.0,
+    block_size: int = 3,
     **hyper,
 ) -> MCMCResult:
     """Structure MCMC over DAGs with an MrDAG edge-inclusion prior.
@@ -1051,6 +1181,11 @@ def run_structure_mcmc(
         unordered node pair: no edge, ``i -> j``, or ``j -> i``.  This
         is useful for sharp posteriors where random add/remove/reverse
         proposals mostly reject.
+    block_resample_prob : float, default 0.0
+        Per-iteration probability of an exact Gibbs update over all
+        directed edges inside a small node block.
+    block_size : int, default 3
+        Number of nodes in the block Gibbs update.
     resample_flip : float, default 0.3
         Per-candidate flip probability inside the hybrid move.  With a
         symmetric-flip proposal the forward / backward densities cancel
@@ -1097,11 +1232,19 @@ def run_structure_mcmc(
     if exact_parent_resample and max_parents is None:
         raise ValueError("exact_parent_resample requires max_parents")
     edge_resample_prob = float(edge_resample_prob)
+    block_resample_prob = float(block_resample_prob)
     hybrid_prob = float(hybrid_prob)
-    if edge_resample_prob < 0.0 or hybrid_prob < 0.0:
-        raise ValueError("edge_resample_prob and hybrid_prob must be non-negative")
-    if edge_resample_prob + hybrid_prob > 1.0:
-        raise ValueError("edge_resample_prob + hybrid_prob must be <= 1")
+    if edge_resample_prob < 0.0 or hybrid_prob < 0.0 or block_resample_prob < 0.0:
+        raise ValueError(
+            "block_resample_prob, edge_resample_prob, and hybrid_prob must be non-negative"
+        )
+    if block_resample_prob + edge_resample_prob + hybrid_prob > 1.0:
+        raise ValueError(
+            "block_resample_prob + edge_resample_prob + hybrid_prob must be <= 1"
+        )
+    block_size = int(block_size)
+    if block_size < 2:
+        raise ValueError("block_size must be at least 2")
     if rng is None:
         rng = np.random.default_rng()
     log_pi, log_1m = _prepare_prior(pi_prior, p)
@@ -1118,8 +1261,22 @@ def run_structure_mcmc(
 
     all_chain_samples: List[np.ndarray] = []
     all_log_post: List[np.ndarray] = []
-    prop_totals = {"add": 0, "remove": 0, "reverse": 0, "hybrid": 0}
-    accept_totals = {"add": 0, "remove": 0, "reverse": 0, "hybrid": 0}
+    prop_totals = {
+        "add": 0,
+        "remove": 0,
+        "reverse": 0,
+        "hybrid": 0,
+        "edge_gibbs": 0,
+        "block_gibbs": 0,
+    }
+    accept_totals = {
+        "add": 0,
+        "remove": 0,
+        "reverse": 0,
+        "hybrid": 0,
+        "edge_gibbs": 0,
+        "block_gibbs": 0,
+    }
     mean_lp_per_chain: List[float] = []
 
     for c in range(n_chains):
@@ -1151,6 +1308,8 @@ def run_structure_mcmc(
             exact_parent_resample=exact_parent_resample,
             max_parents=max_parents,
             edge_resample_prob=edge_resample_prob,
+            block_resample_prob=block_resample_prob,
+            block_size=block_size,
         )
         # Stack this chain's samples into a (S, p, p) array.
         if chain_out["samples"]:
@@ -1256,6 +1415,8 @@ def run_structure_mcmc(
         "exact_parent_resample": bool(exact_parent_resample),
         "max_parents": None if max_parents is None else int(max_parents),
         "edge_resample_prob": float(edge_resample_prob),
+        "block_resample_prob": float(block_resample_prob),
+        "block_size": int(block_size),
     }
 
     return MCMCResult(

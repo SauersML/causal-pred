@@ -38,6 +38,8 @@ import numpy as np
 import pandas as pd
 
 from .data.cohort import (
+    CURATED_OMOP_CONDITION_CATALOG,
+    CURATED_OMOP_CONDITION_IDS,
     EhrPanel,
     SurvivalOutcome,
     build_ehr_panel,
@@ -50,6 +52,7 @@ from .data.cohort import (
 )
 from .data.nodes import CANONICAL_EDGES, NODE_INDEX, NODE_NAMES
 from .data.polygenic import parse_sscore, score_panel
+from .data.opengwas import load_live_gwas
 from .data.real_gwas import load_real_gwas
 from .data.synthetic import SyntheticDataset
 from .dagslam import run_dagslam
@@ -101,8 +104,10 @@ MCMC_SAMPLES = 1500
 MCMC_BURN_IN = 500
 MCMC_THIN = 10
 MCMC_CHAINS = 4
-MCMC_EDGE_RESAMPLE_PROB = 0.7
-MCMC_PARENT_RESAMPLE_PROB = 0.2
+MCMC_BLOCK_RESAMPLE_PROB = 0.6
+MCMC_EDGE_RESAMPLE_PROB = 0.2
+MCMC_PARENT_RESAMPLE_PROB = 0.1
+MCMC_BLOCK_SIZE = 3
 MCMC_EXACT_PARENT_RESAMPLE = True
 THRESHOLD_DEFAULT = 0.5
 
@@ -110,7 +115,11 @@ VALIDATION_N_PERMUTE = 200
 
 EHR_FETCH_DRUGS = True
 EHR_FETCH_MEASUREMENTS = True
-EHR_CONDITION_CONCEPT_IDS: Optional[Tuple[int, ...]] = None
+# The curated condition catalog lives in `causal_pred.data.cohort` so that
+# both the production pipeline and direct callers of `fetch_omop_long_frames`
+# share one source of truth. Extend the catalog there.
+EHR_CONDITION_CATALOG = CURATED_OMOP_CONDITION_CATALOG
+EHR_CONDITION_CONCEPT_IDS: Optional[Tuple[int, ...]] = CURATED_OMOP_CONDITION_IDS
 EHR_MIN_PREVALENCE = 50
 EHR_MIN_LAB_OBSERVATIONS = 50
 EHR_LOOKBACK_DAYS: Optional[int] = 365 * 5
@@ -546,6 +555,8 @@ def _pipeline_config() -> dict[str, Any]:
             "burn_in": MCMC_BURN_IN,
             "thin": MCMC_THIN,
             "chains": MCMC_CHAINS,
+            "block_resample_prob": MCMC_BLOCK_RESAMPLE_PROB,
+            "block_size": MCMC_BLOCK_SIZE,
             "edge_resample_prob": MCMC_EDGE_RESAMPLE_PROB,
             "parent_resample_prob": MCMC_PARENT_RESAMPLE_PROB,
             "exact_parent_resample": MCMC_EXACT_PARENT_RESAMPLE,
@@ -1236,6 +1247,15 @@ def _load_or_run_genscore_features(
             return dataset, z["person_id"].astype(str), meta
 
     logger.info("[genscore] training TopK crosscoder and promoting shared features")
+    logger.info(
+        "[genscore] config n_promote=%d share_band=[%.2f,%.2f] "
+        "min_activation_rate=%.3f crosscoder=%s",
+        GENSCORE_N_PROMOTE,
+        GENSCORE_GENOME_SHARE_MIN,
+        GENSCORE_GENOME_SHARE_MAX,
+        GENSCORE_MIN_ACTIVATION_RATE,
+        GENSCORE_CROSSCODER_KWARGS,
+    )
     t0 = time.time()
     aug_result, model = run_genscore(
         base_dataset=data,
@@ -1248,6 +1268,7 @@ def _load_or_run_genscore_features(
         min_activation_rate=GENSCORE_MIN_ACTIVATION_RATE,
         crosscoder_kwargs=GENSCORE_CROSSCODER_KWARGS,
         rng=np.random.default_rng(PIPELINE_SEED + 10),
+        progress=lambda message: logger.info("%s", message),
     )
     sel = aug_result.feature_selection
     top_genome_loadings: dict[str, list[dict[str, float]]] = {}
@@ -1296,6 +1317,100 @@ def _load_or_run_genscore_features(
         meta_json=np.array(json.dumps(_json_sanitise(meta))),
     )
     cache.store(path)
+
+    # ---- post-training summary --------------------------------------------
+    from .genscore.crosscoder import encode, feature_stream_share
+    from .genscore.integrate import align_panels_by_iid
+
+    r_G = feature_stream_share(model)
+    panels_aligned = align_panels_by_iid(person_ids, prs_df, ehr_panel)
+    z_full = encode(model, panels_aligned.A, panels_aligned.B)
+    activation_rate_all = (z_full > 0).mean(axis=0)
+    dead_mask_all = activation_rate_all == 0.0
+    genome_only = (~dead_mask_all) & (r_G > GENSCORE_GENOME_SHARE_MAX)
+    ehr_only = (~dead_mask_all) & (r_G < GENSCORE_GENOME_SHARE_MIN)
+    cross_modal = (
+        (~dead_mask_all)
+        & (r_G >= GENSCORE_GENOME_SHARE_MIN)
+        & (r_G <= GENSCORE_GENOME_SHARE_MAX)
+    )
+
+    a_hat = z_full @ model.W_d_G
+    b_hat = z_full @ model.W_d_E
+    a_z = (panels_aligned.A - model.mean_G) / model.std_G
+    b_z = (panels_aligned.B - model.mean_E) / model.std_E
+    ss_res_a = float(np.sum((a_z - a_hat) ** 2))
+    ss_tot_a = float(np.sum(a_z ** 2))
+    ss_res_b = float(np.sum((b_z - b_hat) ** 2))
+    ss_tot_b = float(np.sum(b_z ** 2))
+    r2_g = 1.0 - ss_res_a / ss_tot_a if ss_tot_a > 0 else float("nan")
+    r2_e = 1.0 - ss_res_b / ss_tot_b if ss_tot_b > 0 else float("nan")
+
+    rg_q = np.quantile(r_G, [0.0, 0.25, 0.5, 0.75, 1.0])
+    rate_alive = activation_rate_all[~dead_mask_all]
+    if rate_alive.size > 0:
+        rate_q = np.quantile(rate_alive, [0.0, 0.25, 0.5, 0.75, 1.0])
+    else:
+        rate_q = np.zeros(5)
+
+    logger.info(
+        "[genscore] reconstruction R^2 genome=%.4f ehr=%.4f",
+        r2_g,
+        r2_e,
+    )
+    logger.info(
+        "[genscore] feature counts d=%d alive=%d dead=%d "
+        "genome_only(rG>%.2f)=%d ehr_only(rG<%.2f)=%d cross_modal=%d",
+        int(model.d),
+        int((~dead_mask_all).sum()),
+        int(dead_mask_all.sum()),
+        GENSCORE_GENOME_SHARE_MAX,
+        int(genome_only.sum()),
+        GENSCORE_GENOME_SHARE_MIN,
+        int(ehr_only.sum()),
+        int(cross_modal.sum()),
+    )
+    logger.info(
+        "[genscore] genome_share quantiles min=%.3f q25=%.3f med=%.3f q75=%.3f max=%.3f",
+        *(float(x) for x in rg_q),
+    )
+    logger.info(
+        "[genscore] activation_rate quantiles (alive only) "
+        "min=%.4f q25=%.4f med=%.4f q75=%.4f max=%.4f",
+        *(float(x) for x in rate_q),
+    )
+    eligible_pool = int(
+        (cross_modal & (activation_rate_all >= GENSCORE_MIN_ACTIVATION_RATE)).sum()
+    )
+    logger.info(
+        "[genscore] selected (n_promote=%d) eligible pool=%d",
+        GENSCORE_N_PROMOTE,
+        eligible_pool,
+    )
+    for name, idx, share, rate in zip(
+        sel.names,
+        sel.indices.tolist(),
+        sel.genome_share.tolist(),
+        sel.activation_rate.tolist(),
+    ):
+        top_g = top_genome_loadings.get(str(name), [])[:3]
+        top_e = top_ehr_loadings.get(str(name), [])[:3]
+        g_summary = ",".join(
+            f"{entry['feature']}={entry['weight']:+.2f}" for entry in top_g
+        )
+        e_summary = ",".join(
+            f"{entry['feature']}={entry['weight']:+.2f}" for entry in top_e
+        )
+        logger.info(
+            "[genscore]   %s idx=%d r_G=%.3f rate=%.4f top_genome=[%s] top_ehr=[%s]",
+            name,
+            int(idx),
+            float(share),
+            float(rate),
+            g_summary,
+            e_summary,
+        )
+
     logger.info(
         "[genscore] promoted=%d n=%d p=%d",
         len(sel.names),
@@ -1305,8 +1420,94 @@ def _load_or_run_genscore_features(
     return dataset, aug_result.kept_person_id.astype(str), meta
 
 
+def _mr_gwas_source() -> str:
+    """Pick the MR-prior source.
+
+    ``MR_GWAS_SOURCE=live`` (default when ``OPENGWAS_JWT`` is set) runs
+    live two-sample IVW via ``load_live_gwas``.  ``MR_GWAS_SOURCE=literature``
+    forces the hand-coded ``load_real_gwas`` fallback.
+    """
+    explicit = os.environ.get("MR_GWAS_SOURCE", "").strip().lower()
+    if explicit in {"live", "literature"}:
+        return explicit
+    return "live" if os.environ.get("OPENGWAS_JWT", "").strip() else "literature"
+
+
 def _mrdag_cache_key() -> str:
-    return _short_hash({"version": PIPELINE_CONFIG_VERSION, "mrdag": _pipeline_config()["mrdag"]})
+    return _short_hash({
+        "version": PIPELINE_CONFIG_VERSION,
+        "mrdag": _pipeline_config()["mrdag"],
+        "mr_gwas_source": _mr_gwas_source(),
+    })
+
+
+def _log_gwas_per_pair(
+    logger: logging.Logger, summary: Any, source: str
+) -> None:
+    rows = getattr(summary, "per_pair", None)
+    if not rows:
+        finite = int(np.sum(np.isfinite(summary.betas)))
+        total = int(summary.betas.size - len(summary.exposures))  # off-diagonal
+        logger.info(
+            "[mrdag] gwas_source=%s usable_cells=%d/%d",
+            source,
+            finite,
+            total,
+        )
+        return
+    by_source: dict[str, int] = {}
+    for r in rows:
+        by_source[r.source] = by_source.get(r.source, 0) + 1
+    logger.info(
+        "[mrdag] gwas_source=%s pair_status=%s",
+        source,
+        ", ".join(f"{k}={v}" for k, v in sorted(by_source.items())),
+    )
+    fetched_or_cached = [
+        r for r in rows if r.source in {"fetched", "cache"}
+    ]
+    fetched_or_cached.sort(key=lambda r: -abs(r.beta) if np.isfinite(r.beta) else 0.0)
+    for r in fetched_or_cached[:20]:
+        logger.info(
+            "[mrdag] %s -> %s : beta=%.4f se=%.4f n_snps=%d (%s)",
+            r.exposure,
+            r.outcome,
+            r.beta,
+            r.se,
+            r.n_snps,
+            r.source,
+        )
+
+
+def _load_gwas_for_mrdag(logger: logging.Logger) -> tuple[Any, str]:
+    """Load the MR summary statistics for the MrDAG prior.
+
+    Tries ``live`` (OpenGWAS two-sample IVW) when configured; falls
+    back to the curated literature table when no JWT is set or when
+    the fetch yields zero usable cells.  Logs which source was used
+    and a per-pair (beta, SE, n_snps) breakdown.
+    """
+    source = _mr_gwas_source()
+    if source == "live":
+        try:
+            cache_dir = Path(DEFAULT_CACHE_DIR) / "mr_cache"
+            summary = load_live_gwas(cache_dir=cache_dir)
+            usable = int(np.sum(np.isfinite(summary.betas) & np.isfinite(summary.ses)))
+            if usable > 0:
+                _log_gwas_per_pair(logger, summary, "live")
+                return summary, "live"
+            logger.warning(
+                "[mrdag] live OpenGWAS fetch produced 0 usable cells; "
+                "falling back to literature table"
+            )
+        except Exception as exc:
+            logger.warning(
+                "[mrdag] live OpenGWAS fetch failed (%s); falling back to literature",
+                exc,
+            )
+    summary = load_real_gwas()
+    _log_gwas_per_pair(logger, summary, "literature")
+    return summary, "literature"
 
 
 def _load_or_run_mrdag(
@@ -1320,10 +1521,11 @@ def _load_or_run_mrdag(
             logger.info("[mrdag] using cache %s", path)
             return z["pi"], json.loads(str(z["diagnostics_json"].item()))
 
-    logger.info("[mrdag] running literature MR prior sampler")
+    gwas, source_used = _load_gwas_for_mrdag(logger)
+    logger.info("[mrdag] running MR prior sampler (source=%s)", source_used)
     t0 = time.time()
     result = run_mrdag(
-        load_real_gwas(),
+        gwas,
         rng=np.random.default_rng(PIPELINE_SEED + 1),
         n_iter=MRDAG_N_ITER,
         n_chains=MRDAG_N_CHAINS,
@@ -1332,6 +1534,7 @@ def _load_or_run_mrdag(
     )
     diagnostics = dict(result.diagnostics)
     diagnostics["runtime_s"] = time.time() - t0
+    diagnostics["gwas_source"] = source_used
     _atomic_npz(
         path,
         pi=result.pi,
@@ -1444,6 +1647,8 @@ def _load_or_run_mcmc(
         n_chains=MCMC_CHAINS,
         rng=np.random.default_rng(PIPELINE_SEED + 3),
         progress=PIPELINE_VERBOSE,
+        block_resample_prob=MCMC_BLOCK_RESAMPLE_PROB,
+        block_size=MCMC_BLOCK_SIZE,
         edge_resample_prob=MCMC_EDGE_RESAMPLE_PROB,
         hybrid_prob=MCMC_PARENT_RESAMPLE_PROB,
         exact_parent_resample=MCMC_EXACT_PARENT_RESAMPLE,

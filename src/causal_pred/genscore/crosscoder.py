@@ -55,8 +55,9 @@ References
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 
@@ -267,6 +268,7 @@ def train_crosscoder(
     dead_steps: int = 200,
     rng: Optional[np.random.Generator] = None,
     log_every: int = 100,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> TopKCrosscoder:
     """Train a TopK crosscoder on paired (genome, EHR) activations.
 
@@ -367,7 +369,19 @@ def train_crosscoder(
         "loss_main": [],
         "loss_aux": [],
         "frac_dead": [],
+        "frac_active_batch": [],
+        "ever_active_count": [],
     }
+
+    ever_active = np.zeros(d_lat, dtype=bool)
+    t_start = time.time()
+    if progress is not None:
+        progress(
+            "[crosscoder] start "
+            f"n={n} m_G={m_G} m_E={m_E} d={d_lat} k={k} "
+            f"steps={n_steps} batch={batch_size} lr={lr:g} "
+            f"aux_k={aux_k} dead_steps={dead_steps}"
+        )
 
     for step in range(1, n_steps + 1):
         idx = rng_local.integers(0, n, size=batch_size)
@@ -434,6 +448,7 @@ def train_crosscoder(
         active_this_step = mask.any(axis=0)
         steps_since_active += 1
         steps_since_active[active_this_step] = 0
+        ever_active |= active_this_step
 
         # ---- Adam step --------------------------------------------------
         grads = {
@@ -458,10 +473,38 @@ def train_crosscoder(
 
         # ---- diagnostics -----------------------------------------------
         if step == 1 or step == n_steps or step % log_every == 0:
+            frac_active_batch = float(active_this_step.mean())
             history["step"].append(step)
             history["loss_main"].append(float(loss_main))
             history["loss_aux"].append(float(loss_aux))
             history["frac_dead"].append(float(n_dead) / d_lat)
+            history["frac_active_batch"].append(frac_active_batch)
+            history["ever_active_count"].append(int(ever_active.sum()))
+            if progress is not None:
+                elapsed = time.time() - t_start
+                progress(
+                    f"[crosscoder] step={step}/{n_steps} "
+                    f"loss_main={float(loss_main):.5f} "
+                    f"loss_aux={float(loss_aux):.5f} "
+                    f"frac_dead={float(n_dead) / d_lat:.3f} "
+                    f"frac_active_batch={frac_active_batch:.3f} "
+                    f"ever_active={int(ever_active.sum())}/{d_lat} "
+                    f"elapsed={elapsed:.1f}s"
+                )
+
+    if progress is not None:
+        elapsed = time.time() - t_start
+        final_loss_main = history["loss_main"][-1] if history["loss_main"] else float("nan")
+        final_loss_aux = history["loss_aux"][-1] if history["loss_aux"] else float("nan")
+        final_frac_dead = history["frac_dead"][-1] if history["frac_dead"] else float("nan")
+        progress(
+            "[crosscoder] done "
+            f"steps={n_steps} elapsed={elapsed:.1f}s "
+            f"final_loss_main={final_loss_main:.5f} "
+            f"final_loss_aux={final_loss_aux:.5f} "
+            f"final_frac_dead={final_frac_dead:.3f} "
+            f"ever_active={int(ever_active.sum())}/{d_lat}"
+        )
 
     return TopKCrosscoder(
         W_e=params["W_e"],

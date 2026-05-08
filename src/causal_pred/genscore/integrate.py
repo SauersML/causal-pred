@@ -24,7 +24,7 @@ through the DAG.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -125,6 +125,7 @@ def fit_panel_crosscoder(
     aux_coef: float = 1.0 / 32.0,
     dead_steps: int = 200,
     rng: Optional[np.random.Generator] = None,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> TopKCrosscoder:
     """Train the TopK crosscoder on aligned panels, with biobank-friendly
     defaults (longer schedule, smaller learning rate). Thin wrapper around
@@ -141,6 +142,7 @@ def fit_panel_crosscoder(
         aux_coef=aux_coef,
         dead_steps=dead_steps,
         rng=rng,
+        progress=progress,
     )
 
 
@@ -394,14 +396,21 @@ def run_genscore(
     min_activation_rate: float = 0.01,
     crosscoder_kwargs: Optional[dict] = None,
     rng: Optional[np.random.Generator] = None,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> Tuple[AugmentationResult, TopKCrosscoder]:
     """Run the full panel-alignment -> crosscoder -> promotion -> augmentation
     loop and return the augmented dataset together with the trained model.
     """
     panels = align_panels_by_iid(base_person_ids, prs_df, ehr_panel)
+    if progress is not None:
+        progress(
+            f"[crosscoder] panels aligned n={panels.A.shape[0]} "
+            f"m_G={panels.A.shape[1]} m_E={panels.B.shape[1]}"
+        )
     model = fit_panel_crosscoder(
         panels,
         rng=rng,
+        progress=progress,
         **(crosscoder_kwargs or {}),
     )
     selection = select_shared_features(
