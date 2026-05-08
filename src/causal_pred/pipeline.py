@@ -31,9 +31,13 @@ import numpy as np
 import pandas as pd
 
 from .data.cohort import (
+    EhrPanel,
+    build_ehr_panel,
     discover_genotype_dir,
+    fetch_omop_long_frames,
     load_cohort_dataset_with_person_ids,
     resolve_aou_genotypes,
+    resolve_baseline_dt,
     resolve_cohort_csv,
 )
 from .data.nodes import CANONICAL_EDGES, NODE_INDEX
@@ -42,6 +46,7 @@ from .data.real_gwas import load_real_gwas
 from .data.synthetic import SyntheticDataset
 from .dagslam import run_dagslam
 from .gam.survival import fit_survival_gam
+from .genscore.integrate import run_genscore
 from .genscore.panels import download_panel
 from .mcmc import run_structure_mcmc
 from .mrdag import run_mrdag
@@ -91,6 +96,18 @@ MCMC_CHAINS = 4
 THRESHOLD_DEFAULT = 0.5
 
 VALIDATION_N_PERMUTE = 200
+
+GENSCORE_N_PROMOTE = 32
+GENSCORE_GENOME_SHARE_MIN = 0.2
+GENSCORE_GENOME_SHARE_MAX = 0.8
+GENSCORE_MIN_ACTIVATION_RATE = 0.01
+GENSCORE_CROSSCODER_KWARGS = {
+    "d": 512,
+    "k": 32,
+    "n_steps": 4000,
+    "batch_size": 1024,
+    "lr": 3e-4,
+}
 
 GAM_N_SAMPLES = 200
 SURVIVAL_TIME_GRID_POINTS = 50
@@ -263,6 +280,11 @@ def _array_hash(arr: np.ndarray) -> str:
     return h.hexdigest()
 
 
+def _dataframe_values_hash(df: pd.DataFrame) -> str:
+    values = np.ascontiguousarray(df.to_numpy(dtype=np.float64))
+    return _array_hash(values)
+
+
 def _file_sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -279,6 +301,13 @@ def _pipeline_config() -> dict[str, Any]:
         "prs_nodes": PRS_NODES,
         "prs_max_missing": PRS_MAX_MISSING,
         "prs_min_complete_rows": PRS_MIN_COMPLETE_ROWS,
+        "genscore": {
+            "n_promote": GENSCORE_N_PROMOTE,
+            "genome_share_min": GENSCORE_GENOME_SHARE_MIN,
+            "genome_share_max": GENSCORE_GENOME_SHARE_MAX,
+            "min_activation_rate": GENSCORE_MIN_ACTIVATION_RATE,
+            "crosscoder_kwargs": GENSCORE_CROSSCODER_KWARGS,
+        },
         "mrdag": {
             "n_iter": MRDAG_N_ITER,
             "n_chains": MRDAG_N_CHAINS,
@@ -322,6 +351,30 @@ def _run_key(data: SyntheticDataset, mrdag_prior: np.ndarray) -> str:
             "time_sha256": _array_hash(data.time),
             "event_sha256": _array_hash(data.event),
             "mrdag_prior_sha256": _array_hash(mrdag_prior),
+        }
+    )
+
+
+def _genscore_key(
+    data: SyntheticDataset,
+    person_ids: Sequence[str],
+    prs_df: pd.DataFrame,
+    ehr_panel: EhrPanel,
+) -> str:
+    return _short_hash(
+        {
+            "config": _pipeline_config()["genscore"],
+            "columns": list(data.columns),
+            "node_types": list(data.node_types),
+            "x_sha256": _array_hash(data.X),
+            "time_sha256": _array_hash(data.time),
+            "event_sha256": _array_hash(data.event),
+            "person_ids": [str(p) for p in person_ids],
+            "prs_columns": [str(c) for c in prs_df.columns],
+            "prs_sha256": _dataframe_values_hash(prs_df),
+            "ehr_features": list(ehr_panel.feature_names),
+            "ehr_kinds": list(ehr_panel.feature_kinds),
+            "ehr_sha256": _array_hash(ehr_panel.matrix),
         }
     )
 
