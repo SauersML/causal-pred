@@ -51,6 +51,13 @@ def _make_tiny_prs_csv(path):
     ).to_csv(path, index=False, compression="gzip")
 
 
+def _make_tiny_static_cohort_csv(path):
+    _make_tiny_cohort_csv(path)
+    df = pd.read_csv(path)
+    df = df.drop(columns=["followup_years", "event"])
+    df.to_csv(path, index=False)
+
+
 def _configure_tiny_pipeline(monkeypatch, tmp_path):
     from causal_pred import pipeline
     from causal_pred.data.cohort import EhrPanel
@@ -214,6 +221,47 @@ def test_pipeline_determinism(tmp_path, monkeypatch):
     r2 = pipeline.run_pipeline()
     np.testing.assert_allclose(r1.mcmc_edge_probs, r2.mcmc_edge_probs, atol=1e-12)
     np.testing.assert_array_equal(r1.dagslam_adjacency, r2.dagslam_adjacency)
+
+
+def test_pipeline_builds_survival_outcome_when_csv_lacks_time_event(tmp_path, monkeypatch):
+    _make_tiny_static_cohort_csv(tmp_path / "t2d_initial_nodes_complete.csv")
+    _make_tiny_prs_csv(tmp_path / "aou_prs_panel.csv.gz")
+
+    pipeline = _configure_tiny_pipeline(monkeypatch, tmp_path)
+
+    def _fake_survival_outcome(_cache, person_ids, _logger):
+        pid = np.asarray([str(p) for p in person_ids])
+        n = pid.size
+        event = np.zeros(n, dtype=int)
+        event[::5] = 1
+        return pipeline.SurvivalOutcome(
+            person_id=pid,
+            time=np.linspace(2.0, 12.0, n),
+            event=event,
+            keep=np.ones(n, dtype=bool),
+            baseline_dt=np.array(["2020-01-01"] * n, dtype="datetime64[ns]"),
+            end_dt=np.array(["2030-01-01"] * n, dtype="datetime64[ns]"),
+            t2d_dt=np.array(["NaT"] * n, dtype="datetime64[ns]"),
+            meta={
+                "source": "test_omop",
+                "n_input": int(n),
+                "n_kept": int(n),
+                "n_events": int(event.sum()),
+            },
+        )
+
+    monkeypatch.setattr(
+        pipeline,
+        "_load_or_build_survival_outcome",
+        _fake_survival_outcome,
+    )
+
+    result = pipeline.run_pipeline()
+
+    assert result.data_summary["survival_outcome"]["source"] == "test_omop"
+    assert result.data_summary["event_rate"] == pytest.approx(0.2)
+    assert result.survival_mean.shape == (result.data_summary["n"], 6)
+    assert result.survival_diagnostics["backend"] == "gamfit"
 
 
 def test_pipeline_raises_when_no_csv(tmp_path, monkeypatch):

@@ -22,7 +22,9 @@ The real-data path expects the complete-case T2D node file at
 `$WORKSPACE_BUCKET/data/t2d_initial_nodes_complete.csv`. On the AoU
 Researcher Workbench, the bootstrap verifies the workspace inputs, installs
 the local toolchain, syncs dependencies, installs `gnomon`, and runs the
-single pipeline:
+single pipeline. If the cohort CSV has no follow-up time/event columns, the
+pipeline builds the required cached survival outcome from OMOP follow-up and
+T2D diagnosis frames instead of skipping GAM:
 
 ```sh
 bash causal-pred/scripts/bootstrap_aou.sh

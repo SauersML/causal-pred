@@ -32,21 +32,23 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Optional, Sequence
+from typing import Any, Iterator, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
 from .data.cohort import (
     EhrPanel,
+    SurvivalOutcome,
     build_ehr_panel,
+    build_survival_outcome,
     discover_genotype_dir,
     fetch_omop_long_frames,
     load_cohort_dataset_with_person_ids,
     resolve_aou_genotypes,
     resolve_cohort_csv,
 )
-from .data.nodes import CANONICAL_EDGES, NODE_INDEX
+from .data.nodes import CANONICAL_EDGES, NODE_INDEX, NODE_NAMES
 from .data.polygenic import parse_sscore, score_panel
 from .data.real_gwas import load_real_gwas
 from .data.synthetic import SyntheticDataset
@@ -76,7 +78,7 @@ PGS_PANEL_DIRNAME = "pgs_panel"
 GNOMON_OUT_DIRNAME = "gnomon_score"
 GENOTYPE_CACHE_DIR = str(Path.home() / "causal-pred" / "genomes")
 
-PIPELINE_CONFIG_VERSION = "2026-05-08.single-path.2"
+PIPELINE_CONFIG_VERSION = "2026-05-08.single-path.3"
 PIPELINE_SEED = 20260416
 PIPELINE_VERBOSE = False
 
@@ -99,9 +101,19 @@ MCMC_SAMPLES = 1500
 MCMC_BURN_IN = 500
 MCMC_THIN = 10
 MCMC_CHAINS = 4
+MCMC_EDGE_RESAMPLE_PROB = 0.7
+MCMC_PARENT_RESAMPLE_PROB = 0.2
+MCMC_EXACT_PARENT_RESAMPLE = True
 THRESHOLD_DEFAULT = 0.5
 
 VALIDATION_N_PERMUTE = 200
+
+EHR_FETCH_DRUGS = True
+EHR_FETCH_MEASUREMENTS = True
+EHR_CONDITION_CONCEPT_IDS: Optional[Tuple[int, ...]] = None
+EHR_MIN_PREVALENCE = 50
+EHR_MIN_LAB_OBSERVATIONS = 50
+EHR_LOOKBACK_DAYS: Optional[int] = 365 * 5
 
 GENSCORE_N_PROMOTE = 32
 GENSCORE_GENOME_SHARE_MIN = 0.2
@@ -499,6 +511,18 @@ def _pipeline_config() -> dict[str, Any]:
         "prs_nodes": PRS_NODES,
         "prs_max_missing": PRS_MAX_MISSING,
         "prs_min_complete_rows": PRS_MIN_COMPLETE_ROWS,
+        "ehr": {
+            "fetch_drugs": EHR_FETCH_DRUGS,
+            "fetch_measurements": EHR_FETCH_MEASUREMENTS,
+            "condition_concept_ids": (
+                None
+                if EHR_CONDITION_CONCEPT_IDS is None
+                else list(EHR_CONDITION_CONCEPT_IDS)
+            ),
+            "min_prevalence": EHR_MIN_PREVALENCE,
+            "min_lab_observations": EHR_MIN_LAB_OBSERVATIONS,
+            "lookback_days": EHR_LOOKBACK_DAYS,
+        },
         "genscore": {
             "n_promote": GENSCORE_N_PROMOTE,
             "genome_share_min": GENSCORE_GENOME_SHARE_MIN,
@@ -522,6 +546,10 @@ def _pipeline_config() -> dict[str, Any]:
             "burn_in": MCMC_BURN_IN,
             "thin": MCMC_THIN,
             "chains": MCMC_CHAINS,
+            "edge_resample_prob": MCMC_EDGE_RESAMPLE_PROB,
+            "parent_resample_prob": MCMC_PARENT_RESAMPLE_PROB,
+            "exact_parent_resample": MCMC_EXACT_PARENT_RESAMPLE,
+            "max_parents": DAGSLAM_MAX_PARENTS,
         },
         "threshold": THRESHOLD_DEFAULT,
         "gam": {
@@ -619,6 +647,7 @@ def _resolve_microarray_bed() -> Path:
 def _cohort_scores_from_gnomon_scores(
     scores: pd.DataFrame,
     person_ids: pd.Series,
+    logger: Optional[logging.Logger] = None,
 ) -> tuple[pd.DataFrame, int]:
     scores.index = scores.index.astype(str)
     overlap = person_ids.astype(str).isin(scores.index)
@@ -630,7 +659,21 @@ def _cohort_scores_from_gnomon_scores(
             f"required at least {min_required}"
         )
 
-    cohort_scores = scores.reindex(person_ids.astype(str)).dropna(axis=1, how="all")
+    reindexed = scores.reindex(person_ids.astype(str))
+    all_nan_cols = [c for c in reindexed.columns if reindexed[c].isna().all()]
+    cohort_scores = reindexed.dropna(axis=1, how="all")
+    if logger is not None:
+        logger.info(
+            "[prs] gnomon scored cols=%d kept=%d dropped_all_nan=%d",
+            int(scores.shape[1]),
+            int(cohort_scores.shape[1]),
+            len(all_nan_cols),
+        )
+        if all_nan_cols:
+            logger.info(
+                "[prs] dropped (all NaN over cohort): %s",
+                ", ".join(sorted(all_nan_cols)),
+            )
     if cohort_scores.shape[1] < PRS_NODES:
         raise RuntimeError(
             f"gnomon produced {cohort_scores.shape[1]} usable PRS columns; "
@@ -733,7 +776,9 @@ def _build_prs_panel(
             if cache is not None:
                 cache.store(local_sscore, remote_sscore)
 
-    cohort_scores, n_overlap = _cohort_scores_from_gnomon_scores(scores, person_ids)
+    cohort_scores, n_overlap = _cohort_scores_from_gnomon_scores(
+        scores, person_ids, logger
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     part = path.with_name(path.name + ".part")
     if part.exists():
@@ -784,11 +829,138 @@ def _load_or_build_prs_panel(
     return panel, str(path)
 
 
+def _has_survival_outcome(data: SyntheticDataset) -> bool:
+    return bool(np.any(data.time > 0.0) and np.any(data.event == 1))
+
+
+def _survival_outcome_key(person_ids: Sequence[str]) -> str:
+    return _short_hash(
+        {
+            "version": PIPELINE_CONFIG_VERSION,
+            "person_ids": [str(p) for p in person_ids],
+        }
+    )
+
+
+def _load_or_build_survival_outcome(
+    cache: WorkspaceCache,
+    person_ids: Sequence[str],
+    logger: logging.Logger,
+) -> SurvivalOutcome:
+    filename = f"survival-outcome-{_survival_outcome_key(person_ids)}.npz"
+    path = cache.fetch(filename)
+    if path.is_file():
+        with np.load(path, allow_pickle=False) as z:
+            logger.info("[survival] using cache %s", path)
+            return SurvivalOutcome(
+                person_id=z["person_id"].astype(str),
+                time=z["time"].astype(float),
+                event=z["event"].astype(int),
+                keep=z["keep"].astype(bool),
+                baseline_dt=z["baseline_dt"],
+                end_dt=z["end_dt"],
+                t2d_dt=z["t2d_dt"],
+                meta=json.loads(str(z["meta_json"].item())),
+            )
+
+    logger.info("[survival] fetching OMOP follow-up frames for n=%d", len(person_ids))
+    frames = fetch_omop_long_frames(
+        person_ids=person_ids,
+        cache_dir=Path(DEFAULT_CACHE_DIR) / "omop",
+        workspace_bucket=cache.bucket,
+        workspace_prefix=f"{WORKSPACE_CACHE_PREFIX}/omop",
+        progress=lambda message: logger.info("[survival] %s", message),
+    )
+    required = ("visit_baseline", "observation_period", "t2d_event")
+    missing = [name for name in required if name not in frames]
+    if missing:
+        raise RuntimeError(f"OMOP survival frames missing required tables: {missing}")
+    outcome = build_survival_outcome(
+        person_ids,
+        frames["visit_baseline"],
+        frames["observation_period"],
+        frames["t2d_event"],
+    )
+    _atomic_npz(
+        path,
+        person_id=outcome.person_id.astype(str),
+        time=outcome.time,
+        event=outcome.event.astype(int),
+        keep=outcome.keep.astype(bool),
+        baseline_dt=outcome.baseline_dt,
+        end_dt=outcome.end_dt,
+        t2d_dt=outcome.t2d_dt,
+        meta_json=np.array(json.dumps(_json_sanitise(outcome.meta))),
+    )
+    cache.store(path)
+    logger.info(
+        "[survival] built outcome n=%d events=%d dropped=%d",
+        int(outcome.keep.sum()),
+        int(outcome.event[outcome.keep].sum()),
+        int(outcome.keep.size - outcome.keep.sum()),
+    )
+    return outcome
+
+
+def _apply_survival_outcome(
+    data: SyntheticDataset,
+    person_ids: Sequence[str],
+    outcome: SurvivalOutcome,
+) -> tuple[SyntheticDataset, np.ndarray]:
+    pid = np.asarray([str(p) for p in person_ids])
+    if pid.shape[0] != data.n:
+        raise ValueError(
+            f"person_ids has length {pid.shape[0]} but dataset has {data.n} rows"
+        )
+    if outcome.person_id.shape[0] != data.n:
+        raise ValueError(
+            f"survival outcome has {outcome.person_id.shape[0]} rows but dataset has {data.n}"
+        )
+    if not np.array_equal(outcome.person_id.astype(str), pid.astype(str)):
+        raise ValueError("survival outcome person_id order does not match the cohort")
+    keep = outcome.keep.astype(bool)
+    if int(keep.sum()) == 0:
+        raise ValueError("survival outcome removed every cohort row")
+    event = outcome.event.astype(int)
+    if int(event[keep].sum()) == 0:
+        raise ValueError("survival outcome has no incident T2D events after filtering")
+
+    X = data.X[keep].copy()
+    target_idx = _target_index(data.columns, SURVIVAL_TARGET_COLUMN)
+    X[:, target_idx] = event[keep].astype(float)
+    p = X.shape[1]
+    ground_truth_adj = np.zeros((p, p), dtype=int)
+    if data.ground_truth_adj.size:
+        ground_truth_adj = data.ground_truth_adj.copy()
+
+    return (
+        SyntheticDataset(
+            X=X,
+            time=outcome.time[keep].astype(float, copy=False),
+            event=event[keep],
+            columns=data.columns,
+            node_types=data.node_types,
+            ground_truth_adj=ground_truth_adj,
+        ),
+        pid[keep],
+    )
+
+
 def _ehr_panel_key(person_ids: Sequence[str]) -> str:
     return _short_hash(
         {
             "version": PIPELINE_CONFIG_VERSION,
             "person_ids": [str(p) for p in person_ids],
+            "fetch_drugs": EHR_FETCH_DRUGS,
+            "fetch_measurements": EHR_FETCH_MEASUREMENTS,
+            "condition_concept_ids": (
+                None
+                if EHR_CONDITION_CONCEPT_IDS is None
+                else list(EHR_CONDITION_CONCEPT_IDS)
+            ),
+            "min_prevalence": EHR_MIN_PREVALENCE,
+            "min_lab_observations": EHR_MIN_LAB_OBSERVATIONS,
+            "lookback_days": EHR_LOOKBACK_DAYS,
         }
     )
 
@@ -819,6 +991,9 @@ def _load_or_build_ehr_panel(
         cache_dir=Path(DEFAULT_CACHE_DIR) / "omop",
         workspace_bucket=cache.bucket,
         workspace_prefix=f"{WORKSPACE_CACHE_PREFIX}/omop",
+        condition_concept_ids=EHR_CONDITION_CONCEPT_IDS,
+        fetch_drugs=EHR_FETCH_DRUGS,
+        fetch_measurements=EHR_FETCH_MEASUREMENTS,
         progress=lambda message: logger.info("[ehr] %s", message),
     )
     visit_baseline = frames.get("visit_baseline")
@@ -849,14 +1024,21 @@ def _load_or_build_ehr_panel(
         condition_long=frames.get("condition_long"),
         drug_long=frames.get("drug_long"),
         measurement_long=frames.get("measurement_long"),
+        min_prevalence=EHR_MIN_PREVALENCE,
+        min_lab_observations=EHR_MIN_LAB_OBSERVATIONS,
+        lookback_days=EHR_LOOKBACK_DAYS,
     )
     if panel.m == 0:
         raise RuntimeError("EHR panel has zero features; crosscoder cannot run")
+    kind_counts: dict[str, int] = {}
+    for k in panel.feature_kinds:
+        kind_counts[k] = kind_counts.get(k, 0) + 1
     logger.info(
-        "[ehr] built matrix n=%d m=%d elapsed=%s",
+        "[ehr] built matrix n=%d m=%d elapsed=%s kinds=%s",
         panel.n,
         panel.m,
         _format_seconds(time.time() - t_build),
+        ",".join(f"{k}={v}" for k, v in sorted(kind_counts.items())),
     )
     _atomic_npz(
         path,
@@ -903,6 +1085,7 @@ def _augment_with_prs_nodes(
     data: SyntheticDataset,
     person_ids: Sequence[str],
     prs_df: pd.DataFrame,
+    logger: Optional[logging.Logger] = None,
 ) -> tuple[SyntheticDataset, np.ndarray, dict[str, Any]]:
     if PRS_NODES <= 0:
         raise ValueError("PRS_NODES must be positive")
@@ -926,18 +1109,41 @@ def _augment_with_prs_nodes(
     # that is target leakage in a causal-inference setup.
     min_required = min(PRS_MIN_COMPLETE_ROWS, data.n)
     candidates: list[tuple[str, float, np.ndarray]] = []
+    drop_reasons: list[tuple[str, str]] = []
     for col in aligned.columns:
         vals = pd.to_numeric(aligned[col], errors="coerce").to_numpy(dtype=float)
         finite = np.isfinite(vals)
         present_rate = float(finite.mean())
+        n_finite = int(finite.sum())
         if present_rate < 1.0 - PRS_MAX_MISSING:
+            drop_reasons.append((
+                str(col),
+                f"missing={1.0 - present_rate:.3f} > max={PRS_MAX_MISSING:.3f}",
+            ))
             continue
-        if int(finite.sum()) < min_required:
+        if n_finite < min_required:
+            drop_reasons.append((
+                str(col),
+                f"finite_rows={n_finite} < min_required={min_required}",
+            ))
             continue
         sd = float(vals[finite].std(ddof=0))
         if sd == 0.0:
+            drop_reasons.append((str(col), "constant (sd=0)"))
             continue
         candidates.append((str(col), present_rate, vals))
+
+    if logger is not None:
+        logger.info(
+            "[prs] panel cols=%d eligible=%d dropped=%d (max_missing=%.3f min_rows=%d)",
+            int(aligned.shape[1]),
+            len(candidates),
+            len(drop_reasons),
+            float(PRS_MAX_MISSING),
+            int(min_required),
+        )
+        for col, reason in drop_reasons:
+            logger.info("[prs] drop %s: %s", col, reason)
 
     if len(candidates) < PRS_NODES:
         raise ValueError(
@@ -1238,6 +1444,10 @@ def _load_or_run_mcmc(
         n_chains=MCMC_CHAINS,
         rng=np.random.default_rng(PIPELINE_SEED + 3),
         progress=PIPELINE_VERBOSE,
+        edge_resample_prob=MCMC_EDGE_RESAMPLE_PROB,
+        hybrid_prob=MCMC_PARENT_RESAMPLE_PROB,
+        exact_parent_resample=MCMC_EXACT_PARENT_RESAMPLE,
+        max_parents=DAGSLAM_MAX_PARENTS,
     )
     runtime_s = time.time() - t0
     diagnostics = dict(result.diagnostics)
@@ -1579,8 +1789,9 @@ def run_pipeline() -> PipelineResult:
         logger.info("[prs] loading or building cohort PRS panel")
         prs_df, prs_path = _load_or_build_prs_panel(cache, csv_path, person_ids, logger)
         data, kept_person_ids, prs_meta = _augment_with_prs_nodes(
-            data, person_ids, prs_df
+            data, person_ids, prs_df, logger
         )
+        person_id_rows_after_prs = int(kept_person_ids.size)
         timings["prs"] = time.time() - t0
         logger.info(
             "[prs] selected=%d n=%d p=%d dropped_rows=%d elapsed=%s nodes=%s",
@@ -1592,44 +1803,67 @@ def run_pipeline() -> PipelineResult:
             prs_meta["prs_node_names"],
         )
 
-    genscore_meta: dict[str, Any] = {
-        "ehr_stream": "not_run",
-        "reason": "WORKSPACE_CDR is not set",
+    survival_outcome_meta: dict[str, Any] = {
+        "source": "cohort_csv",
+        "n_input": int(data.n),
+        "n_kept": int(data.n),
+        "n_events": int(data.event.sum()),
     }
-    if os.environ.get("WORKSPACE_CDR"):
-        with _phase(logger, "ehr"):
+    if not _has_survival_outcome(data):
+        with _phase(logger, "survival-outcome"):
             t0 = time.time()
-            ehr_panel = _load_or_build_ehr_panel(cache, kept_person_ids, logger)
-            timings["ehr"] = time.time() - t0
-            logger.info("[ehr] complete elapsed=%s", _format_seconds(timings["ehr"]))
-
-        with _phase(logger, "genscore"):
-            t0 = time.time()
-            data, kept_person_ids, genscore_meta = _load_or_run_genscore_features(
-                cache,
+            outcome = _load_or_build_survival_outcome(cache, kept_person_ids, logger)
+            data, kept_person_ids = _apply_survival_outcome(
                 data,
                 kept_person_ids,
-                prs_df,
-                ehr_panel,
-                logger,
+                outcome,
             )
-            timings["genscore"] = time.time() - t0
+            survival_outcome_meta = outcome.meta
+            timings["survival_outcome"] = time.time() - t0
             logger.info(
-                "[genscore] complete n=%d p=%d elapsed=%s",
+                "[survival] outcome ready n=%d events=%d elapsed=%s",
                 data.n,
-                data.p,
-                _format_seconds(timings["genscore"]),
+                int(data.event.sum()),
+                _format_seconds(timings["survival_outcome"]),
             )
     else:
-        timings["ehr"] = 0.0
-        timings["genscore"] = 0.0
-        logger.info("[ehr] skipped because WORKSPACE_CDR is not set")
+        timings["survival_outcome"] = 0.0
+        logger.info(
+            "[survival] using cohort CSV time/event columns n=%d events=%d",
+            data.n,
+            int(data.event.sum()),
+        )
+
+    with _phase(logger, "ehr"):
+        t0 = time.time()
+        ehr_panel = _load_or_build_ehr_panel(cache, kept_person_ids, logger)
+        timings["ehr"] = time.time() - t0
+        logger.info("[ehr] complete elapsed=%s", _format_seconds(timings["ehr"]))
+
+    with _phase(logger, "genscore"):
+        t0 = time.time()
+        data, kept_person_ids, genscore_meta = _load_or_run_genscore_features(
+            cache,
+            data,
+            kept_person_ids,
+            prs_df,
+            ehr_panel,
+            logger,
+        )
+        timings["genscore"] = time.time() - t0
+        logger.info(
+            "[genscore] complete n=%d p=%d elapsed=%s",
+            data.n,
+            data.p,
+            _format_seconds(timings["genscore"]),
+        )
 
     with _phase(logger, "mrdag"):
         t0 = time.time()
         mrdag_pi, mrdag_diagnostics = _load_or_run_mrdag(cache, logger)
         mrdag_prior = _mrdag_prior_for_data(mrdag_pi, data.columns)
         timings["mrdag"] = time.time() - t0
+        _log_mrdag_diagnostics(logger, mrdag_pi, mrdag_diagnostics)
         logger.info("[mrdag] complete elapsed=%s", _format_seconds(timings["mrdag"]))
 
     with _phase(logger, "dagslam"):
@@ -1641,6 +1875,7 @@ def run_pipeline() -> PipelineResult:
             float(dagslam["log_score"]),
             int(dagslam["n_edges"]),
         )
+        _log_dagslam_top_edges(logger, dagslam["adjacency"], data.columns)
 
     with _phase(logger, "mcmc"):
         edge_probs, mcmc_samples, mcmc_diagnostics, mcmc_runtime = _load_or_run_mcmc(
@@ -1658,40 +1893,41 @@ def run_pipeline() -> PipelineResult:
             float(mcmc_diagnostics.get("max_rhat_skeleton", float("nan"))),
             float(mcmc_diagnostics.get("min_ess", float("nan"))),
         )
+        _log_mcmc_diagnostics(
+            logger,
+            edge_probs,
+            mcmc_diagnostics,
+            data.columns,
+            float(THRESHOLD_DEFAULT),
+        )
 
     thresholded = (edge_probs >= THRESHOLD_DEFAULT).astype(int)
     np.fill_diagonal(thresholded, 0)
 
-    if np.any(data.time > 0.0) and np.any(data.event == 1):
-        with _phase(logger, "gam"):
-            (
-                survival_time_grid,
-                survival_mean,
-                survival_lower,
-                survival_upper,
-                survival_parent_columns,
-                survival_diagnostics,
-                survival_runtime,
-            ) = _load_or_run_survival_gam(cache, key, data, mcmc_samples, logger)
-            timings["gam"] = survival_runtime
-    else:
-        logger.info("[gam] skipped because cohort CSV has no survival time/event columns")
-        survival_time_grid = np.zeros(0, dtype=float)
-        survival_mean = np.zeros((data.n, 0), dtype=float)
-        survival_lower = np.zeros((data.n, 0), dtype=float)
-        survival_upper = np.zeros((data.n, 0), dtype=float)
-        survival_parent_columns = tuple()
-        survival_diagnostics = {
-            "status": "not_run",
-            "reason": "cohort CSV has no positive survival time/event columns",
-        }
-        timings["gam"] = 0.0
+    with _phase(logger, "gam"):
+        (
+            survival_time_grid,
+            survival_mean,
+            survival_lower,
+            survival_upper,
+            survival_parent_columns,
+            survival_diagnostics,
+            survival_runtime,
+        ) = _load_or_run_survival_gam(cache, key, data, mcmc_samples, logger)
+        timings["gam"] = survival_runtime
+        logger.info(
+            "[gam] parent_columns=%s n_parent_sets=%d",
+            list(survival_parent_columns),
+            int(survival_diagnostics.get("n_parent_sets", 0)),
+        )
+        _log_survival_metrics(logger, survival_diagnostics)
 
     causal_pathways = _causal_pathway_probabilities(
         edge_probs,
         mcmc_samples,
         data.columns,
     )
+    _log_causal_pathways(logger, causal_pathways)
 
     validation = _validate_edges(
         edge_probs,
@@ -1699,6 +1935,63 @@ def run_pipeline() -> PipelineResult:
         rng=np.random.default_rng(PIPELINE_SEED + 4),
     )
     validation["survival"] = survival_diagnostics.get("metrics", {})
+    _log_validation_metrics(logger, validation)
+
+    logger.info("[summary] === pipeline metrics ===")
+    logger.info(
+        "[summary] cohort: n=%d p=%d events=%d event_rate=%.4f",
+        data.n,
+        data.p,
+        int(data.event.sum()),
+        float(np.mean(data.event)),
+    )
+    logger.info(
+        "[summary] timings: %s",
+        ", ".join(
+            f"{k}={_format_seconds(float(v))}" for k, v in timings.items()
+        ),
+    )
+    logger.info(
+        "[summary] mrdag: max_rhat=%.3f candidate_edges=%d",
+        float(mrdag_diagnostics.get("max_rhat_on_allowed", float("nan"))),
+        int(mrdag_diagnostics.get("n_candidate_edges", 0)),
+    )
+    logger.info(
+        "[summary] dagslam: log_score=%.3f n_edges=%d",
+        float(dagslam["log_score"]),
+        int(dagslam["n_edges"]),
+    )
+    n_off = data.p * (data.p - 1)
+    logger.info(
+        "[summary] mcmc: accept=%.3f max_rhat_skel=%.3f min_ess=%.1f "
+        "edges_above_%.2f=%d/%d",
+        float(mcmc_diagnostics["accept_rate"]["overall"]),
+        float(mcmc_diagnostics.get("max_rhat_skeleton", float("nan"))),
+        float(mcmc_diagnostics.get("min_ess", float("nan"))),
+        float(THRESHOLD_DEFAULT),
+        int(np.sum(thresholded)),
+        int(n_off),
+    )
+    if "auroc" in validation:
+        logger.info(
+            "[summary] validation: AUROC=%.3f AUPRC=%.3f",
+            float(validation["auroc"]),
+            float(validation["auprc"]),
+        )
+    surv_metrics = survival_diagnostics.get("metrics") or {}
+    if surv_metrics:
+        td = surv_metrics.get("time_dependent_auc") or {}
+        br = surv_metrics.get("brier") or {}
+        cal = surv_metrics.get("calibration_at_10y") or {}
+        logger.info(
+            "[summary] survival: integrated_AUC=%.3f integrated_Brier=%.4f "
+            "ECE_10y=%.4f Nagelkerke_R2_10y=%.3f",
+            float(td.get("integrated_auc", float("nan"))),
+            float(br.get("integrated_brier", float("nan"))),
+            float(cal.get("ece", float("nan"))),
+            float(surv_metrics.get("nagelkerke_r2_at_10y", float("nan"))),
+        )
+
     logger.info(
         "[pipeline] complete elapsed=%s n=%d p=%d",
         _format_seconds(time.time() - pipeline_started_at),
@@ -1719,8 +2012,10 @@ def run_pipeline() -> PipelineResult:
             "cohort_sha256": _file_sha256(Path(csv_path)),
             "prs_path": prs_path,
             "prs_sha256": _file_sha256(Path(prs_path)),
-            "person_id_rows_after_prs": int(kept_person_ids.size),
+            "person_id_rows_after_prs": person_id_rows_after_prs,
             "person_id_rows_final": int(kept_person_ids.size),
+            "event_rate": float(np.mean(data.event)),
+            "survival_outcome": survival_outcome_meta,
         },
         mrdag_pi=mrdag_pi,
         mrdag_prior=mrdag_prior,
@@ -1745,6 +2040,226 @@ def run_pipeline() -> PipelineResult:
         genscore_features={"prs_path": prs_path, **prs_meta, **genscore_meta},
         cache_key=key,
     )
+
+
+def _format_top_edges(
+    matrix: np.ndarray,
+    columns: Sequence[str],
+    top_k: int = 10,
+    min_value: float = 0.0,
+) -> str:
+    """Return a one-line ``"parent->child=0.93, ..."`` summary of the top edges."""
+    rows: list[tuple[str, str, float]] = []
+    for i, parent in enumerate(columns):
+        for j, child in enumerate(columns):
+            if i == j:
+                continue
+            v = float(matrix[i, j])
+            if not np.isfinite(v) or v <= min_value:
+                continue
+            rows.append((parent, child, v))
+    rows.sort(key=lambda r: -r[2])
+    if not rows:
+        return "(none)"
+    return ", ".join(f"{p}->{c}={v:.3f}" for p, c, v in rows[:top_k])
+
+
+def _log_mrdag_diagnostics(
+    logger: logging.Logger,
+    pi: np.ndarray,
+    diagnostics: dict[str, Any],
+) -> None:
+    accept_rates = diagnostics.get("accept_rates") or []
+    accept_str = "[" + ", ".join(f"{float(a):.3f}" for a in accept_rates) + "]"
+    logger.info(
+        "[mrdag] candidate_edges=%d chains=%d samples_per_chain=%s "
+        "max_rhat=%.3f between_chain_max_abs_diff=%.3f accept_per_chain=%s",
+        int(diagnostics.get("n_candidate_edges", 0)),
+        int(diagnostics.get("n_chains", len(accept_rates)))
+        if "n_chains" in diagnostics
+        else len(accept_rates),
+        list(diagnostics.get("n_samples_per_chain", [])),
+        float(diagnostics.get("max_rhat_on_allowed", float("nan"))),
+        float(diagnostics.get("between_chain_max_abs_diff", float("nan"))),
+        accept_str,
+    )
+    logger.info(
+        "[mrdag] mr_traits=%s prior_incl=%.3f prior_effect_var=%.4f "
+        "min_effect_scale=%.3f",
+        list(diagnostics.get("mr_traits", [])),
+        float(diagnostics.get("prior_incl", float("nan"))),
+        float(diagnostics.get("prior_effect_var", float("nan"))),
+        float(diagnostics.get("min_effect_scale", float("nan"))),
+    )
+    logger.info("[mrdag] top_pi: %s", _format_top_edges(pi, NODE_NAMES, top_k=10))
+
+
+def _log_dagslam_top_edges(
+    logger: logging.Logger,
+    adjacency: np.ndarray,
+    columns: Sequence[str],
+) -> None:
+    edges = _adj_to_edge_list(np.asarray(adjacency, dtype=int), columns)
+    if not edges:
+        logger.info("[dagslam] top_edges: (none)")
+        return
+    preview = ", ".join(f"{p}->{c}" for p, c in edges[:15])
+    suffix = "" if len(edges) <= 15 else f" (+{len(edges) - 15} more)"
+    logger.info("[dagslam] top_edges: %s%s", preview, suffix)
+
+
+def _log_mcmc_diagnostics(
+    logger: logging.Logger,
+    edge_probs: np.ndarray,
+    diagnostics: dict[str, Any],
+    columns: Sequence[str],
+    threshold: float,
+) -> None:
+    accept_rate = diagnostics.get("accept_rate", {}) or {}
+    by_type = ", ".join(
+        f"{k}={float(v):.3f}" for k, v in accept_rate.items() if k != "overall"
+    )
+    logger.info(
+        "[mcmc] accept_per_move: %s",
+        by_type or "(no proposals)",
+    )
+    logger.info(
+        "[mcmc] max_rhat_directed=%.3f max_rhat_skeleton=%.3f min_ess=%.1f "
+        "n_samples_per_chain=%s mean_logpost_per_chain=%s",
+        float(diagnostics.get("max_rhat_directed", float("nan"))),
+        float(diagnostics.get("max_rhat_skeleton", float("nan"))),
+        float(diagnostics.get("min_ess", float("nan"))),
+        list(diagnostics.get("n_samples_per_chain", [])),
+        [
+            f"{float(x):.3f}"
+            for x in diagnostics.get("mean_log_posterior_per_chain", [])
+        ],
+    )
+    n = edge_probs.shape[0]
+    off = ~np.eye(n, dtype=bool)
+    flat = edge_probs[off]
+    n_above = int(np.sum(flat >= threshold))
+    n_certain = int(np.sum(flat >= 0.95))
+    n_zero = int(np.sum(flat <= 0.05))
+    logger.info(
+        "[mcmc] edges_above_%.2f=%d / %d  (>=0.95: %d, <=0.05: %d)",
+        float(threshold),
+        n_above,
+        int(off.sum()),
+        n_certain,
+        n_zero,
+    )
+    logger.info(
+        "[mcmc] top_edges: %s",
+        _format_top_edges(edge_probs, columns, top_k=15),
+    )
+
+
+def _log_validation_metrics(
+    logger: logging.Logger, validation: dict[str, Any]
+) -> None:
+    if not validation or "auroc" not in validation:
+        logger.info("[validation] no known-edge ground truth available")
+        return
+    logger.info(
+        "[validation] AUROC=%.3f (null %.3f)  AUPRC=%.3f (null %.3f)  "
+        "ground_truth_edges=%d/%d",
+        float(validation.get("auroc", float("nan"))),
+        float(validation.get("auroc_null_mean", float("nan"))),
+        float(validation.get("auprc", float("nan"))),
+        float(validation.get("auprc_null_mean", float("nan"))),
+        int(validation.get("n_valid_ground_truth_edges", 0)),
+        int(validation.get("n_ground_truth_edges", 0)),
+    )
+    thresholds = list(validation.get("thresholds") or [])
+    recovery = list(validation.get("observed_recovery") or [])
+    rec_p = list(validation.get("recovery_pvalue") or [])
+    mcc = list(validation.get("mcc") or [])
+    mcc_p = list(validation.get("mcc_pvalue") or [])
+    for idx, thr in enumerate(thresholds):
+        rec = recovery[idx] if idx < len(recovery) else float("nan")
+        rp = rec_p[idx] if idx < len(rec_p) else float("nan")
+        mc = mcc[idx] if idx < len(mcc) else float("nan")
+        mp = mcc_p[idx] if idx < len(mcc_p) else float("nan")
+        logger.info(
+            "[validation] thr=%.2f recovery=%.3f (p=%.3f)  MCC=%.3f (p=%.3f)",
+            float(thr),
+            float(rec),
+            float(rp),
+            float(mc),
+            float(mp),
+        )
+    per_edge = validation.get("per_edge") or {}
+    if per_edge:
+        rows = sorted(
+            per_edge.items(),
+            key=lambda kv: -float(kv[1].get("probability", 0.0))
+            if not kv[1].get("masked", False)
+            else 1.0,
+        )
+        preview = ", ".join(
+            f"{p}->{c}={float(d['probability']):.2f}"
+            + ("" if not d.get("masked", False) else "(masked)")
+            for (p, c), d in rows
+        )
+        logger.info("[validation] known_edges: %s", preview)
+
+
+def _log_survival_metrics(
+    logger: logging.Logger, diagnostics: dict[str, Any]
+) -> None:
+    metrics = diagnostics.get("metrics") or {}
+    if not metrics:
+        logger.info("[gam] no survival metrics computed")
+        return
+    td = metrics.get("time_dependent_auc") or {}
+    times = list(td.get("times") or [])
+    aucs = list(td.get("auc") or [])
+    pairs = ", ".join(
+        f"t={float(t):.1f}:AUC={float(a):.3f}" for t, a in zip(times, aucs)
+    )
+    logger.info(
+        "[gam] integrated_AUC=%.3f  per-time: %s",
+        float(td.get("integrated_auc", float("nan"))),
+        pairs or "(none)",
+    )
+    br = metrics.get("brier") or {}
+    logger.info(
+        "[gam] integrated_Brier=%.4f  Brier_at_eval=%s",
+        float(br.get("integrated_brier", float("nan"))),
+        [f"{float(x):.4f}" for x in (br.get("brier") or [])],
+    )
+    cal = metrics.get("calibration_at_10y") or {}
+    decomp = cal.get("brier_decomposition") or {}
+    logger.info(
+        "[gam] calib_at_10y: Brier=%.4f reliability=%.4f resolution=%.4f "
+        "uncertainty=%.4f ECE=%.4f MCE=%.4f HL_p=%.3f Nagelkerke_R2=%.3f",
+        float(cal.get("brier", float("nan"))),
+        float(decomp.get("reliability", float("nan"))),
+        float(decomp.get("resolution", float("nan"))),
+        float(decomp.get("uncertainty", float("nan"))),
+        float(cal.get("ece", float("nan"))),
+        float(cal.get("mce", float("nan"))),
+        float(cal.get("hl_pvalue", float("nan"))),
+        float(metrics.get("nagelkerke_r2_at_10y", float("nan"))),
+    )
+
+
+def _log_causal_pathways(
+    logger: logging.Logger, pathways: Sequence[dict[str, Any]]
+) -> None:
+    if not pathways:
+        logger.info("[pathways] (none above threshold)")
+        return
+    for rank, row in enumerate(pathways[:10], start=1):
+        path_txt = " -> ".join(row["path"])
+        logger.info(
+            "[pathways] %2d. %s  posterior=%.3f  marginal=%.3f",
+            rank,
+            path_txt,
+            float(row["posterior_probability"]),
+            float(row["marginal_edge_product"]),
+        )
 
 
 def _adj_to_edge_list(

@@ -113,6 +113,21 @@ SURVIVAL_EVENT_COLUMNS: Tuple[str, ...] = (
     "type2_diabetes_event",
 )
 
+T2D_CONDITION_CONCEPT_IDS: Tuple[int, ...] = (
+    201826,
+    201820,
+    443767,
+    443729,
+    442793,
+    443592,
+    435216,
+    376112,
+)
+
+
+def _coerce_datetime(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce", utc=True).dt.tz_convert(None)
+
 # Canonical units after :func:`clean_measurements`:
 #   bmi              kg/m^2
 #   hba1c            percent (NGSP)
@@ -606,11 +621,10 @@ def load_cohort_dataset(
 ):
     """Load a cohort CSV and return a :class:`SyntheticDataset`.
 
-    The cohort table has no time-to-event outcome (T2D appears as a
-    binary endpoint), so ``time`` and ``event`` are filled with zeros
-    and ``ground_truth_adj`` is the empty matrix. The structure-search
-    stages (DAGSLAM, MCMC) treat the binary T2D node as binary; the GAM
-    stage skips itself when no ``"survival"`` node is present.
+    Static cohort tables can omit time-to-event columns; in that case
+    ``time`` and ``event`` are filled with zeros here and the production
+    pipeline must attach an OMOP-derived survival outcome before GAM. The
+    structure-search stages (DAGSLAM, MCMC) treat the T2D node as binary.
     """
     from .synthetic import SyntheticDataset
 
@@ -649,6 +663,122 @@ def load_cohort_dataset(
         columns=columns,
         node_types=node_types,
         ground_truth_adj=np.zeros((p, p), dtype=int),
+    )
+
+
+@dataclass
+class SurvivalOutcome:
+    """Incident T2D survival outcome aligned to a person-id order."""
+
+    person_id: np.ndarray
+    time: np.ndarray
+    event: np.ndarray
+    keep: np.ndarray
+    baseline_dt: np.ndarray
+    end_dt: np.ndarray
+    t2d_dt: np.ndarray
+    meta: dict
+
+
+def _require_columns(df: pd.DataFrame, name: str, columns: Sequence[str]) -> None:
+    missing = [c for c in columns if c not in df.columns]
+    if missing:
+        raise ValueError(f"{name} is missing required columns: {missing}")
+
+
+def build_survival_outcome(
+    person_ids: Sequence[str],
+    visit_baseline: pd.DataFrame,
+    observation_period: pd.DataFrame,
+    t2d_event: pd.DataFrame,
+    *,
+    min_followup_days: int = 1,
+) -> SurvivalOutcome:
+    """Build incident T2D time/event arrays from OMOP follow-up frames.
+
+    ``time`` starts at each participant's earliest observed visit and ends at
+    first post-baseline T2D diagnosis or observation-period end. Participants
+    with T2D on or before baseline are prevalent cases and are excluded from the
+    incident survival cohort.
+    """
+    if min_followup_days <= 0:
+        raise ValueError("min_followup_days must be positive")
+    _require_columns(visit_baseline, "visit_baseline", ("person_id", "baseline_dt"))
+    _require_columns(
+        observation_period,
+        "observation_period",
+        ("person_id", "observation_end_dt"),
+    )
+    _require_columns(t2d_event, "t2d_event", ("person_id", "t2d_dt"))
+
+    order = pd.Index([str(pid) for pid in person_ids], name="person_id")
+    if order.empty:
+        raise ValueError("person_ids must be non-empty")
+
+    baseline_df = visit_baseline.copy()
+    baseline_df["person_id"] = baseline_df["person_id"].astype(str)
+    baseline_df["baseline_dt"] = _coerce_datetime(baseline_df["baseline_dt"])
+    baseline = baseline_df.groupby("person_id")["baseline_dt"].min().reindex(order)
+
+    obs_df = observation_period.copy()
+    obs_df["person_id"] = obs_df["person_id"].astype(str)
+    obs_df["observation_end_dt"] = _coerce_datetime(obs_df["observation_end_dt"])
+    obs_end = obs_df.groupby("person_id")["observation_end_dt"].max().reindex(order)
+
+    t2d_df = t2d_event.copy()
+    t2d_df["person_id"] = t2d_df["person_id"].astype(str)
+    t2d_df["t2d_dt"] = _coerce_datetime(t2d_df["t2d_dt"])
+    first_t2d = t2d_df.dropna(subset=["t2d_dt"]).groupby("person_id")["t2d_dt"].min()
+    t2d_dt = first_t2d.reindex(order)
+
+    has_dates = baseline.notna() & obs_end.notna()
+    prevalent = has_dates & t2d_dt.notna() & (t2d_dt <= baseline)
+    incident = has_dates & t2d_dt.notna() & (t2d_dt > baseline) & (t2d_dt <= obs_end)
+    end_dt = obs_end.where(~incident, t2d_dt)
+    followup_days = (end_dt - baseline).dt.total_seconds().to_numpy(dtype=float) / 86400.0
+    keep = (
+        has_dates.to_numpy(dtype=bool)
+        & ~prevalent.to_numpy(dtype=bool)
+        & np.isfinite(followup_days)
+        & (followup_days >= float(min_followup_days))
+    )
+    event = incident.to_numpy(dtype=int)
+    time_years = followup_days / 365.25
+    time_years = np.where(keep, time_years, 0.0)
+    event = np.where(keep, event, 0).astype(int)
+
+    meta = {
+        "source": "omop",
+        "n_input": int(len(order)),
+        "n_kept": int(keep.sum()),
+        "n_events": int(event[keep].sum()),
+        "n_missing_baseline": int(baseline.isna().sum()),
+        "n_missing_observation_end": int(obs_end.isna().sum()),
+        "n_prevalent_t2d": int(prevalent.sum()),
+        "n_nonpositive_followup": int(
+            (has_dates.to_numpy(dtype=bool) & ~np.isfinite(followup_days)).sum()
+            + (
+                has_dates.to_numpy(dtype=bool)
+                & np.isfinite(followup_days)
+                & (followup_days < float(min_followup_days))
+            ).sum()
+        ),
+        "min_followup_days": int(min_followup_days),
+    }
+    if meta["n_kept"] == 0:
+        raise ValueError("OMOP survival outcome has no rows with usable follow-up")
+    if meta["n_events"] == 0:
+        raise ValueError("OMOP survival outcome has no incident T2D events after baseline")
+
+    return SurvivalOutcome(
+        person_id=order.to_numpy(dtype=str),
+        time=time_years.astype(float, copy=False),
+        event=event,
+        keep=keep,
+        baseline_dt=baseline.astype("datetime64[ns]").to_numpy(),
+        end_dt=end_dt.astype("datetime64[ns]").to_numpy(),
+        t2d_dt=t2d_dt.astype("datetime64[ns]").to_numpy(),
+        meta=meta,
     )
 
 
@@ -796,13 +926,7 @@ AOU_GENOTYPE_FILES: Tuple[str, ...] = ("arrays.bed", "arrays.bim", "arrays.fam")
 
 CURATED_OMOP_CONDITION_IDS: Tuple[int, ...] = (
     # Type 2 diabetes and close metabolic comorbidities.
-    201820,
-    443767,
-    443729,
-    442793,
-    443592,
-    435216,
-    376112,
+    *T2D_CONDITION_CONCEPT_IDS,
     # Hypertension / cardiovascular disease.
     320128,
     316866,
@@ -822,7 +946,6 @@ CURATED_OMOP_CONDITION_IDS: Tuple[int, ...] = (
     46271022,
     4030518,
     197320,
-    201826,
 )
 
 
@@ -1099,6 +1222,44 @@ def fetch_omop_long_frames(
         """,
         [person_param],
         {"table": "visit_occurrence", "aggregation": "baseline"},
+    )
+
+    frames["observation_period"] = _query(
+        "observation_period",
+        f"""
+        SELECT
+          CAST(person_id AS STRING) AS person_id,
+          TIMESTAMP(MIN(observation_period_start_date)) AS observation_start_dt,
+          TIMESTAMP(MAX(observation_period_end_date)) AS observation_end_dt
+        FROM `{cdr}.observation_period`
+        WHERE person_id IN UNNEST(@person_ids)
+        GROUP BY person_id
+        """,
+        [person_param],
+        {"table": "observation_period", "aggregation": "person_followup_bounds"},
+    )
+
+    t2d_params: list = [
+        person_param,
+        _array_param("t2d_condition_concept_ids", T2D_CONDITION_CONCEPT_IDS),
+    ]
+    frames["t2d_event"] = _query(
+        "t2d_event",
+        f"""
+        SELECT
+          CAST(person_id AS STRING) AS person_id,
+          MIN(COALESCE(CAST(condition_start_datetime AS TIMESTAMP), TIMESTAMP(condition_start_date))) AS t2d_dt
+        FROM `{cdr}.condition_occurrence`
+        WHERE person_id IN UNNEST(@person_ids)
+          AND condition_concept_id IN UNNEST(@t2d_condition_concept_ids)
+        GROUP BY person_id
+        """,
+        t2d_params,
+        {
+            "table": "condition_occurrence",
+            "condition_ids": T2D_CONDITION_CONCEPT_IDS,
+            "aggregation": "first_t2d_datetime_by_person",
+        },
     )
 
     condition_ids = (
@@ -1558,6 +1719,7 @@ __all__ = [
     "COHORT_NODE_TYPES",
     "PLAUSIBILITY_BOUNDS",
     "CACHE_FILENAMES",
+    "T2D_CONDITION_CONCEPT_IDS",
     "label_measurement_node",
     "attach_node_labels",
     "clean_measurements",
@@ -1568,6 +1730,7 @@ __all__ = [
     "load_cohort_csv",
     "load_cohort_dataset",
     "load_cohort_dataset_with_person_ids",
+    "build_survival_outcome",
     "resolve_cohort_csv",
     "write_cohort_cache",
     "discover_genotype_dir",
@@ -1579,5 +1742,6 @@ __all__ = [
     "resolve_baseline_dt",
     "build_ehr_panel",
     "CohortBuildResult",
+    "SurvivalOutcome",
     "EhrPanel",
 ]

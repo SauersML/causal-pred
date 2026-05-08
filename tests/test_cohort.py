@@ -17,6 +17,7 @@ from causal_pred.data.cohort import (
     PLAUSIBILITY_BOUNDS,
     attach_node_labels,
     build_cohort_dataset,
+    build_survival_outcome,
     clean_measurements,
     collapse_to_wide_median,
     label_measurement_node,
@@ -358,6 +359,50 @@ def test_write_cohort_cache_round_trip(tmp_path):
     assert found == cc
 
 
+def test_build_survival_outcome_uses_incident_t2d_and_censoring():
+    person_ids = ["101", "102", "103", "104"]
+    visit_baseline = pd.DataFrame(
+        {
+            "person_id": person_ids,
+            "baseline_dt": pd.to_datetime(
+                ["2020-01-01", "2020-01-01", "2020-01-01", "2020-01-01"]
+            ),
+        }
+    )
+    observation_period = pd.DataFrame(
+        {
+            "person_id": person_ids,
+            "observation_start_dt": pd.to_datetime(
+                ["2019-01-01", "2019-01-01", "2019-01-01", "2019-01-01"]
+            ),
+            "observation_end_dt": pd.to_datetime(
+                ["2024-01-01", "2023-01-01", "2022-01-01", "2025-01-01"]
+            ),
+        }
+    )
+    t2d_event = pd.DataFrame(
+        {
+            "person_id": ["101", "103", "104"],
+            "t2d_dt": pd.to_datetime(["2021-01-01", "2019-06-01", "2026-01-01"]),
+        }
+    )
+
+    outcome = build_survival_outcome(
+        person_ids,
+        visit_baseline,
+        observation_period,
+        t2d_event,
+    )
+
+    assert outcome.keep.tolist() == [True, True, False, True]
+    assert outcome.event.tolist() == [1, 0, 0, 0]
+    assert outcome.time[0] == pytest.approx(366 / 365.25)
+    assert outcome.time[1] == pytest.approx(1096 / 365.25)
+    assert outcome.time[3] == pytest.approx(1827 / 365.25)
+    assert outcome.meta["n_prevalent_t2d"] == 1
+    assert outcome.meta["n_events"] == 1
+
+
 def test_fetch_omop_long_frames_restores_workspace_parquets(tmp_path, monkeypatch):
     from causal_pred.data import cohort as cohort_mod
 
@@ -401,6 +446,31 @@ def test_fetch_omop_long_frames_restores_workspace_parquets(tmp_path, monkeypatc
         ),
     )
     write_remote(
+        "observation_period",
+        {"table": "observation_period", "aggregation": "person_followup_bounds"},
+        pd.DataFrame(
+            {
+                "person_id": person_ids,
+                "observation_start_dt": pd.to_datetime(["2023-01-01", "2023-01-01"]),
+                "observation_end_dt": pd.to_datetime(["2026-01-01", "2026-02-01"]),
+            }
+        ),
+    )
+    write_remote(
+        "t2d_event",
+        {
+            "table": "condition_occurrence",
+            "condition_ids": cohort_mod.T2D_CONDITION_CONCEPT_IDS,
+            "aggregation": "first_t2d_datetime_by_person",
+        },
+        pd.DataFrame(
+            {
+                "person_id": ["101"],
+                "t2d_dt": pd.to_datetime(["2025-01-01"]),
+            }
+        ),
+    )
+    write_remote(
         "condition_long",
         {
             "table": "condition_occurrence",
@@ -438,8 +508,15 @@ def test_fetch_omop_long_frames_restores_workspace_parquets(tmp_path, monkeypatc
         condition_concept_ids=[],
     )
 
-    assert set(frames) == {"visit_baseline", "condition_long"}
+    assert set(frames) == {
+        "visit_baseline",
+        "observation_period",
+        "t2d_event",
+        "condition_long",
+    }
     assert frames["visit_baseline"]["person_id"].tolist() == person_ids
+    assert frames["observation_period"]["observation_end_dt"].dt.year.tolist() == [2026, 2026]
+    assert frames["t2d_event"]["person_id"].tolist() == ["101"]
     assert frames["condition_long"]["phecode"].tolist() == ["1", "2"]
     assert all("/intermediates/causal-pred/omop/" in uri for uri in restored_uris)
 
@@ -471,7 +548,26 @@ def test_fetch_omop_long_frames_aggregates_conditions_before_download(
                         }
                     )
                 )
+            if "observation_period" in sql:
+                return FakeJob(
+                    pd.DataFrame(
+                        {
+                            "person_id": ["101"],
+                            "observation_start_dt": pd.to_datetime(["2023-01-01"]),
+                            "observation_end_dt": pd.to_datetime(["2025-01-01"]),
+                        }
+                    )
+                )
             if "condition_occurrence" in sql:
+                if "t2d_dt" in sql:
+                    return FakeJob(
+                        pd.DataFrame(
+                            {
+                                "person_id": ["101"],
+                                "t2d_dt": pd.to_datetime(["2024-06-01"]),
+                            }
+                        )
+                    )
                 return FakeJob(
                     pd.DataFrame(
                         {
@@ -504,7 +600,10 @@ def test_fetch_omop_long_frames_aggregates_conditions_before_download(
         condition_concept_ids=[201820],
     )
 
-    condition_sql = next(q for q in queries if "condition_occurrence" in q)
+    condition_sql = next(
+        q for q in queries
+        if "condition_occurrence" in q and "CAST(condition_concept_id AS STRING)" in q
+    )
     assert "MIN(COALESCE" in condition_sql
     assert "GROUP BY person_id, condition_concept_id" in condition_sql
     assert frames["condition_long"]["phecode"].tolist() == ["201820"]

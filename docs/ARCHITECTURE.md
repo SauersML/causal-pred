@@ -73,8 +73,11 @@ normalises units (mmol/L -> mg/dL, mmol/mol -> NGSP %), drops
 physiologically impossible values, removes extreme outliers per-node
 via a conservative IQR rule, collapses repeated measures by median,
 and merges with a binary T2D node from the condition frame to produce
-a participant-level wide CSV with core clinical, demographic, lifestyle,
-and follow-up time/event columns. The production cache is
+a participant-level wide CSV with core clinical, demographic, and lifestyle
+columns. If that CSV lacks follow-up time/event columns, the pipeline builds a
+required cached survival outcome from OMOP visit baseline, observation-period
+end, and first post-baseline T2D diagnosis before DAGSLAM/MCMC/GAM. The
+production cache is
 `data/t2d_initial_nodes_complete.csv`;
 `resolve_cohort_csv` checks that local file first, then copies the same
 canonical filename from `$WORKSPACE_BUCKET/data/` via `gsutil cp`.
