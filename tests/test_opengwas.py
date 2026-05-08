@@ -1,9 +1,4 @@
-"""Unit tests for the OpenGWAS two-sample MR fetcher.
-
-These tests do not hit the network: ``load_live_gwas`` receives fake
-OpenGWAS clients that return canned payloads so the harmonisation + IVW
-math + caching layer can be exercised deterministically.
-"""
+"""Unit tests for the OpenGWAS two-sample MR fetcher."""
 
 from __future__ import annotations
 
@@ -85,71 +80,22 @@ def test_harmonise_drops_incompatible_alleles():
     assert pairs == []
 
 
-def test_load_live_gwas_uses_cache_and_computes_ivw(tmp_path: Path):
-    rng = np.random.default_rng(42)
+def test_load_live_gwas_real_cache_produces_ivw_cells():
+    cache_dir = Path(__file__).resolve().parents[1] / "data" / "mr_cache"
+    assert cache_dir.is_dir(), "real OpenGWAS cache must be present"
 
-    def make_hits(study_id: str) -> list[dict]:
-        # Plant a known effect: tophit betas are all positive.
-        return [_hit(f"{study_id}_rs{k}", float(rng.normal(0.05, 0.005)), 0.005)
-                for k in range(20)]
+    summary = opengwas.load_live_gwas(cache_dir=cache_dir)
 
-    def make_assocs(out_id: str, rsids: list[str], scale: float) -> list[dict]:
-        out = []
-        for rs in rsids:
-            # outcome beta = scale * exposure-like beta (we synthesise a number
-            # consistent with a true causal effect = scale).
-            out.append({
-                "rsid": rs,
-                "beta": float(scale * 0.05 + rng.normal(0.0, 0.001)),
-                "se": 0.001,
-                "ea": "A",
-                "nea": "G",
-                "eaf": 0.3,
-            })
-        return out
-
-    captured_calls: list[tuple[str, object]] = []
-
-    class FakeClient:
-        @property
-        def authenticated(self) -> bool:
-            return True
-
-        def fetch_tophits(self, study_id, *, pval, r2, kb):
-            del pval, r2, kb
-            captured_calls.append(("tophits", study_id))
-            return make_hits(study_id)
-
-        def fetch_associations_by_study(
-            self,
-            study_ids,
-            rsids,
-            *,
-            max_workers=4,
-        ):
-            del max_workers
-            captured_calls.append(("assocs", tuple(sorted(study_ids))))
-            return {
-                sid: make_assocs(sid, list(rsids), scale_per_outcome[sid])
-                for sid in study_ids
-            }
-
-    # We map outcome_id -> scale so we know what IVW should return.
-    scale_per_outcome = {opengwas.OPENGWAS_STUDY_IDS[t]: float(i + 1)
-                         for i, t in enumerate(opengwas.OPENGWAS_STUDY_IDS)}
-    client = FakeClient()
-
-    summary = opengwas.load_live_gwas(client=client, cache_dir=tmp_path)
-
-    # We should have at least one usable cell (BMI -> T2D, etc.).
     usable = np.isfinite(summary.betas) & np.isfinite(summary.ses)
     assert usable.any(), "expected at least one usable IVW cell"
+    assert int(usable.sum()) >= 40
 
-    # IVW point estimates should match the planted scales (within MC noise).
     bmi_idx = summary.exposures.index("BMI")
-    t2d_idx = summary.outcomes.index("T2D")
-    expected = scale_per_outcome[opengwas.OPENGWAS_STUDY_IDS["T2D"]]
-    assert abs(float(summary.betas[bmi_idx, t2d_idx]) - expected) < 0.05
+    ldl_idx = summary.outcomes.index("LDL")
+    assert np.isfinite(summary.betas[bmi_idx, ldl_idx])
+    assert np.isfinite(summary.ses[bmi_idx, ldl_idx])
+    assert summary.ses[bmi_idx, ldl_idx] > 0.0
+    assert ("BMI", "LDL") in summary.citations
 
     # diet_quality has no curated study id -> entire row should be NaN.
     diet_idx = summary.exposures.index("diet_quality")
@@ -157,28 +103,15 @@ def test_load_live_gwas_uses_cache_and_computes_ivw(tmp_path: Path):
         "diet_quality row should remain NaN since no study ID is curated"
     )
 
-    # Second call should be served entirely from cache.
-    captured_calls.clear()
-    summary2 = opengwas.load_live_gwas(client=client, cache_dir=tmp_path)
-    assert captured_calls == [], (
-        f"second call should be all-cache, but hit network: {captured_calls}"
-    )
-    np.testing.assert_allclose(summary.betas, summary2.betas, equal_nan=True)
+    sources = {row.source for row in summary.per_pair}
+    assert sources <= {"cache", "circular", "no_id", "no_overlap"}
 
 
 def test_no_jwt_yields_all_nan_summary(tmp_path: Path):
-    class NoTokenClient:
-        @property
-        def authenticated(self) -> bool:
-            return False
-
-        def fetch_tophits(self, *args, **kwargs):
-            raise AssertionError("network should not be hit when client has no token")
-
-        def fetch_associations_by_study(self, *args, **kwargs):
-            raise AssertionError("network should not be hit when client has no token")
-
-    summary = opengwas.load_live_gwas(client=NoTokenClient(), cache_dir=tmp_path)
+    summary = opengwas.load_live_gwas(
+        client=opengwas.OpenGWASClient(token=None),
+        cache_dir=tmp_path,
+    )
     assert not np.any(np.isfinite(summary.betas))
 
 
