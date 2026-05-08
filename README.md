@@ -89,5 +89,12 @@ Run all tests:
 uv run pytest -q
 ```
 
+On the AoU Researcher Workbench (or any host with an existing clone), refresh
+the repo and run the one-shot bootstrap:
+
+```sh
+git -C causal-pred pull --ff-only && bash causal-pred/scripts/bootstrap_aou.sh
+```
+
 See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for full instructions, CLI flags,
 real-genotype scoring with `gnomon`, and troubleshooting.
