@@ -48,16 +48,13 @@ from .crosscoder import (
 class AlignedPanels:
     """Row-aligned (genome, EHR) activation matrices for the crosscoder.
 
-    Rows are in ``person_id`` order. Each participant in ``person_id``
-    appears in both ``A`` (genome) and ``B`` (EHR); persons missing from
-    either panel are dropped here.
+    Rows are in ``person_id`` order, restricted to participants present in
+    both panels.
     """
 
     A: np.ndarray              # (n, m_G)
     B: np.ndarray              # (n, m_E)
     person_id: np.ndarray      # (n,) string
-    prs_columns: Tuple[str, ...]
-    ehr_columns: Tuple[str, ...]
 
 
 def align_panels_by_iid(
@@ -108,8 +105,6 @@ def align_panels_by_iid(
         A=np.ascontiguousarray(A, dtype=np.float64),
         B=np.ascontiguousarray(B, dtype=np.float64),
         person_id=np.asarray(keep_pids),
-        prs_columns=tuple(str(c) for c in prs_df.columns),
-        ehr_columns=tuple(ehr_panel.feature_names),
     )
 
 
