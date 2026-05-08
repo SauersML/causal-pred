@@ -30,6 +30,8 @@ schemas share the same downstream contract: a
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -755,6 +757,38 @@ AOU_GENOTYPE_BUCKET: str = "gs://fc-aou-datasets-controlled/v8/microarray/plink"
 AOU_GENOTYPE_FILES: Tuple[str, ...] = ("arrays.bed", "arrays.bim", "arrays.fam")
 
 
+CURATED_OMOP_CONDITION_IDS: Tuple[int, ...] = (
+    # Type 2 diabetes and close metabolic comorbidities.
+    201820,
+    443767,
+    443729,
+    442793,
+    443592,
+    435216,
+    376112,
+    # Hypertension / cardiovascular disease.
+    320128,
+    316866,
+    319835,
+    321588,
+    312327,
+    314666,
+    317009,
+    4329847,
+    # Dyslipidaemia and obesity-related codes.
+    432867,
+    443392,
+    433736,
+    437663,
+    434376,
+    # Kidney and liver disease, common T2D correlates.
+    46271022,
+    4030518,
+    197320,
+    201826,
+)
+
+
 def _remote_gcloud_size(uri: str, billing_project: str) -> int:
     gc = _gcloud()
     if gc is None:
@@ -861,6 +895,210 @@ def discover_genotype_dir(extra: Sequence[str | os.PathLike] = ()) -> Optional[P
         if c.is_dir() and _has_genotype_triple(c):
             return c
     return None
+
+
+# ---------------------------------------------------------------------------
+# OMOP long-frame fetchers for the EHR / crosscoder stream
+# ---------------------------------------------------------------------------
+
+
+def _normalise_person_ids(person_ids: Sequence[str]) -> tuple[list[str], list[int]]:
+    ids = [str(pid) for pid in person_ids]
+    if not ids:
+        raise ValueError("person_ids must be non-empty")
+    try:
+        return ids, [int(pid) for pid in ids]
+    except ValueError as exc:
+        raise ValueError("AoU OMOP person_id values must be integer-like") from exc
+
+
+def _omop_cache_key(payload: dict) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:24]
+
+
+def _read_omop_cache(path: Path, key: str) -> Optional[pd.DataFrame]:
+    key_path = path.with_suffix(path.suffix + ".key")
+    if path.is_file() and key_path.is_file() and key_path.read_text().strip() == key:
+        return pd.read_parquet(path)
+    return None
+
+
+def _write_omop_cache(path: Path, key: str, df: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    part = path.with_suffix(path.suffix + ".part")
+    df.to_parquet(part, index=False)
+    os.replace(part, path)
+    path.with_suffix(path.suffix + ".key").write_text(key)
+
+
+def fetch_omop_long_frames(
+    person_ids: Sequence[str],
+    *,
+    cdr: Optional[str] = None,
+    cache_dir: str | os.PathLike = "data/omop",
+    condition_concept_ids: Optional[Sequence[int]] = CURATED_OMOP_CONDITION_IDS,
+    drug_concept_ids: Optional[Sequence[int]] = None,
+    measurement_concept_ids: Optional[Sequence[int]] = None,
+    fetch_drugs: bool = False,
+    fetch_measurements: bool = False,
+) -> dict[str, pd.DataFrame]:
+    """Fetch cached AoU OMOP long frames for the EHR feature stream.
+
+    The production pipeline currently consumes the prepared wide cohort CSV.
+    This helper is kept wired for the EHR/crosscoder branch: it fetches
+    baseline-censorable OMOP frames from the AoU CDR, caches only parquet
+    intermediates under ``cache_dir``, and never uploads or copies genotype
+    files.
+    """
+    from google.cloud import bigquery
+
+    cdr = cdr or os.environ.get("WORKSPACE_CDR")
+    if not cdr:
+        raise RuntimeError("WORKSPACE_CDR must be set or passed as cdr")
+
+    pid_str, pid_int = _normalise_person_ids(person_ids)
+    cache_root = Path(cache_dir)
+    client = bigquery.Client()
+
+    def _array_param(name: str, values: Sequence[int]) -> bigquery.ArrayQueryParameter:
+        return bigquery.ArrayQueryParameter(name, "INT64", [int(v) for v in values])
+
+    def _query(
+        name: str,
+        sql: str,
+        params: Sequence[bigquery.ScalarQueryParameter | bigquery.ArrayQueryParameter],
+        payload: dict,
+    ) -> pd.DataFrame:
+        key = _omop_cache_key({"cdr": cdr, "person_ids": pid_str, **payload})
+        path = cache_root / f"{name}-{key}.parquet"
+        cached = _read_omop_cache(path, key)
+        if cached is not None:
+            return cached
+        job_config = bigquery.QueryJobConfig(query_parameters=list(params))
+        df = client.query(sql, job_config=job_config).to_dataframe()
+        _write_omop_cache(path, key, df)
+        return df
+
+    person_param = _array_param("person_ids", pid_int)
+    frames: dict[str, pd.DataFrame] = {}
+
+    condition_ids = (
+        tuple(int(x) for x in condition_concept_ids)
+        if condition_concept_ids is not None
+        else tuple()
+    )
+    condition_filter = (
+        "AND condition_concept_id IN UNNEST(@condition_concept_ids)"
+        if condition_ids
+        else ""
+    )
+    condition_params: list = [person_param]
+    if condition_ids:
+        condition_params.append(_array_param("condition_concept_ids", condition_ids))
+    frames["condition_long"] = _query(
+        "condition_long",
+        f"""
+        SELECT
+          CAST(person_id AS STRING) AS person_id,
+          CAST(condition_concept_id AS STRING) AS phecode,
+          condition_start_datetime AS datetime
+        FROM `{cdr}.condition_occurrence`
+        WHERE person_id IN UNNEST(@person_ids)
+          {condition_filter}
+        """,
+        condition_params,
+        {"table": "condition_occurrence", "condition_ids": condition_ids},
+    )
+
+    frames["visit_long"] = _query(
+        "visit_long",
+        f"""
+        SELECT
+          CAST(person_id AS STRING) AS person_id,
+          visit_start_datetime AS datetime
+        FROM `{cdr}.visit_occurrence`
+        WHERE person_id IN UNNEST(@person_ids)
+        """,
+        [person_param],
+        {"table": "visit_occurrence"},
+    )
+
+    if fetch_drugs:
+        drug_ids = (
+            tuple(int(x) for x in drug_concept_ids)
+            if drug_concept_ids is not None
+            else tuple()
+        )
+        drug_filter = "AND drug_concept_id IN UNNEST(@drug_concept_ids)" if drug_ids else ""
+        drug_params: list = [person_param]
+        if drug_ids:
+            drug_params.append(_array_param("drug_concept_ids", drug_ids))
+        frames["drug_long"] = _query(
+            "drug_long",
+            f"""
+            SELECT
+              CAST(person_id AS STRING) AS person_id,
+              CAST(drug_concept_id AS STRING) AS atc_class,
+              drug_exposure_start_datetime AS datetime
+            FROM `{cdr}.drug_exposure`
+            WHERE person_id IN UNNEST(@person_ids)
+              {drug_filter}
+            """,
+            drug_params,
+            {"table": "drug_exposure", "drug_ids": drug_ids},
+        )
+
+    if fetch_measurements:
+        measurement_ids = (
+            tuple(int(x) for x in measurement_concept_ids)
+            if measurement_concept_ids is not None
+            else tuple()
+        )
+        measurement_filter = (
+            "AND measurement_concept_id IN UNNEST(@measurement_concept_ids)"
+            if measurement_ids
+            else ""
+        )
+        measurement_params: list = [person_param]
+        if measurement_ids:
+            measurement_params.append(
+                _array_param("measurement_concept_ids", measurement_ids)
+            )
+        frames["measurement_long"] = _query(
+            "measurement_long",
+            f"""
+            SELECT
+              CAST(person_id AS STRING) AS person_id,
+              CAST(measurement_concept_id AS STRING) AS lab,
+              value_as_number AS value,
+              measurement_datetime AS datetime
+            FROM `{cdr}.measurement`
+            WHERE person_id IN UNNEST(@person_ids)
+              AND value_as_number IS NOT NULL
+              {measurement_filter}
+            """,
+            measurement_params,
+            {"table": "measurement", "measurement_ids": measurement_ids},
+        )
+
+    return frames
+
+
+def resolve_baseline_dt(person_ids: Sequence[str], visit_long: pd.DataFrame) -> pd.Series:
+    """Return each participant's earliest observed visit datetime.
+
+    Missing participants are retained with ``NaT`` so downstream
+    baseline-censoring drops their EHR events instead of inventing a date.
+    """
+    order = pd.Index([str(pid) for pid in person_ids], name="person_id")
+    if visit_long.empty:
+        return pd.Series(pd.NaT, index=order, name="baseline_dt")
+    df = visit_long.copy()
+    df["person_id"] = df["person_id"].astype(str)
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    baseline = df.dropna(subset=["datetime"]).groupby("person_id")["datetime"].min()
+    return baseline.reindex(order).rename("baseline_dt")
 
 
 # ---------------------------------------------------------------------------
@@ -1221,6 +1459,9 @@ __all__ = [
     "resolve_aou_genotypes",
     "AOU_GENOTYPE_BUCKET",
     "AOU_GENOTYPE_FILES",
+    "CURATED_OMOP_CONDITION_IDS",
+    "fetch_omop_long_frames",
+    "resolve_baseline_dt",
     "build_ehr_panel",
     "CohortBuildResult",
     "EhrPanel",
