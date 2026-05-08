@@ -92,12 +92,12 @@ def _fit_gam(
     columns: Tuple[str, ...],
     survival_likelihood: str = "location-scale",
 ) -> _SubmodelFit:
-    """Fit a survival GAM through ``gam.fit`` and return a ``_SubmodelFit``.
+    """Fit a survival GAM through ``gamfit.fit`` and return a ``_SubmodelFit``.
 
-    The library's unified API supports ``location-scale``,
-    ``marginal-slope``, ``latent``, and ``latent-binary`` likelihoods;
-    ``location-scale`` is the canonical choice for continuous-time
-    failure data with a smooth covariate effect on the location.
+    Uses the unified ``location-scale`` survival likelihood (the
+    ``marginal-slope`` mode does not converge on the ``causal-pred``
+    benchmarks at ``n=300``). The covariates enter the formula as
+    P-spline smooths (continuous) or linear terms (binary).
     """
     time = np.asarray(time, dtype=float)
     event = np.asarray(event, dtype=float)
