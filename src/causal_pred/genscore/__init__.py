@@ -33,26 +33,19 @@ from .integrate import (
     select_shared_features,
 )
 from .panels import (
-    CARDIOMETABOLIC_PANEL_V1,
-    PANEL_PROVENANCE,
-    PanelDownloadError,
-    all_panel_ids,
+    PGS_PANEL,
     discover_local_panel,
     download_panel,
-    panel_area_for,
     pgs_catalog_url,
 )
 
 __all__ = [
     "AlignedPanels",
     "AugmentationResult",
-    "CARDIOMETABOLIC_PANEL_V1",
     "FeatureSelection",
-    "PANEL_PROVENANCE",
-    "PanelDownloadError",
+    "PGS_PANEL",
     "TopKCrosscoder",
     "align_panels_by_iid",
-    "all_panel_ids",
     "augment_dataset_with_features",
     "classify_features",
     "discover_local_panel",
@@ -60,7 +53,6 @@ __all__ = [
     "encode",
     "feature_stream_share",
     "fit_panel_crosscoder",
-    "panel_area_for",
     "pgs_catalog_url",
     "reconstruct",
     "run_genscore",
