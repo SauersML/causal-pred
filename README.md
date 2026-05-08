@@ -66,7 +66,7 @@ docs/          architecture, runbook, mathematical notes
 
 ## Quickstart
 
-On the AoU Researcher Workbench, setup and run with one command:
+In the terminal, setup and run with one command:
 
 ```sh
 if [ -d causal-pred/.git ]; then git -C causal-pred stash push -m aou-local-uv-lock -- uv.lock >/dev/null || true; git -C causal-pred pull --ff-only; else git clone https://github.com/SauersML/causal-pred.git causal-pred; fi && bash causal-pred/scripts/bootstrap_aou.sh
