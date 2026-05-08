@@ -9,6 +9,8 @@ into a directory consumable by :func:`causal_pred.data.polygenic.score_panel`.
 from __future__ import annotations
 
 import concurrent.futures
+import codecs
+import gzip
 import os
 import urllib.error
 import urllib.request
@@ -50,6 +52,10 @@ PGS_PANEL: tuple[str, ...] = (
 )
 
 
+class _InvalidScoreFile(RuntimeError):
+    """Raised when a downloaded PGS score file cannot be read by gnomon."""
+
+
 def pgs_catalog_url(pgs_id: str, build: str = "GRCh38") -> str:
     """URL of the harmonised scoring file for ``pgs_id`` on EBI FTP."""
     return (
@@ -58,11 +64,34 @@ def pgs_catalog_url(pgs_id: str, build: str = "GRCh38") -> str:
     )
 
 
+def _validate_score_file(path: Path) -> None:
+    """Validate the gzip container and strict UTF-8 text payload."""
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    try:
+        with gzip.open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(1 << 20)
+                if not chunk:
+                    break
+                decoder.decode(chunk)
+            decoder.decode(b"", final=True)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _InvalidScoreFile(
+            f"{path} is not a valid gzip UTF-8 score file: {exc}"
+        ) from exc
+
+
 def _download_one(url: str, dst: Path, timeout: int) -> Path:
     if dst.is_file() and dst.stat().st_size > 0:
-        return dst
+        try:
+            _validate_score_file(dst)
+            return dst
+        except _InvalidScoreFile:
+            dst.unlink()
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(dst.suffix + ".part")
+    if tmp.exists():
+        tmp.unlink()
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         with open(tmp, "wb") as fh:
             while True:
@@ -70,6 +99,7 @@ def _download_one(url: str, dst: Path, timeout: int) -> Path:
                 if not chunk:
                     break
                 fh.write(chunk)
+    _validate_score_file(tmp)
     os.replace(tmp, dst)
     return dst
 
@@ -84,8 +114,8 @@ def download_panel(
     """Download every PGS scoring file in ``ids`` into ``out_dir`` in parallel.
 
     Files are named ``<pgs_id>_hmPOS_<build>.txt.gz`` so the directory is
-    consumable by :func:`causal_pred.data.polygenic.score_panel`. Files
-    already present with non-zero size are skipped.
+    consumable by :func:`causal_pred.data.polygenic.score_panel`. Existing
+    files are reused only after gzip and strict UTF-8 validation.
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -106,7 +136,12 @@ def download_panel(
         ):
             try:
                 paths.append(fut.result())
-            except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            except (
+                urllib.error.URLError,
+                OSError,
+                TimeoutError,
+                _InvalidScoreFile,
+            ) as exc:
                 errors.append(exc)
 
     if errors:
