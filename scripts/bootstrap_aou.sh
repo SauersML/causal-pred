@@ -25,11 +25,27 @@
 set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-$HOME/causal-pred}"
-GENO_DIR="${GENO_DIR:-$REPO_DIR/genomes}"
 FETCH_GENOTYPES="${FETCH_GENOTYPES:-1}"
 RUN_PIPELINE="${RUN_PIPELINE:-1}"
 
 log() { printf '\033[1;34m[bootstrap]\033[0m %s\n' "$*"; }
+
+# If GENO_DIR is unset, reuse an existing arrays.{bed,bim,fam} triple
+# wherever we can find one (cwd, $HOME, repo root, $REPO_DIR/genomes) so
+# we don't redownload ~180 GiB. Otherwise default to $REPO_DIR/genomes.
+has_triple() {
+    [[ -s "$1/arrays.bed" && -s "$1/arrays.bim" && -s "$1/arrays.fam" ]]
+}
+if [[ -z "${GENO_DIR:-}" ]]; then
+    for cand in "$PWD" "$HOME" "$REPO_DIR" "$REPO_DIR/genomes"; do
+        if has_triple "$cand"; then
+            GENO_DIR="$cand"
+            log "found existing arrays.{bed,bim,fam} in $GENO_DIR -- skipping download"
+            break
+        fi
+    done
+    GENO_DIR="${GENO_DIR:-$REPO_DIR/genomes}"
+fi
 
 # 1. uv ----------------------------------------------------------------------
 if ! command -v uv >/dev/null 2>&1; then
