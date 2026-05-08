@@ -42,10 +42,6 @@ import pandas as pd
 
 
 CACHE_FILENAMES: dict = {
-    # Logical name -> ordered list of acceptable on-disk filenames. The first
-    # entry is the canonical name used when *writing* a fresh cache; the
-    # remaining entries are accepted on read so we tolerate the trailing
-    # ``_case`` variant produced by some upstream notebooks.
     "participant_level": ("t2d_initial_nodes_participant_level.csv",),
     "complete": (
         "t2d_initial_nodes_complete.csv",
@@ -427,6 +423,73 @@ def load_cohort_csv(
     return X, tuple(present), types
 
 
+def load_cohort_dataset_with_person_ids(
+    path: str,
+    standardise_continuous: bool = True,
+    drop_incomplete: bool = True,
+):
+    """Load a cohort CSV and keep the per-row ``person_id`` values.
+
+    This is the real-data entry point used when genomic scores must be
+    aligned with the AoU cohort. It applies the same numeric coercion,
+    complete-case filtering, binary coercion, and continuous standardisation
+    as :func:`load_cohort_csv`, then returns ``(dataset, person_id)`` where
+    ``person_id`` is ordered exactly like ``dataset.X``.
+    """
+    from .synthetic import SyntheticDataset
+
+    raw = pd.read_csv(path, dtype={"person_id": "string"})
+    if "person_id" not in raw.columns:
+        raise ValueError(f"cohort CSV {path!r} must contain person_id for genomic alignment")
+
+    person_id = raw["person_id"].astype("string").copy()
+    df = raw.drop(columns=["person_id"])
+
+    present = [c for c in COHORT_NODES if c in df.columns]
+    if not present:
+        raise ValueError(
+            f"CSV {path!r} contains none of the cohort columns "
+            f"{COHORT_NODES!r}; got {list(df.columns)!r}"
+        )
+    df = df[present].copy()
+
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if drop_incomplete:
+        keep = ~df.isna().any(axis=1)
+        df = df.loc[keep].copy()
+        person_id = person_id.loc[keep].copy()
+
+    types = tuple(COHORT_NODE_TYPES[c] for c in present)
+
+    for col, kind in zip(present, types):
+        if kind == "binary":
+            df[col] = df[col].round().astype(int)
+
+    if standardise_continuous:
+        for col, kind in zip(present, types):
+            if kind == "continuous":
+                v = df[col].astype(float).to_numpy()
+                mu = v.mean()
+                sd = v.std(ddof=0)
+                if sd == 0.0:
+                    raise ValueError(f"continuous cohort column has zero variance: {col}")
+                df[col] = (v - mu) / sd
+
+    X = df.to_numpy(dtype=np.float64)
+    n, p = X.shape
+    dataset = SyntheticDataset(
+        X=X,
+        time=np.zeros(n, dtype=float),
+        event=np.zeros(n, dtype=int),
+        columns=tuple(present),
+        node_types=types,
+        ground_truth_adj=np.zeros((p, p), dtype=int),
+    )
+    return dataset, person_id.astype(str).to_numpy()
+
+
 # ---------------------------------------------------------------------------
 # Adapter: cohort CSV -> SyntheticDataset (the pipeline's universal type)
 # ---------------------------------------------------------------------------
@@ -466,10 +529,6 @@ def load_cohort_dataset(
 # ---------------------------------------------------------------------------
 # Caching: local-then-bucket lookup, build only on miss
 # ---------------------------------------------------------------------------
-
-
-AOU_GENOTYPE_BUCKET: str = "gs://fc-aou-datasets-controlled/v8/microarray/plink"
-AOU_GENOTYPE_FILES: Tuple[str, ...] = ("arrays.bed", "arrays.bim", "arrays.fam")
 
 
 def _gsutil() -> Optional[str]:
@@ -513,9 +572,9 @@ def resolve_cohort_csv(
     ``name`` is one of :data:`CACHE_FILENAMES` (``"complete"`` or
     ``"participant_level"``). The lookup order is:
 
-      1. ``cache_dir/<canonical>.csv`` (or any accepted alias);
-      2. ``$WORKSPACE_BUCKET/data/<canonical>.csv`` (or alias) -- copied
-         into ``cache_dir`` via ``gsutil cp``;
+      1. ``cache_dir/<canonical>.csv`` or accepted notebook filename;
+      2. ``$WORKSPACE_BUCKET/data/<filename>.csv`` -- copied into
+         ``cache_dir`` as the canonical filename via ``gsutil cp``;
       3. ``bucket/data/<canonical>.csv`` if ``bucket`` is given explicitly.
 
     Raises ``FileNotFoundError`` if no source resolves.
@@ -575,62 +634,79 @@ def write_cohort_cache(
     return pl, cc
 
 
+AOU_GENOTYPE_BUCKET: str = "gs://fc-aou-datasets-controlled/v8/microarray/plink"
+AOU_GENOTYPE_FILES: Tuple[str, ...] = ("arrays.bed", "arrays.bim", "arrays.fam")
+
+
+def _remote_gcloud_size(uri: str, billing_project: str) -> int:
+    gc = _gcloud()
+    if gc is None:
+        raise RuntimeError("gcloud is not on PATH; cannot inspect the AoU microarray bucket")
+    r = subprocess.run(
+        [gc, "storage", "ls", "-l", uri, f"--billing-project={billing_project}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[-1] == uri:
+            return int(parts[0])
+    raise RuntimeError(f"could not read remote size for {uri!r} from gcloud output")
+
+
 def resolve_aou_genotypes(
     cache_dir: str | os.PathLike = ".",
     bucket: str = AOU_GENOTYPE_BUCKET,
     billing_project: Optional[str] = None,
 ) -> Path:
-    """Return the local path to the AoU v8 microarray PLINK ``.bed`` prefix.
+    """Return local AoU v8 microarray PLINK ``arrays.bed``.
 
-    Looks for ``arrays.bed``, ``arrays.bim``, ``arrays.fam`` under
-    ``cache_dir`` and downloads only the files that are missing (or
-    zero-byte) from ``bucket`` via ``gcloud storage cp``. Existing files
-    are kept as-is, so calling this after a partial download resumes the
-    untransferred members of the triple without re-fetching the rest.
-
-    The bucket is requester-pays: ``billing_project`` (or the
-    ``GOOGLE_PROJECT`` env-var, which the AoU Researcher Workbench sets
-    automatically) is forwarded to ``gcloud storage cp --billing-project``.
-    Subprocess output is **not** captured so progress streams to the
-    terminal -- the full triple is ~180 GiB and takes ~20 min on the
-    workbench's default network.
-
-    Returns the path to ``arrays.bed``; pass this (or its prefix without
-    the suffix) to gnomon / PLINK callers.
+    Each member of ``arrays.{bed,bim,fam}`` is downloaded from the requester
+    pays AoU controlled bucket when absent or size-mismatched. Downloads go
+    to ``*.part`` and are atomically moved into place after the copied file
+    matches the remote byte count, so interrupted downloads are never treated
+    as usable genotype inputs.
     """
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    project = billing_project or os.environ.get("GOOGLE_PROJECT")
+    if not project:
+        raise RuntimeError("GOOGLE_PROJECT must be set to download AoU microarray data")
+
+    gc = _gcloud()
+    if gc is None:
+        raise RuntimeError("gcloud is not on PATH; cannot fetch AoU microarray data")
+
+    cache = Path(cache_dir)
+    cache.mkdir(parents=True, exist_ok=True)
     bucket = bucket.rstrip("/")
 
-    missing = [
-        fname
-        for fname in AOU_GENOTYPE_FILES
-        if not (cache_dir / fname).is_file() or (cache_dir / fname).stat().st_size == 0
-    ]
+    for fname in AOU_GENOTYPE_FILES:
+        src = f"{bucket}/{fname}"
+        dst = cache / fname
+        expected_size = _remote_gcloud_size(src, project)
+        if dst.is_file() and dst.stat().st_size == expected_size:
+            continue
 
-    if missing:
-        gc = _gcloud()
-        if gc is None:
+        part = dst.with_suffix(dst.suffix + ".part")
+        if part.exists():
+            part.unlink()
+        subprocess.run(
+            [gc, "storage", "cp", src, str(part), f"--billing-project={project}"],
+            check=True,
+        )
+        got_size = part.stat().st_size
+        if got_size != expected_size:
+            part.unlink(missing_ok=True)
             raise RuntimeError(
-                "gcloud is not on PATH; cannot fetch from the AoU controlled bucket"
+                f"downloaded {src} has {got_size} bytes; expected {expected_size}"
             )
-        project = billing_project or os.environ.get("GOOGLE_PROJECT")
-        if not project:
-            raise RuntimeError(
-                "billing_project / $GOOGLE_PROJECT must be set to download from "
-                f"the requester-pays bucket {bucket!r}"
-            )
-        for fname in missing:
-            src = f"{bucket}/{fname}"
-            dst = cache_dir / fname
-            subprocess.run(
-                [gc, "storage", "cp", src, str(dst), f"--billing-project={project}"],
-                check=True,
-            )
+        os.replace(part, dst)
 
-    bed = cache_dir / AOU_GENOTYPE_FILES[0]
-    if not bed.is_file():
-        raise FileNotFoundError(f"missing PLINK .bed after fetch: {bed}")
+    bed = cache / "arrays.bed"
+    bim = cache / "arrays.bim"
+    fam = cache / "arrays.fam"
+    if not (bed.is_file() and bim.is_file() and fam.is_file()):
+        raise FileNotFoundError(f"incomplete AoU microarray PLINK triple in {cache}")
     return bed
 
 
@@ -641,13 +717,7 @@ def load_or_build_cohort(
     builder: Optional[Callable[[], CohortBuildResult]] = None,
     upload_after_build: bool = False,
 ) -> Path:
-    """Resolve a cached cohort CSV; build it on cache miss.
-
-    Tries :func:`resolve_cohort_csv` first. If that misses and ``builder``
-    is given, calls ``builder()`` (which must return a
-    :class:`CohortBuildResult`), writes both CSVs to ``cache_dir``, and
-    returns the path matching ``name``.
-    """
+    """Resolve a cached cohort CSV; build it on cache miss."""
     try:
         return resolve_cohort_csv(name=name, cache_dir=cache_dir, bucket=bucket)
     except FileNotFoundError:
@@ -658,6 +728,253 @@ def load_or_build_cohort(
             result, cache_dir=cache_dir, bucket=bucket, upload=upload_after_build
         )
         return cc if name == "complete" else pl
+
+
+# ---------------------------------------------------------------------------
+# Genotype discovery (cheap pre-check before resolve_aou_genotypes downloads)
+# ---------------------------------------------------------------------------
+
+
+def _has_genotype_triple(d: Path) -> bool:
+    return all((d / f).is_file() and (d / f).stat().st_size > 0 for f in AOU_GENOTYPE_FILES)
+
+
+def discover_genotype_dir(extra: Sequence[str | os.PathLike] = ()) -> Optional[Path]:
+    """Return the first directory containing a complete arrays.{bed,bim,fam} triple.
+
+    Search order (first hit wins): each path in ``extra`` (caller-supplied
+    overrides), then ``$PWD``, ``$HOME``, ``$HOME/causal-pred``,
+    ``$HOME/causal-pred/genomes``. Returns ``None`` if none have all three
+    non-zero files; the caller is responsible for downloading via
+    :func:`resolve_aou_genotypes`.
+    """
+    candidates: list[Path] = [Path(p) for p in extra]
+    candidates += [
+        Path.cwd(),
+        Path.home(),
+        Path.home() / "causal-pred",
+        Path.home() / "causal-pred" / "genomes",
+    ]
+    seen: set[Path] = set()
+    for c in candidates:
+        c = c.expanduser()
+        if c in seen:
+            continue
+        seen.add(c)
+        if c.is_dir() and _has_genotype_triple(c):
+            return c
+    return None
+
+
+# ---------------------------------------------------------------------------
+# OMOP long-frame fetcher (BigQuery; AoU CDR via $WORKSPACE_CDR)
+# ---------------------------------------------------------------------------
+
+
+# Curated common-disease panel used as the default condition filter for the
+# OMOP fetch. Includes T2D, T2D-relevant comorbidities (cardiometabolic,
+# renal, hepatic, neurologic) and other prevalent conditions; covers most
+# of what the EHR-stream crosscoder needs without dragging in the full
+# concept_ancestor closure.
+CURATED_OMOP_CONDITION_IDS: Tuple[int, ...] = (
+    316866, 432867, 80180, 433736, 321588, 440383, 435524, 318800, 439777,
+    201826, 440069, 4152280, 313459, 317009, 443392, 4030518, 44784217,
+    81902, 257007, 318443, 441408, 140673, 317576, 46271022, 436962,
+    4283893, 318736, 192359, 4226263, 378416, 316139, 197320, 4185932,
+    197032, 255848, 437833, 255573, 195562, 31317, 374366, 4027396, 192671,
+    313217, 37311061, 80502, 4212540, 4319447, 436676, 321052, 381591,
+    201340, 379019, 201620, 132797, 4256228, 317002, 437541, 432870, 30753,
+    321318, 444247, 441848, 434610, 441788, 319049, 4318985, 436073, 440674,
+    372328, 443454, 380378, 435224, 4112853, 439727, 80809, 312327, 137053,
+    4174977, 440417, 4163261, 438120, 444429, 4133004, 193782, 438409,
+    4322024, 374377, 4064161, 432585, 73754, 139900, 134438, 441284, 140168,
+    4137275, 201254, 199074, 4266367, 373503, 200528, 4260535, 438130,
+    257628, 374028, 133444, 4286201, 4067106, 319041, 4182210, 24609,
+    4103295, 133834, 4078925, 378414, 4028363, 433527, 254443, 432881,
+    4311499, 4038838, 443727, 4131909, 375806, 440940, 4002359, 4331304,
+    201606, 374919, 45763653, 4024659, 4281232, 434119, 434592, 81893,
+    444044, 4091559, 4180790, 4242574, 198985, 4245975, 432791, 4074815,
+    434821, 434557, 381270, 197508, 321042,
+)
+
+
+def fetch_omop_long_frames(
+    person_ids: Sequence[str],
+    cdr: Optional[str] = None,
+    cache_dir: str | os.PathLike = "data/omop",
+    condition_concept_ids: Optional[Sequence[int]] = CURATED_OMOP_CONDITION_IDS,
+    drug_concept_ids: Optional[Sequence[int]] = None,
+    measurement_concept_ids: Optional[Sequence[int]] = None,
+    fetch_drugs: bool = False,
+    fetch_measurements: bool = False,
+) -> dict[str, pd.DataFrame]:
+    """Pull the four OMOP long-frames consumed by :func:`build_ehr_panel` from the AoU CDR.
+
+    Conditions are filtered to a curated common-disease panel by default so
+    the query is tractable on cohorts of 100k+ participants; pass
+    ``condition_concept_ids=None`` to disable filtering (expensive). Drugs
+    and measurements are skipped by default because their unfiltered tables
+    are billions of rows on AoU; set ``fetch_drugs`` /
+    ``fetch_measurements=True`` (with a non-empty ``*_concept_ids`` list,
+    or ``None`` to mean "all" if you really want it) to include them.
+
+    BigQuery is imported lazily so the module stays importable off-workbench.
+    The cache is keyed on a SHA1 of the sorted ``person_ids`` tuple plus
+    the active filter sets, stored next to each parquet as ``<table>.key``;
+    changing the cohort or the filters silently invalidates the cache
+    without a manual purge.
+    """
+    import hashlib
+    from google.cloud import bigquery
+
+    cdr = cdr if cdr is not None else os.environ.get("WORKSPACE_CDR")
+    if not cdr:
+        raise RuntimeError("WORKSPACE_CDR is not set; pass cdr=... explicitly")
+    cdr = cdr.strip().strip("`")
+
+    pid_int = sorted({int(p) for p in person_ids})
+    cond_ids = (
+        sorted({int(c) for c in condition_concept_ids})
+        if condition_concept_ids is not None
+        else None
+    )
+    drug_ids = (
+        sorted({int(c) for c in drug_concept_ids})
+        if drug_concept_ids is not None
+        else None
+    )
+    meas_ids = (
+        sorted({int(c) for c in measurement_concept_ids})
+        if measurement_concept_ids is not None
+        else None
+    )
+
+    def _key_for(table: str) -> str:
+        salt: tuple = (tuple(pid_int),)
+        if table == "condition_long":
+            salt += (("cond", tuple(cond_ids) if cond_ids is not None else None),)
+        elif table == "drug_long":
+            salt += (("drug", tuple(drug_ids) if drug_ids is not None else None),)
+        elif table == "measurement_long":
+            salt += (("meas", tuple(meas_ids) if meas_ids is not None else None),)
+        return hashlib.sha1(repr(salt).encode("utf-8")).hexdigest()
+
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    cond_filter = (
+        " AND condition_concept_id IN UNNEST(@condition_concept_ids)"
+        if cond_ids is not None
+        else ""
+    )
+    drug_filter = (
+        " AND drug_concept_id IN UNNEST(@drug_concept_ids)"
+        if drug_ids is not None
+        else ""
+    )
+    meas_filter = (
+        " AND m.measurement_concept_id IN UNNEST(@measurement_concept_ids)"
+        if meas_ids is not None
+        else ""
+    )
+
+    queries: dict[str, tuple[str, list]] = {
+        "condition_long": (
+            f"SELECT CAST(person_id AS STRING) AS person_id, "
+            f"CAST(condition_concept_id AS STRING) AS phecode, "
+            f"condition_start_datetime AS datetime "
+            f"FROM `{cdr}.condition_occurrence` "
+            f"WHERE person_id IN UNNEST(@person_ids){cond_filter}",
+            (
+                [bigquery.ArrayQueryParameter("condition_concept_ids", "INT64", cond_ids)]
+                if cond_ids is not None else []
+            ),
+        ),
+        "visit_long": (
+            f"SELECT CAST(person_id AS STRING) AS person_id, "
+            f"visit_start_datetime AS datetime "
+            f"FROM `{cdr}.visit_occurrence` "
+            f"WHERE person_id IN UNNEST(@person_ids)",
+            [],
+        ),
+    }
+    if fetch_drugs:
+        queries["drug_long"] = (
+            f"SELECT CAST(person_id AS STRING) AS person_id, "
+            f"CAST(drug_concept_id AS STRING) AS atc_class, "
+            f"drug_exposure_start_datetime AS datetime "
+            f"FROM `{cdr}.drug_exposure` "
+            f"WHERE person_id IN UNNEST(@person_ids){drug_filter}",
+            (
+                [bigquery.ArrayQueryParameter("drug_concept_ids", "INT64", drug_ids)]
+                if drug_ids is not None else []
+            ),
+        )
+    if fetch_measurements:
+        queries["measurement_long"] = (
+            f"SELECT CAST(m.person_id AS STRING) AS person_id, "
+            f"c.concept_name AS lab, "
+            f"m.value_as_number AS value, "
+            f"m.measurement_datetime AS datetime "
+            f"FROM `{cdr}.measurement` AS m "
+            f"JOIN `{cdr}.concept` AS c "
+            f"ON m.measurement_concept_id = c.concept_id "
+            f"WHERE m.person_id IN UNNEST(@person_ids) "
+            f"AND m.value_as_number IS NOT NULL{meas_filter}",
+            (
+                [bigquery.ArrayQueryParameter("measurement_concept_ids", "INT64", meas_ids)]
+                if meas_ids is not None else []
+            ),
+        )
+
+    client = None
+    out: dict[str, pd.DataFrame] = {}
+    for table, (sql, extra_params) in queries.items():
+        parquet_path = cache_dir / f"{table}.parquet"
+        key_path = cache_dir / f"{table}.key"
+        key = _key_for(table)
+        if (
+            parquet_path.is_file()
+            and key_path.is_file()
+            and key_path.read_text().strip() == key
+        ):
+            out[table] = pd.read_parquet(parquet_path)
+            continue
+        if client is None:
+            client = bigquery.Client()
+        params = [bigquery.ArrayQueryParameter("person_ids", "INT64", pid_int)] + extra_params
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        frame = client.query(sql, job_config=job_config).to_dataframe()
+        frame["person_id"] = frame["person_id"].astype(str)
+        frame.to_parquet(parquet_path, index=False)
+        key_path.write_text(key)
+        out[table] = frame
+
+    return out
+
+
+def resolve_baseline_dt(
+    person_ids: Sequence[str],
+    visit_long: pd.DataFrame,
+) -> pd.Series:
+    """Define each participant's baseline as their earliest AoU encounter.
+
+    First-visit anchoring is a no-lookahead choice that exists for every
+    participant (cases and non-cases alike), unlike diagnosis date which is
+    only defined for incident T2D. Persons with no visits keep ``NaT`` so
+    downstream filters drop them rather than silently leaking future data.
+    """
+    pids = pd.Index([str(p) for p in person_ids], name="person_id").unique()
+    if visit_long is None or len(visit_long) == 0:
+        return pd.Series(
+            pd.NaT, index=pids, name="baseline_dt", dtype="datetime64[ns]"
+        )
+    vl = visit_long[["person_id", "datetime"]].copy()
+    vl["person_id"] = vl["person_id"].astype(str)
+    vl["datetime"] = pd.to_datetime(vl["datetime"], errors="coerce")
+    vl = vl.dropna(subset=["datetime"])
+    earliest = vl.groupby("person_id", sort=False)["datetime"].min()
+    return earliest.reindex(pids).rename("baseline_dt")
 
 
 # ---------------------------------------------------------------------------
@@ -1011,12 +1328,16 @@ __all__ = [
     "build_cohort_dataset",
     "load_cohort_csv",
     "load_cohort_dataset",
+    "load_cohort_dataset_with_person_ids",
     "resolve_cohort_csv",
+    "write_cohort_cache",
+    "discover_genotype_dir",
     "resolve_aou_genotypes",
     "AOU_GENOTYPE_BUCKET",
     "AOU_GENOTYPE_FILES",
-    "write_cohort_cache",
-    "load_or_build_cohort",
+    "fetch_omop_long_frames",
+    "resolve_baseline_dt",
+    "CURATED_OMOP_CONDITION_IDS",
     "build_ehr_panel",
     "CohortBuildResult",
     "EhrPanel",

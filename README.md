@@ -23,7 +23,7 @@ which makes the validation framework meaningful even on synthetic data.
 ## Pipeline
 
 ```text
-  External GWAS            Biobank (SIMULATED HERE: data/synthetic.py)
+  External GWAS            AoU cohort CSV from the workspace bucket
   summary stats            individual-level matrix
         |                            |
         v                            v
@@ -71,13 +71,9 @@ Install (requires `uv` and a working Rust toolchain for the `gam` extension):
 uv sync --dev
 ```
 
-Run the demo end-to-end on synthetic data:
-
-```sh
-uv run python -m causal_pred.pipeline
-```
-
-Run the full peer-review-grade pipeline:
+Run the real cohort pipeline. It resolves `data/t2d_initial_nodes_complete.csv`
+locally first, then copies `$WORKSPACE_BUCKET/data/t2d_initial_nodes_complete.csv`
+on AoU:
 
 ```sh
 uv run python scripts/run_full_pipeline.py
@@ -89,12 +85,11 @@ Run all tests:
 uv run pytest -q
 ```
 
-On the AoU Researcher Workbench (or any host with an existing clone), refresh
-the repo and run the one-shot bootstrap:
+On the AoU Researcher Workbench, run the one-shot bootstrap:
 
 ```sh
-git -C causal-pred pull --ff-only && bash causal-pred/scripts/bootstrap_aou.sh
+bash causal-pred/scripts/bootstrap_aou.sh
 ```
 
-See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for full instructions, CLI flags,
+See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for full instructions,
 real-genotype scoring with `gnomon`, and troubleshooting.

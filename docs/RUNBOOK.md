@@ -1,8 +1,8 @@
 # Runbook
 
 Operational instructions for installing, running, and troubleshooting
-`causal-pred`. Every shell command below goes through `uv run` so the
-environment stays consistent with `uv.lock`.
+`causal-pred`. Python commands go through `uv run` so the environment
+stays consistent with `uv.lock`.
 
 ## Install
 
@@ -16,24 +16,26 @@ This resolves all runtime and dev dependencies, including the Rust-backed
 `gam` library. If `gam` fails to build, see the troubleshooting section
 below for `rustc missing`.
 
-## Run the demo
+## AoU Workbench bootstrap
 
-The fastest sanity check. Runs the pipeline end-to-end on synthetic data
-with small sample size:
+The real-data path expects the complete-case T2D node file at
+`$WORKSPACE_BUCKET/data/t2d_initial_nodes_complete.csv`. On the AoU
+Researcher Workbench, the bootstrap verifies that object, installs the
+local toolchain, syncs dependencies, copies the CSV into `data/`, and runs
+the pipeline:
 
 ```sh
-uv run python -m causal_pred.pipeline
+bash causal-pred/scripts/bootstrap_aou.sh
 ```
 
-This writes `outputs/summary.json` and a handful of PNGs under
-`outputs/plots/`.
+This writes `outputs/summary.json` and the edge artefacts under `outputs/`.
 
 ## Run the full pipeline
 
 The pipeline is a single fixed path: cohort wide CSV (resolved via the
-local-then-bucket cache) -> DAGSLAM hill-climb -> structure MCMC -> save
-artefacts under `outputs/`. There are no command-line flags; defaults
-are the configuration. To override hyperparameters, edit
+local `data/` cache, then `$WORKSPACE_BUCKET/data/`) -> DAGSLAM hill-climb
+-> structure MCMC -> save artefacts under `outputs/`. There are no
+command-line flags; defaults are the configuration. To override hyperparameters, edit
 ``run_pipeline``'s defaults in `src/causal_pred/pipeline.py`.
 
 ```sh
