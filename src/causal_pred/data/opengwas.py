@@ -147,7 +147,6 @@ class OpenGWASClientLike(Protocol):
         pval: float = DEFAULT_PVAL,
         r2: float = DEFAULT_R2,
         kb: int = DEFAULT_KB,
-        pop: str = "EUR",
     ) -> list[dict]:
         ...
 
@@ -221,9 +220,13 @@ class OpenGWASClient:
         pval: float = DEFAULT_PVAL,
         r2: float = DEFAULT_R2,
         kb: int = DEFAULT_KB,
-        pop: str = "EUR",
     ) -> list[dict]:
-        """Server-side LD-clumped tophits for one exposure GWAS."""
+        """Server-side LD-clumped tophits for one exposure GWAS.
+
+        We do not pass ``pop`` -- OpenGWAS picks the LD reference
+        server-side and we deliberately avoid baking a single ancestry
+        into the request.
+        """
         body = {
             "id": study_id,
             "pval": pval,
@@ -232,7 +235,6 @@ class OpenGWASClient:
             "preclumped": 0,
             "clump": 1,
             "force_server": 0,
-            "pop": pop,
         }
         out = self._post("/tophits", body)
         if not isinstance(out, list):
@@ -392,11 +394,10 @@ def _cache_key(
     pval: float,
     r2: float,
     kb: int,
-    pop: str,
 ) -> str:
     return (
         f"{CACHE_VERSION}__{exposure_id}__{outcome_id}__"
-        f"p{pval:.0e}_r{r2}_kb{kb}_{pop}.json"
+        f"p{pval:.0e}_r{r2}_kb{kb}.json"
     )
 
 
@@ -440,8 +441,13 @@ def _emit(per_pair: list[_PerPair], record: _PerPair) -> None:
     per_pair.append(record)
 
 
-def _per_exposure_tophits_cache_key(study_id: str, pval: float, r2: float, kb: int, pop: str) -> str:
-    return f"{CACHE_VERSION}__tophits__{study_id}__p{pval:.0e}_r{r2}_kb{kb}_{pop}.json"
+def _per_exposure_tophits_cache_key(
+    study_id: str,
+    pval: float,
+    r2: float,
+    kb: int,
+) -> str:
+    return f"{CACHE_VERSION}__tophits__{study_id}__p{pval:.0e}_r{r2}_kb{kb}.json"
 
 
 def _load_or_fetch_tophits(
@@ -451,13 +457,12 @@ def _load_or_fetch_tophits(
     pval: float,
     r2: float,
     kb: int,
-    pop: str,
 ) -> list[dict]:
-    path = cache_dir / _per_exposure_tophits_cache_key(study_id, pval, r2, kb, pop)
+    path = cache_dir / _per_exposure_tophits_cache_key(study_id, pval, r2, kb)
     cached = _read_cache(path)
     if cached is not None and isinstance(cached.get("tophits"), list):
         return cached["tophits"]
-    hits = client.fetch_tophits(study_id, pval=pval, r2=r2, kb=kb, pop=pop)
+    hits = client.fetch_tophits(study_id, pval=pval, r2=r2, kb=kb)
     _write_cache(path, {"study_id": study_id, "tophits": hits, "fetched_at": time.time()})
     return hits
 
@@ -471,7 +476,6 @@ def load_live_gwas(
     pval: float = DEFAULT_PVAL,
     r2: float = DEFAULT_R2,
     kb: int = DEFAULT_KB,
-    pop: str = "EUR",
     drop_circular: bool = True,
     raise_on_error: bool = False,
 ) -> RealGWASSummary:
@@ -510,7 +514,7 @@ def load_live_gwas(
         if exp_id is None:
             continue
         cache_path = cache_root / _per_exposure_tophits_cache_key(
-            exp_id, pval, r2, kb, pop
+            exp_id, pval, r2, kb
         )
         cached = _read_cache(cache_path)
         if cached is not None and isinstance(cached.get("tophits"), list):
@@ -529,7 +533,7 @@ def load_live_gwas(
             continue
         try:
             tophits_by_exposure[exp] = _load_or_fetch_tophits(
-                cache_root, client, exp_id, pval, r2, kb, pop
+                cache_root, client, exp_id, pval, r2, kb
             )
             logger.info(
                 "[opengwas] tophits fetched %s (%s): n=%d",
@@ -580,7 +584,7 @@ def load_live_gwas(
                     "source": "no_id", "note": "no tophits for exposure",
                 }
                 continue
-            cache_path = cache_root / _cache_key(exp_id, out_id, pval, r2, kb, pop)
+            cache_path = cache_root / _cache_key(exp_id, out_id, pval, r2, kb)
             cached = _read_cache(cache_path)
             if cached is not None and "beta" in cached and "se" in cached:
                 beta = float(cached["beta"]) if cached["beta"] is not None else float("nan")
@@ -636,7 +640,7 @@ def load_live_gwas(
                 assocs = assocs_by_id.get(out_id, [])
                 pairs = harmonise_pairs(hits, assocs)
                 beta, se, k = ivw(pairs)
-                cache_path = cache_root / _cache_key(exp_id, out_id, pval, r2, kb, pop)
+                cache_path = cache_root / _cache_key(exp_id, out_id, pval, r2, kb)
                 _write_cache(
                     cache_path,
                     {
@@ -647,7 +651,7 @@ def load_live_gwas(
                         "beta": None if not np.isfinite(beta) else beta,
                         "se": None if not np.isfinite(se) else se,
                         "n_snps": int(k),
-                        "params": {"pval": pval, "r2": r2, "kb": kb, "pop": pop},
+                        "params": {"pval": pval, "r2": r2, "kb": kb},
                         "fetched_at": time.time(),
                     },
                 )

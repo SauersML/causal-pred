@@ -1247,6 +1247,167 @@ def _augment_with_prs_nodes(
     return augmented, pid[keep], meta
 
 
+def _render_genscore_plots_async(
+    model_bundle: dict[str, Any] | None,
+    prs_df: pd.DataFrame,
+    ehr_panel: EhrPanel,
+    person_ids: np.ndarray,
+    genscore_meta: dict[str, Any],
+    logger: logging.Logger,
+) -> None:
+    """Render crosscoder figures in a background thread.
+
+    Spawns immediately after the genscore phase so the plots land on
+    disk while the rest of the pipeline (MrDAG, DAGSLAM, MCMC, GAM) is
+    still running. Failures are logged and swallowed: plotting must not
+    take down the pipeline.
+    """
+    if model_bundle is None:
+        logger.info(
+            "[genscore-plots] no cached crosscoder weights; "
+            "skipping plots this run (rerun after deleting genscore-*.npz "
+            "to populate model cache)"
+        )
+        return
+
+    import threading
+
+    def _worker() -> None:
+        try:
+            from .genscore.crosscoder import TopKCrosscoder
+            from .genscore.integrate import (
+                FeatureSelection,
+                align_panels_by_iid,
+            )
+            from .genscore.plots import (
+                GenscorePlotInputs,
+                save_all_genscore_plots,
+            )
+
+            t0 = time.time()
+            history = {
+                "step": list(genscore_meta.get("loss_history_step", [])),
+                "loss_main": list(genscore_meta.get("loss_history_main", [])),
+                "loss_aux": list(genscore_meta.get("loss_history_aux", [])),
+                "frac_dead": list(genscore_meta.get("frac_dead_history", [])),
+                "frac_active_batch": list(
+                    genscore_meta.get("frac_active_batch_history", [])
+                ),
+                "ever_active_count": list(
+                    genscore_meta.get("ever_active_count_history", [])
+                ),
+            }
+
+            model = TopKCrosscoder(
+                W_e=np.asarray(model_bundle["W_e"], dtype=np.float64),
+                b_enc=np.asarray(model_bundle["b_enc"], dtype=np.float64),
+                W_d_G=np.asarray(model_bundle["W_d_G"], dtype=np.float64),
+                W_d_E=np.asarray(model_bundle["W_d_E"], dtype=np.float64),
+                mean_G=np.asarray(model_bundle["mean_G"], dtype=np.float64),
+                std_G=np.asarray(model_bundle["std_G"], dtype=np.float64),
+                mean_E=np.asarray(model_bundle["mean_E"], dtype=np.float64),
+                std_E=np.asarray(model_bundle["std_E"], dtype=np.float64),
+                k=int(model_bundle["k"]),
+                history=history,
+            )
+
+            panels = align_panels_by_iid(person_ids, prs_df, ehr_panel)
+
+            promoted_indices = np.asarray(
+                model_bundle["promoted_indices"], dtype=int
+            )
+            promoted_names = tuple(
+                str(n) for n in genscore_meta.get("promoted_names", [])
+            )
+            promoted_genome_share = np.asarray(
+                genscore_meta.get("promoted_genome_share", []), dtype=float
+            )
+            promoted_activation_rate = np.asarray(
+                genscore_meta.get("promoted_activation_rate", []), dtype=float
+            )
+            if (
+                promoted_genome_share.size != promoted_indices.size
+                or promoted_activation_rate.size != promoted_indices.size
+                or len(promoted_names) != promoted_indices.size
+            ):
+                # Recompute on the fly from the model + panels if metadata is
+                # inconsistent (e.g. a hand-edited cache).
+                from .genscore.crosscoder import encode, feature_stream_share
+                z_full = encode(model, panels.A, panels.B)
+                rate_full = (z_full > 0).mean(axis=0)
+                rg_full = feature_stream_share(model)
+                promoted_activation_rate = rate_full[promoted_indices]
+                promoted_genome_share = rg_full[promoted_indices]
+                promoted_names = tuple(
+                    f"feat_{int(j):04d}" for j in promoted_indices
+                )
+
+            selection = FeatureSelection(
+                indices=promoted_indices,
+                names=promoted_names,
+                genome_share=promoted_genome_share,
+                activation_rate=promoted_activation_rate,
+            )
+
+            plots_dir = str(Path(DEFAULT_OUTPUT_DIR) / "plots")
+            saved = save_all_genscore_plots(
+                plots_dir,
+                GenscorePlotInputs(
+                    model=model,
+                    panels=panels,
+                    selection=selection,
+                    prs_columns=tuple(str(c) for c in prs_df.columns),
+                    ehr_columns=tuple(str(c) for c in ehr_panel.feature_names),
+                    ehr_kinds=tuple(str(k) for k in ehr_panel.feature_kinds),
+                    history=history,
+                ),
+            )
+            logger.info(
+                "[genscore-plots] wrote %d figures to %s elapsed=%.1fs",
+                len(saved),
+                plots_dir,
+                time.time() - t0,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "[genscore-plots] rendering failed: %s", exc, exc_info=True
+            )
+
+    t = threading.Thread(
+        target=_worker,
+        name="genscore-plots",
+        daemon=False,
+    )
+    t.start()
+    _BACKGROUND_PLOT_THREADS.append(t)
+    logger.info(
+        "[genscore-plots] dispatched in background while downstream phases run"
+    )
+
+
+_BACKGROUND_PLOT_THREADS: list = []
+
+
+def _join_background_plot_threads(
+    logger: logging.Logger, timeout: float = 120.0
+) -> None:
+    """Block briefly so background plot threads finish before sync/exit."""
+    for t in list(_BACKGROUND_PLOT_THREADS):
+        if t.is_alive():
+            logger.info(
+                "[genscore-plots] waiting up to %.0fs for background "
+                "plot thread %s",
+                timeout, t.name,
+            )
+            t.join(timeout=timeout)
+            if t.is_alive():
+                logger.warning(
+                    "[genscore-plots] thread %s still running after "
+                    "timeout; continuing", t.name,
+                )
+    _BACKGROUND_PLOT_THREADS.clear()
+
+
 def _load_or_run_genscore_features(
     cache: WorkspaceCache,
     data: SyntheticDataset,
@@ -1254,7 +1415,7 @@ def _load_or_run_genscore_features(
     prs_df: pd.DataFrame,
     ehr_panel: EhrPanel,
     logger: logging.Logger,
-) -> tuple[SyntheticDataset, np.ndarray, dict[str, Any]]:
+) -> tuple[SyntheticDataset, np.ndarray, dict[str, Any], dict[str, Any] | None]:
     key = _genscore_key(data, person_ids, prs_df, ehr_panel)
     filename = f"genscore-{key}.npz"
     path = cache.fetch(filename)
@@ -1272,7 +1433,21 @@ def _load_or_run_genscore_features(
                 node_types=node_types,
                 ground_truth_adj=z["ground_truth_adj"].astype(int),
             )
-            return dataset, z["person_id"].astype(str), meta
+            model_bundle: dict[str, Any] | None = None
+            if "cc_W_e" in z.files:
+                model_bundle = {
+                    "W_e": np.asarray(z["cc_W_e"]),
+                    "b_enc": np.asarray(z["cc_b_enc"]),
+                    "W_d_G": np.asarray(z["cc_W_d_G"]),
+                    "W_d_E": np.asarray(z["cc_W_d_E"]),
+                    "mean_G": np.asarray(z["cc_mean_G"]),
+                    "std_G": np.asarray(z["cc_std_G"]),
+                    "mean_E": np.asarray(z["cc_mean_E"]),
+                    "std_E": np.asarray(z["cc_std_E"]),
+                    "k": int(np.asarray(z["cc_k"]).item()),
+                    "promoted_indices": np.asarray(z["cc_promoted_indices"], dtype=int),
+                }
+            return dataset, z["person_id"].astype(str), meta, model_bundle
 
     logger.info("[genscore] training TopK crosscoder and promoting shared features")
     logger.info(
@@ -1330,6 +1505,12 @@ def _load_or_run_genscore_features(
         "loss_history_main": list(model.history["loss_main"]),
         "loss_history_aux": list(model.history["loss_aux"]),
         "frac_dead_history": list(model.history["frac_dead"]),
+        "frac_active_batch_history": list(
+            model.history.get("frac_active_batch", [])
+        ),
+        "ever_active_count_history": list(
+            model.history.get("ever_active_count", [])
+        ),
         "runtime_s": time.time() - t0,
     }
     dataset = aug_result.dataset
@@ -1343,8 +1524,30 @@ def _load_or_run_genscore_features(
         columns_json=np.array(json.dumps(list(dataset.columns))),
         node_types_json=np.array(json.dumps(list(dataset.node_types))),
         meta_json=np.array(json.dumps(_json_sanitise(meta))),
+        cc_W_e=model.W_e.astype(np.float32, copy=False),
+        cc_b_enc=model.b_enc.astype(np.float32, copy=False),
+        cc_W_d_G=model.W_d_G.astype(np.float32, copy=False),
+        cc_W_d_E=model.W_d_E.astype(np.float32, copy=False),
+        cc_mean_G=model.mean_G.astype(np.float64, copy=False),
+        cc_std_G=model.std_G.astype(np.float64, copy=False),
+        cc_mean_E=model.mean_E.astype(np.float64, copy=False),
+        cc_std_E=model.std_E.astype(np.float64, copy=False),
+        cc_k=np.asarray(int(model.k)),
+        cc_promoted_indices=sel.indices.astype(np.int64, copy=False),
     )
     cache.store(path)
+    model_bundle: dict[str, Any] | None = {
+        "W_e": np.asarray(model.W_e),
+        "b_enc": np.asarray(model.b_enc),
+        "W_d_G": np.asarray(model.W_d_G),
+        "W_d_E": np.asarray(model.W_d_E),
+        "mean_G": np.asarray(model.mean_G),
+        "std_G": np.asarray(model.std_G),
+        "mean_E": np.asarray(model.mean_E),
+        "std_E": np.asarray(model.std_E),
+        "k": int(model.k),
+        "promoted_indices": np.asarray(sel.indices, dtype=int),
+    }
 
     # ---- post-training summary --------------------------------------------
     from .genscore.crosscoder import encode, feature_stream_share
@@ -1445,7 +1648,7 @@ def _load_or_run_genscore_features(
         dataset.n,
         dataset.p,
     )
-    return dataset, aug_result.kept_person_id.astype(str), meta
+    return dataset, aug_result.kept_person_id.astype(str), meta, model_bundle
 
 
 def _mr_gwas_source() -> str:
@@ -2085,7 +2288,12 @@ def run_pipeline() -> PipelineResult:
 
     with _phase(logger, "genscore"):
         t0 = time.time()
-        data, kept_person_ids, genscore_meta = _load_or_run_genscore_features(
+        (
+            data,
+            kept_person_ids,
+            genscore_meta,
+            genscore_model_bundle,
+        ) = _load_or_run_genscore_features(
             cache,
             data,
             kept_person_ids,
@@ -2100,6 +2308,18 @@ def run_pipeline() -> PipelineResult:
             data.p,
             _format_seconds(timings["genscore"]),
         )
+
+    # Render genscore figures immediately, before any downstream phase
+    # runs. The plots land in <DEFAULT_OUTPUT_DIR>/plots/ so the user can
+    # inspect them while MrDAG / DAGSLAM / MCMC / GAM are still running.
+    _render_genscore_plots_async(
+        genscore_model_bundle,
+        prs_df,
+        ehr_panel,
+        kept_person_ids,
+        genscore_meta,
+        logger,
+    )
 
     with _phase(logger, "mrdag"):
         t0 = time.time()
@@ -2738,6 +2958,7 @@ def main() -> int:
     try:
         result = run_pipeline()
         save_result(result)
+        _join_background_plot_threads(logger)
         outdir = Path(DEFAULT_OUTPUT_DIR)
         _sync_outputs_to_workspace(outdir)
         logger.info(

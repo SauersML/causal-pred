@@ -122,7 +122,7 @@ def _configure_tiny_pipeline(monkeypatch, tmp_path):
             "base_n": int(data.n),
             "augmented_n": int(data.n),
             "ehr_feature_count": int(_ehr_panel.m),
-        }
+        }, None
 
     def _fake_survival(_cache, _key, data, _samples, _logger):
         t_grid = np.linspace(1.0, 12.0, 6)

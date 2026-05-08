@@ -115,8 +115,8 @@ def test_load_live_gwas_uses_cache_and_computes_ivw(tmp_path: Path):
         def authenticated(self) -> bool:
             return True
 
-        def fetch_tophits(self, study_id, *, pval, r2, kb, pop):
-            del pval, r2, kb, pop
+        def fetch_tophits(self, study_id, *, pval, r2, kb):
+            del pval, r2, kb
             captured_calls.append(("tophits", study_id))
             return make_hits(study_id)
 
