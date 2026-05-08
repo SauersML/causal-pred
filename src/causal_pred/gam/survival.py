@@ -156,18 +156,20 @@ def _predict_survival_matrix(
 ) -> np.ndarray:
     """Return ``(n_new, n_t)`` survival probabilities S(t | x).
 
-    The gamfit library evaluates the survival surface at each prediction
-    row's own ``exit`` time. To recover the full ``(n_new, n_t)`` curve
-    we expand the input into ``n_new * n_t`` rows -- each X repeated
-    across the ``t_grid`` with ``exit`` set to that grid point -- then
-    reshape the per-row survival probabilities back to ``(n_new, n_t)``.
+    The gamfit model returns a :class:`gamfit.SurvivalPrediction` object
+    for the requested rows. Its ``survival_at`` method evaluates each
+    row's fitted survival function on the shared output grid.
     """
     p = len(fit.columns)
     if p > 0:
         X_new = np.asarray(X_new, dtype=float).reshape(-1, p)
     else:
         X_new = np.asarray(X_new, dtype=float)
-        X_new = X_new.reshape(X_new.shape[0], 0) if X_new.ndim == 2 else X_new.reshape(0, 0)
+        X_new = (
+            X_new.reshape(X_new.shape[0], 0)
+            if X_new.ndim == 2
+            else X_new.reshape(0, 0)
+        )
     n_new = X_new.shape[0]
     t_grid = np.asarray(t_grid, dtype=float).ravel()
     n_t = t_grid.shape[0]
@@ -175,34 +177,22 @@ def _predict_survival_matrix(
     if n_new == 0 or n_t == 0:
         return np.zeros((n_new, n_t), dtype=float)
 
-    # Long format: one row per (individual, time-point) pair.
-    rep_X = (
-        np.repeat(X_new, n_t, axis=0)
-        if p > 0
-        else np.zeros((n_new * n_t, 0))
-    )
-    rep_t = np.tile(t_grid, n_new)
-    rep_entry = np.zeros_like(rep_t, dtype=float)
-    rep_event = np.ones_like(rep_t, dtype=float)
-
     df_new = pd.DataFrame(
         {
-            "entry": rep_entry,
-            "exit": rep_t,
-            "event": rep_event,
-            **{name: rep_X[:, i] for i, name in enumerate(fit.columns)},
+            "entry": np.zeros(n_new, dtype=float),
+            "exit": np.full(n_new, float(t_grid[0]), dtype=float),
+            "event": np.ones(n_new, dtype=float),
+            **{name: X_new[:, i] for i, name in enumerate(fit.columns)},
         }
     )
 
     pred = fit.model.predict(df_new)
-    surv = np.asarray(pred.survival, dtype=float)         # (n_new * n_t, 1)
-    if surv.shape != (n_new * n_t, 1):
+    S_mean = np.asarray(pred.survival_at(t_grid), dtype=float)
+    if S_mean.shape != (n_new, n_t):
         raise RuntimeError(
-            f"gamfit returned survival of shape {surv.shape}; "
-            f"expected ({n_new * n_t}, 1)"
+            f"gamfit returned survival_at of shape {S_mean.shape}; "
+            f"expected ({n_new}, {n_t})"
         )
-    S_mean = surv.reshape(n_new, n_t)
-
     # S must be non-increasing in t; enforce by left-to-right cumulative
     # minimum so floating-point noise can't violate monotonicity.
     S_mean = np.minimum.accumulate(S_mean, axis=1)
