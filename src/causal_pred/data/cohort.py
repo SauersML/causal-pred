@@ -1126,6 +1126,16 @@ CURATED_OMOP_CONDITION_IDS: Tuple[int, ...] = tuple(
     cid for _name, cid in CURATED_OMOP_CONDITION_CATALOG
 )
 
+CURATED_OMOP_MEASUREMENT_CATALOG: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("bmi", ("39156-5",)),
+    ("hba1c", ("4548-4", "17856-6")),
+    ("fasting_glucose", ("1558-6",)),
+    ("hdl_cholesterol", ("2085-9",)),
+    ("ldl_cholesterol", ("2089-1", "13457-7", "18262-6")),
+    ("triglycerides", ("2571-8",)),
+    ("systolic_bp", ("8480-6",)),
+)
+
 
 def _remote_gcloud_size(uri: str, billing_project: str) -> int:
     gc = _gcloud()
@@ -1254,6 +1264,29 @@ def _omop_cache_key(payload: dict) -> str:
     return hashlib.sha256(raw).hexdigest()[:24]
 
 
+def _sql_literal(value: str) -> str:
+    value = str(value)
+    if "'" in value:
+        raise ValueError(f"SQL literal contains quote: {value!r}")
+    return f"'{value}'"
+
+
+def _measurement_catalog_sql() -> str:
+    rows: list[str] = []
+    seen_codes: set[str] = set()
+    for lab, codes in CURATED_OMOP_MEASUREMENT_CATALOG:
+        for code in codes:
+            if code in seen_codes:
+                raise ValueError(f"duplicate measurement LOINC code in catalog: {code}")
+            seen_codes.add(code)
+            rows.append(
+                f"SELECT {_sql_literal(lab)} AS lab, {_sql_literal(code)} AS concept_code"
+            )
+    if not rows:
+        raise ValueError("CURATED_OMOP_MEASUREMENT_CATALOG is empty")
+    return "\n              UNION ALL\n              ".join(rows)
+
+
 def _read_omop_cache(path: Path, key: str) -> Optional[pd.DataFrame]:
     key_path = path.with_suffix(path.suffix + ".key")
     if path.is_file() and key_path.is_file() and key_path.read_text().strip() == key:
@@ -1281,7 +1314,6 @@ def fetch_omop_long_frames(
     workspace_prefix: str = "intermediates/causal-pred/omop",
     condition_concept_ids: Optional[Sequence[int]] = CURATED_OMOP_CONDITION_IDS,
     drug_concept_ids: Optional[Sequence[int]] = None,
-    measurement_concept_ids: Optional[Sequence[int]] = None,
     fetch_conditions: bool = True,
     fetch_drugs: bool = False,
     fetch_measurements: bool = False,
@@ -1578,21 +1610,7 @@ def fetch_omop_long_frames(
         )
 
     if fetch_measurements:
-        measurement_ids = (
-            tuple(int(x) for x in measurement_concept_ids)
-            if measurement_concept_ids is not None
-            else tuple()
-        )
-        measurement_filter = (
-            "AND measurement_concept_id IN UNNEST(@measurement_concept_ids)"
-            if measurement_ids
-            else ""
-        )
-        measurement_params: list = [person_param]
-        if measurement_ids:
-            measurement_params.append(
-                _array_param("measurement_concept_ids", measurement_ids)
-            )
+        measurement_catalog_sql = _measurement_catalog_sql()
         frames["measurement_summary"] = _query(
             "measurement_summary",
             f"""
@@ -1604,74 +1622,38 @@ def fetch_omop_long_frames(
               WHERE person_id IN UNNEST(@person_ids)
               GROUP BY person_id
             ),
-            labelled AS (
+            curated AS (
+              {measurement_catalog_sql}
+            ),
+            filtered AS (
               SELECT
-                m.person_id,
-                CASE
-                  WHEN REGEXP_CONTAINS(concept_text, r'body mass index|(^|[^a-z0-9])bmi([^a-z0-9]|$)') THEN 'bmi'
-                  WHEN REGEXP_CONTAINS(concept_text, r'a1c|hba1c|hemoglobin a1c|glycated hemoglobin') THEN 'hba1c'
-                  WHEN REGEXP_CONTAINS(concept_text, r'glucose')
-                       AND REGEXP_CONTAINS(concept_text, r'fasting|fasted') THEN 'fasting_glucose'
-                  WHEN REGEXP_CONTAINS(concept_text, r'hdl|high density lipoprotein') THEN 'hdl_cholesterol'
-                  WHEN REGEXP_CONTAINS(concept_text, r'ldl|low density lipoprotein') THEN 'ldl_cholesterol'
-                  WHEN REGEXP_CONTAINS(concept_text, r'triglyceride') THEN 'triglycerides'
-                  WHEN REGEXP_CONTAINS(concept_text, r'systolic') THEN 'systolic_bp'
-                  ELSE NULL
-                END AS lab,
+                CAST(m.person_id AS STRING) AS person_id,
+                curated.lab,
                 m.value_as_number,
-                unit_text,
                 COALESCE(CAST(m.measurement_datetime AS TIMESTAMP), TIMESTAMP(m.measurement_date)) AS datetime,
                 b.baseline_dt
-              FROM (
-                SELECT
-                  m.*,
-                  LOWER(CONCAT(
-                    COALESCE(mc.concept_name, ''), ' ',
-                    COALESCE(sc.concept_name, ''), ' ',
-                    COALESCE(m.measurement_source_value, '')
-                  )) AS concept_text,
-                  LOWER(CONCAT(
-                    COALESCE(uc.concept_name, ''), ' ',
-                    COALESCE(m.unit_source_value, '')
-                  )) AS unit_text
-                FROM `{cdr}.measurement` AS m
-                LEFT JOIN `{cdr}.concept` AS mc
-                  ON m.measurement_concept_id = mc.concept_id
-                LEFT JOIN `{cdr}.concept` AS sc
-                  ON m.measurement_source_concept_id = sc.concept_id
-                LEFT JOIN `{cdr}.concept` AS uc
-                  ON m.unit_concept_id = uc.concept_id
-                WHERE m.person_id IN UNNEST(@person_ids)
-                  AND m.value_as_number IS NOT NULL
-                  {measurement_filter}
-              ) AS m
+              FROM `{cdr}.measurement` AS m
+              JOIN `{cdr}.concept` AS concept
+                ON m.measurement_concept_id = concept.concept_id
+              JOIN curated
+                ON concept.vocabulary_id = 'LOINC'
+               AND concept.concept_code = curated.concept_code
+               AND concept.domain_id = 'Measurement'
+               AND concept.standard_concept = 'S'
               JOIN baseline AS b
                 ON m.person_id = b.person_id
+              WHERE m.person_id IN UNNEST(@person_ids)
+                AND m.value_as_number IS NOT NULL
             ),
             cleaned AS (
               SELECT
-                CAST(person_id AS STRING) AS person_id,
+                person_id,
                 lab,
-                CASE
-                  WHEN lab = 'hba1c'
-                       AND REGEXP_CONTAINS(unit_text, r'mmol/mol')
-                    THEN 0.09148 * value_as_number + 2.152
-                  WHEN lab = 'fasting_glucose'
-                       AND REGEXP_CONTAINS(unit_text, r'mmol/l|millimole')
-                    THEN value_as_number * 18.0182
-                  WHEN lab IN ('hdl_cholesterol', 'ldl_cholesterol')
-                       AND REGEXP_CONTAINS(unit_text, r'mmol/l|millimole')
-                    THEN value_as_number * 38.67
-                  WHEN lab = 'triglycerides'
-                       AND REGEXP_CONTAINS(unit_text, r'mmol/l|millimole')
-                    THEN value_as_number * 88.57
-                  ELSE value_as_number
-                END AS value_clean,
+                value_as_number AS value_clean,
                 TIMESTAMP_DIFF(datetime, baseline_dt, SECOND)
                   / (365.0 * 24.0 * 60.0 * 60.0) AS years_until_baseline
-              FROM labelled
-              WHERE lab IS NOT NULL
-                AND datetime IS NOT NULL
+              FROM filtered
+              WHERE datetime IS NOT NULL
                 AND baseline_dt IS NOT NULL
                 AND datetime < baseline_dt
                 {lookback_filter}
@@ -1704,10 +1686,13 @@ def fetch_omop_long_frames(
             FROM plausible
             GROUP BY person_id, lab
             """,
-            measurement_params,
+            [person_param],
             {
                 "table": "measurement",
-                "measurement_ids": measurement_ids,
+                "measurement_catalog": [
+                    {"lab": lab, "loinc_codes": list(codes)}
+                    for lab, codes in CURATED_OMOP_MEASUREMENT_CATALOG
+                ],
                 "aggregation": "baseline_lab_summary_by_person",
                 "lookback_days": lookback_days,
             },
@@ -1855,80 +1840,6 @@ def _lab_summary_column_names(keep_labs: Sequence[str]) -> tuple[list[str], list
     return names, kinds
 
 
-def _lab_summary(
-    long_df: pd.DataFrame,
-    person_col: str,
-    lab_col: str,
-    value_col: str,
-    datetime_col: str,
-    baseline_dt: pd.Series,
-    person_order: pd.Series,
-    min_observations: int,
-) -> Tuple[np.ndarray, list[str], list[str]]:
-    """Per-(person, lab) summary stats: mean / min / max / slope (yr^-1).
-
-    The slope is OLS of ``value`` on ``years_until_baseline`` (so a *positive*
-    slope means the lab has been rising as the person approaches baseline).
-    Persons / labs with fewer than ``min_observations`` measurements get NaN
-    in the slope; the per-lab column mean fills NaN at the end. Labs whose
-    *number of distinct participants* with any measurement is below
-    ``min_observations`` are dropped.
-    """
-    if long_df.empty:
-        return np.zeros((len(person_order), 0), dtype=np.float64), [], []
-    df = long_df.copy()
-    df[datetime_col] = pd.to_datetime(df[datetime_col], errors="coerce")
-    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
-    df = df.dropna(subset=[person_col, lab_col, value_col, datetime_col])
-    bd = baseline_dt.reindex(df[person_col]).to_numpy()
-    df["years_until_baseline"] = (
-        bd - df[datetime_col].to_numpy()
-    ) / np.timedelta64(365, "D")
-    df["years_until_baseline"] = -df["years_until_baseline"].astype(float)
-    # i.e. negative for events in the past.
-
-    lab_counts = df.groupby(lab_col)[person_col].nunique()
-    keep_labs = sorted(lab_counts[lab_counts >= min_observations].index.tolist())
-    if not keep_labs:
-        return np.zeros((len(person_order), 0), dtype=np.float64), [], []
-    df = df[df[lab_col].isin(set(keep_labs))]
-
-    idx_by_pid = {pid: i for i, pid in enumerate(person_order.tolist())}
-    col_by_lab = {lab: j for j, lab in enumerate(keep_labs)}
-    n = len(person_order)
-    m = len(keep_labs)
-
-    means = np.full((n, m), np.nan, dtype=np.float64)
-    mins = np.full((n, m), np.nan, dtype=np.float64)
-    maxs = np.full((n, m), np.nan, dtype=np.float64)
-    slopes = np.full((n, m), np.nan, dtype=np.float64)
-
-    for (pid, lab), g in df.groupby([person_col, lab_col]):
-        i = idx_by_pid.get(pid)
-        if i is None:
-            continue
-        j = col_by_lab[lab]
-        v = g[value_col].to_numpy(dtype=float)
-        means[i, j] = float(np.mean(v))
-        mins[i, j] = float(np.min(v))
-        maxs[i, j] = float(np.max(v))
-        if len(v) >= 2:
-            t = g["years_until_baseline"].to_numpy(dtype=float)
-            tc = t - t.mean()
-            denom = float(np.sum(tc * tc))
-            if denom > 1e-12:
-                slopes[i, j] = float(np.sum(tc * (v - v.mean())) / denom)
-
-    means = _impute_col_means(means)
-    mins = _impute_col_means(mins)
-    maxs = _impute_col_means(maxs)
-    slopes = _impute_col_means(slopes)
-
-    block = np.concatenate([means, mins, maxs, slopes], axis=1)
-    names, kinds = _lab_summary_column_names(keep_labs)
-    return block, names, kinds
-
-
 def _lab_summary_from_aggregates(
     summary_df: pd.DataFrame,
     person_col: str,
@@ -1996,14 +1907,12 @@ def build_ehr_panel(
     *,
     condition_long: Optional[pd.DataFrame] = None,
     drug_long: Optional[pd.DataFrame] = None,
-    measurement_long: Optional[pd.DataFrame] = None,
     measurement_summary: Optional[pd.DataFrame] = None,
     visit_long: Optional[pd.DataFrame] = None,
     person_col: str = "person_id",
     condition_group_col: str = "phecode",
     drug_group_col: str = "atc_class",
     measurement_lab_col: str = "lab",
-    measurement_value_col: str = "value",
     datetime_col: str = "datetime",
     min_prevalence: int = 50,
     min_lab_observations: int = 50,
@@ -2033,11 +1942,6 @@ def build_ehr_panel(
         Long frame of drug exposures with columns
         ``[person_col, drug_group_col, datetime_col]``. ATC level-3 is the
         canonical group; ``drug_concept_id`` works as a fallback.
-    measurement_long : DataFrame, optional
-        Long frame of lab measurements with columns
-        ``[person_col, measurement_lab_col, measurement_value_col,
-        datetime_col]``. Values must be in canonical units already (use
-        :func:`clean_measurements` upstream).
     measurement_summary : DataFrame, optional
         BigQuery-collapsed lab summaries with columns
         ``[person_col, measurement_lab_col, value_mean, value_min,
@@ -2113,27 +2017,6 @@ def build_ehr_panel(
             names.extend(lab_names)
             kinds.extend(lab_kinds)
 
-    elif measurement_long is not None and len(measurement_long):
-        mf = _filter_pre_baseline(
-            measurement_long, datetime_col, bd, lookback_days, person_col
-        )
-        mf[person_col] = mf[person_col].astype(str)
-        mf[measurement_lab_col] = mf[measurement_lab_col].astype(str)
-        block, lab_names, lab_kinds = _lab_summary(
-            mf,
-            person_col,
-            measurement_lab_col,
-            measurement_value_col,
-            datetime_col,
-            bd,
-            person_order,
-            min_observations=min_lab_observations,
-        )
-        if block.shape[1] > 0:
-            blocks.append(block)
-            names.extend(lab_names)
-            kinds.extend(lab_kinds)
-
     if visit_long is not None and len(visit_long):
         vf = _filter_pre_baseline(
             visit_long, datetime_col, bd, lookback_days, person_col
@@ -2181,6 +2064,7 @@ __all__ = [
     "AOU_GENOTYPE_FILES",
     "CURATED_OMOP_CONDITION_CATALOG",
     "CURATED_OMOP_CONDITION_IDS",
+    "CURATED_OMOP_MEASUREMENT_CATALOG",
     "fetch_omop_long_frames",
     "resolve_baseline_dt",
     "build_ehr_panel",

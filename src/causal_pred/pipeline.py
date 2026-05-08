@@ -40,6 +40,7 @@ import pandas as pd
 from .data.cohort import (
     CURATED_OMOP_CONDITION_CATALOG,
     CURATED_OMOP_CONDITION_IDS,
+    CURATED_OMOP_MEASUREMENT_CATALOG,
     EhrPanel,
     SurvivalOutcome,
     build_ehr_panel,
@@ -539,6 +540,10 @@ def _pipeline_config() -> dict[str, Any]:
                 if EHR_CONDITION_CONCEPT_IDS is None
                 else list(EHR_CONDITION_CONCEPT_IDS)
             ),
+            "measurement_catalog": [
+                {"lab": lab, "loinc_codes": list(codes)}
+                for lab, codes in CURATED_OMOP_MEASUREMENT_CATALOG
+            ],
             "min_prevalence": EHR_MIN_PREVALENCE,
             "min_lab_observations": EHR_MIN_LAB_OBSERVATIONS,
             "lookback_days": EHR_LOOKBACK_DAYS,
@@ -986,6 +991,10 @@ def _ehr_panel_key(person_ids: Sequence[str]) -> str:
                 if EHR_CONDITION_CONCEPT_IDS is None
                 else list(EHR_CONDITION_CONCEPT_IDS)
             ),
+            "measurement_catalog": [
+                {"lab": lab, "loinc_codes": list(codes)}
+                for lab, codes in CURATED_OMOP_MEASUREMENT_CATALOG
+            ],
             "min_prevalence": EHR_MIN_PREVALENCE,
             "min_lab_observations": EHR_MIN_LAB_OBSERVATIONS,
             "lookback_days": EHR_LOOKBACK_DAYS,
@@ -1053,7 +1062,6 @@ def _load_or_build_ehr_panel(
         baseline_dt=baseline_dt,
         condition_long=frames.get("condition_long"),
         drug_long=frames.get("drug_long"),
-        measurement_long=frames.get("measurement_long"),
         measurement_summary=frames.get("measurement_summary"),
         min_prevalence=EHR_MIN_PREVALENCE,
         min_lab_observations=EHR_MIN_LAB_OBSERVATIONS,
