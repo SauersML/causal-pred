@@ -531,6 +531,9 @@ def test_fetch_omop_long_frames_uploads_workspace_parquets(tmp_path, monkeypatch
             self.df = df
             self.job_id = "job-test"
 
+        def result(self):
+            return self
+
         def to_dataframe(self, **kwargs):
             assert kwargs == {"create_bqstorage_client": True}
             return self.df.copy()
@@ -628,6 +631,9 @@ def test_fetch_omop_long_frames_aggregates_conditions_before_download(
         def __init__(self, df):
             self.df = df
 
+        def result(self):
+            return self
+
         def to_dataframe(self, **kwargs):
             assert kwargs == {"create_bqstorage_client": True}
             return self.df.copy()
@@ -703,6 +709,110 @@ def test_fetch_omop_long_frames_aggregates_conditions_before_download(
     assert "MIN(COALESCE" in condition_sql
     assert "GROUP BY person_id, condition_concept_id" in condition_sql
     assert frames["condition_long"]["phecode"].tolist() == ["201820"]
+
+
+def test_fetch_omop_long_frames_aggregates_measurements_by_curated_loinc(
+    tmp_path, monkeypatch
+):
+    from causal_pred.data import cohort as cohort_mod
+
+    queries = []
+
+    class FakeJob:
+        def __init__(self, df):
+            self.df = df
+            self.job_id = "job-test"
+
+        def result(self):
+            return self
+
+        def to_dataframe(self, **kwargs):
+            assert kwargs == {"create_bqstorage_client": True}
+            return self.df.copy()
+
+    class FakeClient:
+        def query(self, sql, **_kwargs):
+            queries.append(sql)
+            if "FROM `project.dataset.measurement`" in sql:
+                return FakeJob(
+                    pd.DataFrame(
+                        {
+                            "person_id": ["101"],
+                            "lab": ["hba1c"],
+                            "value_mean": [6.2],
+                            "value_min": [5.9],
+                            "value_max": [6.5],
+                            "value_slope": [0.1],
+                            "n_measurements": [3],
+                        }
+                    )
+                )
+            if (
+                "FROM `project.dataset.visit_occurrence`" in sql
+                and "FROM `project.dataset.measurement`" not in sql
+            ):
+                return FakeJob(
+                    pd.DataFrame(
+                        {
+                            "person_id": ["101"],
+                            "baseline_dt": pd.to_datetime(["2024-01-01"]),
+                        }
+                    )
+                )
+            if "observation_period" in sql:
+                return FakeJob(
+                    pd.DataFrame(
+                        {
+                            "person_id": ["101"],
+                            "observation_start_dt": pd.to_datetime(["2023-01-01"]),
+                            "observation_end_dt": pd.to_datetime(["2025-01-01"]),
+                        }
+                    )
+                )
+            if "condition_occurrence" in sql and "t2d_dt" in sql:
+                return FakeJob(
+                    pd.DataFrame(
+                        {
+                            "person_id": ["101"],
+                            "t2d_dt": pd.to_datetime(["2024-06-01"]),
+                        }
+                    )
+                )
+            raise AssertionError(sql)
+
+    fake_bigquery = types.SimpleNamespace(
+        ArrayQueryParameter=lambda *args: args,
+        QueryJobConfig=lambda **kwargs: kwargs,
+        Client=FakeClient,
+    )
+    fake_cloud = types.ModuleType("google.cloud")
+    fake_cloud.bigquery = fake_bigquery
+    fake_google = types.ModuleType("google")
+    fake_google.cloud = fake_cloud
+    monkeypatch.setitem(sys.modules, "google", fake_google)
+    monkeypatch.setitem(sys.modules, "google.cloud", fake_cloud)
+    monkeypatch.setitem(sys.modules, "google.cloud.bigquery", fake_bigquery)
+
+    frames = cohort_mod.fetch_omop_long_frames(
+        ["101"],
+        cdr="project.dataset",
+        cache_dir=tmp_path / "omop",
+        workspace_bucket=None,
+        fetch_conditions=False,
+        fetch_measurements=True,
+        lookback_days=365 * 5,
+    )
+
+    measurement_sql = next(q for q in queries if "FROM `project.dataset.measurement`" in q)
+    assert "concept_text" not in measurement_sql
+    assert "39156-5" in measurement_sql
+    assert "4548-4" in measurement_sql
+    assert "JOIN curated" in measurement_sql
+    assert "concept.standard_concept = 'S'" in measurement_sql
+    assert "concept.domain_id = 'Measurement'" in measurement_sql
+    assert "GROUP BY person_id, lab" in measurement_sql
+    assert "TIMESTAMP_SUB(baseline_dt, INTERVAL 1825 DAY)" in measurement_sql
+    assert frames["measurement_summary"]["lab"].tolist() == ["hba1c"]
 
 
 # ---------------------------------------------------------------------------

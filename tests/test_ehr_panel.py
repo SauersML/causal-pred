@@ -1,7 +1,7 @@
 """Tests for the EHR panel builder.
 
 These tests use synthetic OMOP-shaped frames (``person_id``, group label,
-datetime; plus ``value`` for measurements) to verify:
+datetime; plus BigQuery-style lab summary rows) to verify:
 
 * baseline-strict censoring (events on or after baseline never appear),
 * prevalence filtering (rare groups are dropped),
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from causal_pred.data.cohort import EhrPanel, build_ehr_panel
 
@@ -81,7 +82,7 @@ def test_min_prevalence_filters_rare_groups():
 
 
 def test_lab_summary_slope_sign_matches_truth():
-    """Per-(person, lab) slope of value vs years-until-baseline should match."""
+    """Per-(person, lab) aggregate slopes should flow into the feature matrix."""
     rng = np.random.default_rng(0)
     n = 80
     person_ids = [f"p{i:03d}" for i in range(n)]
@@ -90,24 +91,30 @@ def test_lab_summary_slope_sign_matches_truth():
     # Half the people: rising HbA1c. Other half: falling.
     for i, p in enumerate(person_ids):
         slope_yr = +0.5 if i % 2 == 0 else -0.5
+        measurement_values = []
         for years_ago in (4, 3, 2, 1):
             value = 5.5 - slope_yr * years_ago + rng.normal(scale=0.05)
-            rows.append(
-                {
-                    "person_id": p,
-                    "lab": "hba1c",
-                    "value": value,
-                    "datetime": (
-                        pd.to_datetime("2025-01-01")
-                        - pd.Timedelta(days=int(365 * years_ago))
-                    ),
-                }
-            )
-    meas = pd.DataFrame(rows)
+            measurement_values.append(value)
+        values = np.asarray(measurement_values, dtype=float)
+        times = -np.asarray([4.0, 3.0, 2.0, 1.0], dtype=float)
+        tc = times - times.mean()
+        slope = float(np.sum(tc * (values - values.mean())) / np.sum(tc * tc))
+        rows.append(
+            {
+                "person_id": p,
+                "lab": "hba1c",
+                "value_mean": float(values.mean()),
+                "value_min": float(values.min()),
+                "value_max": float(values.max()),
+                "value_slope": slope,
+                "n_measurements": int(values.size),
+            }
+        )
+    summary = pd.DataFrame(rows)
     panel = build_ehr_panel(
         person_ids,
         baseline,
-        measurement_long=meas,
+        measurement_summary=summary,
         min_lab_observations=5,
     )
     j_slope = panel.feature_names.index("lab_slope:hba1c")

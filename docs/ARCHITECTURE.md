@@ -67,9 +67,11 @@ ground-truth DAG -- still used by tests and by historical benchmarks.
 with PMID/DOI. `polygenic.py` shells out to the `gnomon` CLI for
 scoring and HWE-PCA ancestry projection; it never reimplements scoring
 in Python. `cohort.py` is the cohort-data branch of the same loader:
-it accepts OMOP-shaped condition + measurement frames, labels rows by
-DAG node (BMI, HbA1c, HDL, LDL, triglycerides, systolic BP),
-normalises units (mmol/L -> mg/dL, mmol/mol -> NGSP %), drops
+it accepts OMOP-shaped condition + measurement frames for cohort CSV
+construction and uses a curated LOINC measurement catalog for the
+production EHR stream. The cohort builder labels rows by DAG node
+(BMI, HbA1c, HDL, LDL, triglycerides, systolic BP), normalises units
+(mmol/L -> mg/dL, mmol/mol -> NGSP %), drops
 physiologically impossible values, removes extreme outliers per-node
 via a conservative IQR rule, collapses repeated measures by median,
 and merges with a binary T2D node from the condition frame to produce
@@ -83,7 +85,9 @@ production cache is
 canonical filename from `$WORKSPACE_BUCKET/data/` via `gsutil cp`.
 `load_cohort_dataset_with_person_ids` is the production loader because the
 single pipeline aligns microarray-derived PRS and baseline-censored EHR
-features back to participant IDs before DAGSLAM -> MCMC -> GAM.
+features back to participant IDs before DAGSLAM -> MCMC -> GAM. The EHR
+measurement path is aggregated in BigQuery before download; it never pulls
+raw measurement histories for the full AoU cohort.
 
 ### `genscore/`
 Mechanistic-interpretability-style feature discovery. `crosscoder.py` learns

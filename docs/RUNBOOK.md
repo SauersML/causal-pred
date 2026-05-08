@@ -48,8 +48,9 @@ configuration changes.
 Reusable intermediates live under `data/intermediates/causal-pred/` and are
 mirrored to `$WORKSPACE_BUCKET/intermediates/causal-pred/` when the real AoU
 workspace bucket is available. This includes the cohort-aligned PRS panel,
-the raw `gnomon` `.sscore` output under `gnomon_score/`, OMOP long-frame
-parquets under `omop/`, the EHR panel, crosscoder feature matrices, DAGSLAM,
+the raw `gnomon` `.sscore` output under `gnomon_score/`, OMOP condition/drug
+long-frame parquets plus the BigQuery-aggregated curated LOINC measurement
+summary under `omop/`, the EHR panel, crosscoder feature matrices, DAGSLAM,
 MCMC, and survival GAM outputs. The PLINK genotype files are intentionally not
 uploaded or mirrored. Cache keys include the inputs and pipeline constants, so
 precomputed results are loaded only when they match the current run.
