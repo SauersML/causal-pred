@@ -22,8 +22,8 @@
 #   4. locate this checkout, or clone it into $HOME/causal-pred on a fresh workbench
 #   5. `uv sync --dev` into the repo-local .venv
 #   6. install `gnomon` if missing
-#   7. prepare/cached microarray PRS matrix via gnomon score
-#   8. run the real AoU PRS pipeline and cache small outputs in WORKSPACE_BUCKET
+#   7. run the single real pipeline; it prepares/loads cached PRS, runs
+#      MrDAG -> DAGSLAM -> MCMC, and mirrors small artefacts to WORKSPACE_BUCKET
 
 set -euo pipefail
 
@@ -101,16 +101,8 @@ if ! command -v gnomon >/dev/null 2>&1; then
 fi
 export PATH="$HOME/.local/bin:$PATH"
 
-# 6. PRS preparation ---------------------------------------------------------
-log "preparing AoU microarray PRS matrix"
-uv run python scripts/prepare_aou_prs.py
-
-# 7. pipeline ----------------------------------------------------------------
+# 6. pipeline ----------------------------------------------------------------
 log "running real AoU microarray-PRS pipeline"
 uv run python scripts/run_full_pipeline.py
-
-# 8. cache small outputs ------------------------------------------------------
-log "caching pipeline outputs in WORKSPACE_BUCKET"
-gsutil -m rsync -r outputs "$WORKSPACE_BUCKET/results/causal-pred/latest"
 
 log "done. artefacts in $REPO_DIR/outputs"
