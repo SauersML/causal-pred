@@ -500,64 +500,69 @@ def score_panel(
             raise ValueError("score_path sequence must be non-empty")
 
     def _run_panel(work_dir: Path) -> pd.DataFrame:
-        if files_to_stage is not None:
-            scores_dir = work_dir / "scores"
-            scores_dir.mkdir(parents=True, exist_ok=True)
-            for sf in files_to_stage:
-                src = Path(sf)
-                if not src.is_file():
-                    raise FileNotFoundError(f"score file does not exist: {sf}")
-                link = scores_dir / src.name
-                if link.exists():
-                    continue
-                try:
-                    os.symlink(src.resolve(), link)
-                except OSError:
-                    shutil.copy2(src, link)
-            score_arg: Path = scores_dir
-        else:
-            assert direct_score_path is not None
-            score_arg = direct_score_path
-
-        genotype_in = _materialise_genotype(genotype_path, work_dir)
-        cmd = [binary, "score", str(score_arg), str(genotype_in)]
-        started_at = time.time()
+        score_tmp: tempfile.TemporaryDirectory[str] | None = None
         try:
-            subprocess.run(
-                cmd,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
-            )
-        except subprocess.CalledProcessError as exc:
-            raise PolygenicRunError(
-                f"gnomon score (panel) failed ({' '.join(cmd)!s}):\n"
-                f"--- stdout ---\n{exc.stdout}\n"
-                f"--- stderr ---\n{exc.stderr}"
-            ) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise PolygenicRunError(
-                f"gnomon score (panel) timed out after {timeout}s"
-            ) from exc
+            if files_to_stage is not None:
+                score_tmp = tempfile.TemporaryDirectory(prefix="gnomon_scores_")
+                scores_dir = Path(score_tmp.name)
+                for sf in files_to_stage:
+                    src = Path(sf)
+                    if not src.is_file():
+                        raise FileNotFoundError(f"score file does not exist: {sf}")
+                    link = scores_dir / src.name
+                    try:
+                        os.symlink(src.resolve(), link)
+                    except OSError:
+                        shutil.copy2(src, link)
+                score_arg: Path = scores_dir
+            else:
+                assert direct_score_path is not None
+                score_arg = direct_score_path
 
-        # gnomon writes <genotype_stem>_<score_basename>.sscore in the dir
-        # that holds the staged genotype (that's our work_dir).
-        candidates = [
-            p for p in work_dir.glob("*.sscore") if p.stat().st_mtime >= started_at - 1.0
-        ]
-        if not candidates:
-            raise PolygenicRunError(
-                f"gnomon score produced no .sscore in {work_dir}"
-            )
-        # Pick the candidate whose stem starts with the genotype stem.
-        gstem = Path(genotype_in).stem
-        preferred = [c for c in candidates if c.stem.startswith(gstem)]
-        sscore = preferred[0] if preferred else candidates[0]
+            genotype_in = _materialise_genotype(genotype_path, work_dir)
+            cmd = [binary, "score", str(score_arg), str(genotype_in)]
+            started_at = time.time()
+            try:
+                subprocess.run(
+                    cmd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=env,
+                )
+            except subprocess.CalledProcessError as exc:
+                raise PolygenicRunError(
+                    f"gnomon score (panel) failed ({' '.join(cmd)!s}):\n"
+                    f"--- stdout ---\n{exc.stdout}\n"
+                    f"--- stderr ---\n{exc.stderr}"
+                ) from exc
+            except subprocess.TimeoutExpired as exc:
+                raise PolygenicRunError(
+                    f"gnomon score (panel) timed out after {timeout}s"
+                ) from exc
 
-        frame = parse_sscore(sscore)
-        return frame
+            # gnomon writes <genotype_stem>_<score_basename>.sscore in the dir
+            # that holds the staged genotype (that's our work_dir).
+            candidates = [
+                p
+                for p in work_dir.glob("*.sscore")
+                if p.stat().st_mtime >= started_at - 1.0
+            ]
+            if not candidates:
+                raise PolygenicRunError(
+                    f"gnomon score produced no .sscore in {work_dir}"
+                )
+            # Pick the candidate whose stem starts with the genotype stem.
+            gstem = Path(genotype_in).stem
+            preferred = [c for c in candidates if c.stem.startswith(gstem)]
+            sscore = preferred[0] if preferred else candidates[0]
+
+            frame = parse_sscore(sscore)
+            return frame
+        finally:
+            if score_tmp is not None:
+                score_tmp.cleanup()
 
     if out_dir is None:
         with tempfile.TemporaryDirectory(prefix="gnomon_panel_") as td:

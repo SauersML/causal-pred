@@ -65,10 +65,10 @@ def pgs_catalog_url(pgs_id: str, build: str = "GRCh38") -> str:
 
 
 def _validate_score_file(path: Path) -> None:
-    """Validate the gzip container and strict UTF-8 text payload."""
+    """Validate a decompressed PGS score file as strict UTF-8 text."""
     decoder = codecs.getincrementaldecoder("utf-8")()
     try:
-        with gzip.open(path, "rb") as fh:
+        with path.open("rb") as fh:
             while True:
                 chunk = fh.read(1 << 20)
                 if not chunk:
@@ -77,11 +77,36 @@ def _validate_score_file(path: Path) -> None:
             decoder.decode(b"", final=True)
     except (OSError, UnicodeDecodeError) as exc:
         raise _InvalidScoreFile(
-            f"{path} is not a valid gzip UTF-8 score file: {exc}"
+            f"{path} is not a valid UTF-8 score file: {exc}"
         ) from exc
 
 
-def _download_one(url: str, dst: Path, timeout: int) -> Path:
+def _decompress_score_file(src_gz: Path, dst_txt: Path) -> None:
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    try:
+        with gzip.open(src_gz, "rb") as src, dst_txt.open("wb") as dst:
+            while True:
+                chunk = src.read(1 << 20)
+                if not chunk:
+                    break
+                decoder.decode(chunk)
+                dst.write(chunk)
+            decoder.decode(b"", final=True)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _InvalidScoreFile(
+            f"{src_gz} does not contain a valid gzip UTF-8 score file: {exc}"
+        ) from exc
+
+
+def _download_one(
+    url: str,
+    dst: Path,
+    timeout: int,
+    stale_paths: Sequence[Path] = (),
+) -> Path:
+    for stale in stale_paths:
+        if stale != dst and stale.exists():
+            stale.unlink()
     if dst.is_file() and dst.stat().st_size > 0:
         try:
             _validate_score_file(dst)
@@ -89,18 +114,24 @@ def _download_one(url: str, dst: Path, timeout: int) -> Path:
         except _InvalidScoreFile:
             dst.unlink()
     dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_suffix(dst.suffix + ".part")
-    if tmp.exists():
-        tmp.unlink()
+    compressed_tmp = dst.with_suffix(dst.suffix + ".gz.part")
+    text_tmp = dst.with_suffix(dst.suffix + ".part")
+    for tmp in (compressed_tmp, text_tmp):
+        if tmp.exists():
+            tmp.unlink()
     with urllib.request.urlopen(url, timeout=timeout) as resp:
-        with open(tmp, "wb") as fh:
+        with open(compressed_tmp, "wb") as fh:
             while True:
                 chunk = resp.read(1 << 16)
                 if not chunk:
                     break
                 fh.write(chunk)
-    _validate_score_file(tmp)
-    os.replace(tmp, dst)
+    try:
+        _decompress_score_file(compressed_tmp, text_tmp)
+    finally:
+        if compressed_tmp.exists():
+            compressed_tmp.unlink()
+    os.replace(text_tmp, dst)
     return dst
 
 
@@ -113,19 +144,22 @@ def download_panel(
 ) -> List[Path]:
     """Download every PGS scoring file in ``ids`` into ``out_dir`` in parallel.
 
-    Files are named ``<pgs_id>_hmPOS_<build>.txt.gz`` so the directory is
-    consumable by :func:`causal_pred.data.polygenic.score_panel`. Existing
-    files are reused only after gzip and strict UTF-8 validation.
+    Files are downloaded from the PGS Catalog ``*.txt.gz`` endpoints but are
+    cached as decompressed ``<pgs_id>_hmPOS_<build>.txt`` files, because
+    gnomon 0.1.2 rejects the catalog gzip streams as non-UTF-8. Existing text
+    files are reused only after strict UTF-8 validation.
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    suffix = f"_hmPOS_{build}.txt.gz"
+    text_suffix = f"_hmPOS_{build}.txt"
+    gzip_suffix = f"{text_suffix}.gz"
 
     def _job(pgs_id: str) -> Path:
         return _download_one(
             pgs_catalog_url(pgs_id, build=build),
-            out / f"{pgs_id}{suffix}",
+            out / f"{pgs_id}{text_suffix}",
             timeout=timeout,
+            stale_paths=(out / f"{pgs_id}{gzip_suffix}",),
         )
 
     paths: List[Path] = []
@@ -162,7 +196,11 @@ def discover_local_panel(
     missing: List[str] = []
     for pid in ids:
         hit = next(
-            (p for p in on_disk if p.is_file() and p.name.startswith(pid)),
+            (
+                p
+                for p in on_disk
+                if p.is_file() and p.name.startswith(pid) and p.suffix == ".txt"
+            ),
             None,
         )
         if hit is None:

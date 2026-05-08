@@ -41,11 +41,13 @@ def test_pgs_catalog_url_structure():
 
 def test_discover_local_panel_finds_present_and_missing(tmp_path):
     for pid in ("PGS003725", "PGS000018"):
-        (tmp_path / f"{pid}_hmPOS_GRCh38.txt.gz").write_text("")
+        (tmp_path / f"{pid}_hmPOS_GRCh38.txt").write_text("")
+        (tmp_path / f"{pid}_hmPOS_GRCh38.gnomon.tsv").write_text("")
     found, missing = discover_local_panel(tmp_path)
     found_names = sorted(p.name for p in found)
-    assert "PGS003725_hmPOS_GRCh38.txt.gz" in found_names
-    assert "PGS000018_hmPOS_GRCh38.txt.gz" in found_names
+    assert "PGS003725_hmPOS_GRCh38.txt" in found_names
+    assert "PGS000018_hmPOS_GRCh38.txt" in found_names
+    assert "PGS003725_hmPOS_GRCh38.gnomon.tsv" not in found_names
     assert "PGS003725" not in missing
     assert len(missing) == 117 - 2
 
@@ -60,8 +62,8 @@ class _FakeResponse(io.BytesIO):
 
 
 def test_download_panel_reuses_valid_cached_file(monkeypatch, tmp_path):
-    cached = tmp_path / "PGS000892_hmPOS_GRCh38.txt.gz"
-    payload = gzip.compress(
+    cached = tmp_path / "PGS000892_hmPOS_GRCh38.txt"
+    payload = (
         b"###PGS CATALOG SCORING FILE\n"
         b"chr_name\tchr_position\teffect_allele\teffect_weight\n"
     )
@@ -79,8 +81,10 @@ def test_download_panel_reuses_valid_cached_file(monkeypatch, tmp_path):
 
 
 def test_download_panel_replaces_invalid_cached_file(monkeypatch, tmp_path):
-    cached = tmp_path / "PGS000892_hmPOS_GRCh38.txt.gz"
-    cached.write_bytes(gzip.compress(b"ok\xffbroken\n"))
+    cached = tmp_path / "PGS000892_hmPOS_GRCh38.txt"
+    stale_gzip = tmp_path / "PGS000892_hmPOS_GRCh38.txt.gz"
+    cached.write_bytes(b"ok\xffbroken\n")
+    stale_gzip.write_bytes(b"old gzip cache")
     replacement = gzip.compress(
         b"###PGS CATALOG SCORING FILE\n"
         b"chr_name\tchr_position\teffect_allele\teffect_weight\n"
@@ -95,9 +99,8 @@ def test_download_panel_replaces_invalid_cached_file(monkeypatch, tmp_path):
     paths = download_panel(tmp_path, ids=("PGS000892",), n_workers=1)
 
     assert paths == [cached]
-    assert gzip.decompress(cached.read_bytes()).decode("utf-8").startswith(
-        "###PGS CATALOG"
-    )
+    assert cached.read_text().startswith("###PGS CATALOG")
+    assert not stale_gzip.exists()
 
 
 def test_download_panel_rejects_invalid_fresh_download(monkeypatch, tmp_path):
