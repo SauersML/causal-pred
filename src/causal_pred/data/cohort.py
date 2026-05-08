@@ -1265,7 +1265,10 @@ def _write_omop_cache(path: Path, key: str, df: pd.DataFrame) -> None:
     part = path.with_suffix(path.suffix + ".part")
     df.to_parquet(part, index=False)
     os.replace(part, path)
-    path.with_suffix(path.suffix + ".key").write_text(key)
+    key_path = path.with_suffix(path.suffix + ".key")
+    key_part = key_path.with_suffix(key_path.suffix + ".part")
+    key_part.write_text(key)
+    os.replace(key_part, key_path)
 
 
 def fetch_omop_long_frames(
@@ -1278,6 +1281,7 @@ def fetch_omop_long_frames(
     condition_concept_ids: Optional[Sequence[int]] = CURATED_OMOP_CONDITION_IDS,
     drug_concept_ids: Optional[Sequence[int]] = None,
     measurement_concept_ids: Optional[Sequence[int]] = None,
+    fetch_conditions: bool = True,
     fetch_drugs: bool = False,
     fetch_measurements: bool = False,
     progress: Callable[[str], None] | None = None,
@@ -1314,6 +1318,17 @@ def fetch_omop_long_frames(
     def _array_param(name: str, values: Sequence[int]) -> bigquery.ArrayQueryParameter:
         return bigquery.ArrayQueryParameter(name, "INT64", [int(v) for v in values])
 
+    def _mirror_cache_to_workspace(name: str, path: Path) -> None:
+        if workspace_bucket is None:
+            return
+        key_path = path.with_suffix(path.suffix + ".key")
+        for src in (path, key_path):
+            uri = _bucket_prefixed_path(workspace_bucket, workspace_prefix, src.name)
+            if _gsutil_exists(uri):
+                continue
+            _emit(f"{name} workspace cache upload {uri}")
+            _gsutil_copy(str(src), uri)
+
     def _query(
         name: str,
         sql: str,
@@ -1325,6 +1340,7 @@ def fetch_omop_long_frames(
         path = cache_root / f"{name}-{key}.parquet"
         cached = _read_omop_cache(path, key)
         if cached is not None:
+            _mirror_cache_to_workspace(name, path)
             _emit(f"{name} cache hit rows={len(cached)} cols={cached.shape[1]}")
             return cached
         key_path = path.with_suffix(path.suffix + ".key")
@@ -1369,15 +1385,7 @@ def fetch_omop_long_frames(
                 )
             ) from exc
         _write_omop_cache(path, key, df)
-        if workspace_bucket is not None:
-            _gsutil_copy(
-                str(path),
-                _bucket_prefixed_path(workspace_bucket, workspace_prefix, path.name),
-            )
-            _gsutil_copy(
-                str(key_path),
-                _bucket_prefixed_path(workspace_bucket, workspace_prefix, key_path.name),
-            )
+        _mirror_cache_to_workspace(name, path)
         _emit(
             f"{name} BigQuery done rows={len(df)} cols={df.shape[1]} "
             f"elapsed={time.time() - started_at:.1f}s"
@@ -1439,38 +1447,39 @@ def fetch_omop_long_frames(
         },
     )
 
-    condition_ids = (
-        tuple(int(x) for x in condition_concept_ids)
-        if condition_concept_ids is not None
-        else tuple()
-    )
-    condition_filter = (
-        "AND condition_concept_id IN UNNEST(@condition_concept_ids)"
-        if condition_ids
-        else ""
-    )
-    condition_params: list = [person_param]
-    if condition_ids:
-        condition_params.append(_array_param("condition_concept_ids", condition_ids))
-    frames["condition_long"] = _query(
-        "condition_long",
-        f"""
-        SELECT
-          CAST(person_id AS STRING) AS person_id,
-          CAST(condition_concept_id AS STRING) AS phecode,
-          MIN(COALESCE(CAST(condition_start_datetime AS TIMESTAMP), TIMESTAMP(condition_start_date))) AS datetime
-        FROM `{cdr}.condition_occurrence`
-        WHERE person_id IN UNNEST(@person_ids)
-          {condition_filter}
-        GROUP BY person_id, condition_concept_id
-        """,
-        condition_params,
-        {
-            "table": "condition_occurrence",
-            "condition_ids": condition_ids,
-            "aggregation": "min_datetime_by_person_condition",
-        },
-    )
+    if fetch_conditions:
+        condition_ids = (
+            tuple(int(x) for x in condition_concept_ids)
+            if condition_concept_ids is not None
+            else tuple()
+        )
+        condition_filter = (
+            "AND condition_concept_id IN UNNEST(@condition_concept_ids)"
+            if condition_ids
+            else ""
+        )
+        condition_params: list = [person_param]
+        if condition_ids:
+            condition_params.append(_array_param("condition_concept_ids", condition_ids))
+        frames["condition_long"] = _query(
+            "condition_long",
+            f"""
+            SELECT
+              CAST(person_id AS STRING) AS person_id,
+              CAST(condition_concept_id AS STRING) AS phecode,
+              MIN(COALESCE(CAST(condition_start_datetime AS TIMESTAMP), TIMESTAMP(condition_start_date))) AS datetime
+            FROM `{cdr}.condition_occurrence`
+            WHERE person_id IN UNNEST(@person_ids)
+              {condition_filter}
+            GROUP BY person_id, condition_concept_id
+            """,
+            condition_params,
+            {
+                "table": "condition_occurrence",
+                "condition_ids": condition_ids,
+                "aggregation": "min_datetime_by_person_condition",
+            },
+        )
 
     if fetch_drugs:
         drug_ids = (

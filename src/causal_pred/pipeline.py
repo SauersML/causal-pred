@@ -81,7 +81,7 @@ PGS_PANEL_DIRNAME = "pgs_panel"
 GNOMON_OUT_DIRNAME = "gnomon_score"
 GENOTYPE_CACHE_DIR = str(Path.home() / "causal-pred" / "genomes")
 
-PIPELINE_CONFIG_VERSION = "2026-05-08.single-path.3"
+PIPELINE_CONFIG_VERSION = "2026-05-08.single-path.4"
 PIPELINE_SEED = 20260416
 PIPELINE_VERBOSE = False
 
@@ -243,6 +243,10 @@ class WorkspaceCache:
                 dst,
                 _path_size_mib(dst),
             )
+            uri = self.uri(filename)
+            if uri is not None and not _gsutil_exists(uri):
+                logger.info("[cache] workspace miss for local hit; mirroring %s", uri)
+                self.store(dst, filename)
             return dst
         uri = self.uri(filename)
         if uri is not None and _gsutil_exists(uri):
@@ -411,7 +415,14 @@ def _workspace_bucket() -> Optional[str]:
     return bucket or None
 
 
+def _workspace_cdr() -> Optional[str]:
+    cdr = os.environ.get("WORKSPACE_CDR", "").strip()
+    return cdr or None
+
+
 def _gsutil_exists(uri: str) -> bool:
+    if shutil.which("gsutil") is None:
+        return False
     return subprocess.run(["gsutil", "-q", "stat", uri], check=False).returncode == 0
 
 
@@ -848,6 +859,7 @@ def _survival_outcome_key(person_ids: Sequence[str]) -> str:
     return _short_hash(
         {
             "version": PIPELINE_CONFIG_VERSION,
+            "cdr": _workspace_cdr(),
             "person_ids": [str(p) for p in person_ids],
         }
     )
@@ -877,9 +889,13 @@ def _load_or_build_survival_outcome(
     logger.info("[survival] fetching OMOP follow-up frames for n=%d", len(person_ids))
     frames = fetch_omop_long_frames(
         person_ids=person_ids,
+        cdr=_workspace_cdr(),
         cache_dir=Path(DEFAULT_CACHE_DIR) / "omop",
         workspace_bucket=cache.bucket,
         workspace_prefix=f"{WORKSPACE_CACHE_PREFIX}/omop",
+        fetch_conditions=False,
+        fetch_drugs=False,
+        fetch_measurements=False,
         progress=lambda message: logger.info("[survival] %s", message),
     )
     required = ("visit_baseline", "observation_period", "t2d_event")
@@ -961,6 +977,7 @@ def _ehr_panel_key(person_ids: Sequence[str]) -> str:
     return _short_hash(
         {
             "version": PIPELINE_CONFIG_VERSION,
+            "cdr": _workspace_cdr(),
             "person_ids": [str(p) for p in person_ids],
             "fetch_drugs": EHR_FETCH_DRUGS,
             "fetch_measurements": EHR_FETCH_MEASUREMENTS,
@@ -999,6 +1016,7 @@ def _load_or_build_ehr_panel(
     )
     frames = fetch_omop_long_frames(
         person_ids=person_ids,
+        cdr=_workspace_cdr(),
         cache_dir=Path(DEFAULT_CACHE_DIR) / "omop",
         workspace_bucket=cache.bucket,
         workspace_prefix=f"{WORKSPACE_CACHE_PREFIX}/omop",

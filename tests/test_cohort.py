@@ -521,6 +521,102 @@ def test_fetch_omop_long_frames_restores_workspace_parquets(tmp_path, monkeypatc
     assert all("/intermediates/causal-pred/omop/" in uri for uri in restored_uris)
 
 
+def test_fetch_omop_long_frames_uploads_workspace_parquets(tmp_path, monkeypatch):
+    from causal_pred.data import cohort as cohort_mod
+
+    queries = []
+
+    class FakeJob:
+        def __init__(self, df):
+            self.df = df
+            self.job_id = "job-test"
+
+        def to_dataframe(self, **kwargs):
+            assert kwargs == {"create_bqstorage_client": True}
+            return self.df.copy()
+
+    class FakeClient:
+        def query(self, sql, **_kwargs):
+            queries.append(sql)
+            if "visit_occurrence" in sql:
+                return FakeJob(
+                    pd.DataFrame(
+                        {
+                            "person_id": ["101", "102"],
+                            "baseline_dt": pd.to_datetime(
+                                ["2024-01-01", "2024-02-01"]
+                            ),
+                        }
+                    )
+                )
+            if "observation_period" in sql:
+                return FakeJob(
+                    pd.DataFrame(
+                        {
+                            "person_id": ["101", "102"],
+                            "observation_start_dt": pd.to_datetime(
+                                ["2023-01-01", "2023-01-01"]
+                            ),
+                            "observation_end_dt": pd.to_datetime(
+                                ["2026-01-01", "2026-02-01"]
+                            ),
+                        }
+                    )
+                )
+            if "condition_occurrence" in sql and "t2d_dt" in sql:
+                return FakeJob(
+                    pd.DataFrame(
+                        {
+                            "person_id": ["101"],
+                            "t2d_dt": pd.to_datetime(["2025-01-01"]),
+                        }
+                    )
+                )
+            raise AssertionError(sql)
+
+    fake_bigquery = types.SimpleNamespace(
+        ArrayQueryParameter=lambda *args: args,
+        QueryJobConfig=lambda **kwargs: kwargs,
+        Client=FakeClient,
+    )
+    fake_cloud = types.ModuleType("google.cloud")
+    fake_cloud.bigquery = fake_bigquery
+    fake_google = types.ModuleType("google")
+    fake_google.cloud = fake_cloud
+    monkeypatch.setitem(sys.modules, "google", fake_google)
+    monkeypatch.setitem(sys.modules, "google.cloud", fake_cloud)
+    monkeypatch.setitem(sys.modules, "google.cloud.bigquery", fake_bigquery)
+
+    copied = []
+    monkeypatch.setattr(cohort_mod, "_gsutil_exists", lambda _uri: False)
+
+    def fake_copy(src, dst):
+        assert Path(src).is_file()
+        copied.append((Path(src).name, dst))
+
+    monkeypatch.setattr(cohort_mod, "_gsutil_copy", fake_copy)
+
+    frames = cohort_mod.fetch_omop_long_frames(
+        ["101", "102"],
+        cdr="project.dataset",
+        cache_dir=tmp_path / "omop",
+        workspace_bucket="gs://workspace",
+        workspace_prefix="intermediates/causal-pred/omop",
+        fetch_conditions=False,
+    )
+
+    assert set(frames) == {"visit_baseline", "observation_period", "t2d_event"}
+    assert not any("CAST(condition_concept_id AS STRING)" in q for q in queries)
+    assert len(copied) == 6
+    copied_names = {name for name, _dst in copied}
+    assert sum(name.endswith(".parquet") for name in copied_names) == 3
+    assert sum(name.endswith(".parquet.key") for name in copied_names) == 3
+    assert all(
+        dst.startswith("gs://workspace/intermediates/causal-pred/omop/")
+        for _name, dst in copied
+    )
+
+
 def test_fetch_omop_long_frames_aggregates_conditions_before_download(
     tmp_path, monkeypatch
 ):
