@@ -16,11 +16,13 @@ from .cohort import (
     CACHE_FILENAMES,
     CohortBuildResult,
     build_cohort_dataset,
+    discover_genotype_dir,
+    load_cohort_dataset_with_person_ids,
     load_cohort_csv,
     load_cohort_dataset,
+    resolve_aou_genotypes,
     resolve_cohort_csv,
     write_cohort_cache,
-    load_or_build_cohort,
 )
 
 __all__ = [
@@ -39,9 +41,11 @@ __all__ = [
     "CACHE_FILENAMES",
     "CohortBuildResult",
     "build_cohort_dataset",
+    "discover_genotype_dir",
     "load_cohort_csv",
     "load_cohort_dataset",
+    "load_cohort_dataset_with_person_ids",
+    "resolve_aou_genotypes",
     "resolve_cohort_csv",
     "write_cohort_cache",
-    "load_or_build_cohort",
 ]

@@ -1,51 +1,45 @@
 #!/usr/bin/env bash
-# One-shot bootstrap for the AoU Researcher Workbench.
+# One-shot real-data training bootstrap for the AoU Researcher Workbench.
+#
+# Preferred from a checkout:
+#
+#   bash causal-pred/scripts/bootstrap_aou.sh
+#
+# Fresh workbench:
 #
 #   curl -fsSL https://raw.githubusercontent.com/SauersML/causal-pred/main/scripts/bootstrap_aou.sh | bash
 #
-# Steps (each is idempotent):
-#   1. install `uv` if missing
-#   2. clone (or fast-forward) the causal-pred repo
-#   3. `uv sync --dev` to install Python deps into a private .venv
-#   4. install the `gnomon` CLI (via gnomon's install.sh) if missing
-#   5. fetch the AoU v8 microarray PLINK triple into $GENO_DIR
-#      (skipped when FETCH_GENOTYPES=0; resumes individual missing files)
-#   6. run the pipeline (skipped when RUN_PIPELINE=0)
+# Required AoU inputs:
 #
-# Overridable env-vars:
-#   REPO_DIR           where to clone (default: $HOME/causal-pred)
-#   GENO_DIR           where to cache arrays.{bed,bim,fam} (default: $REPO_DIR/genomes)
-#   FETCH_GENOTYPES    1 (default) downloads ~181 GiB; set 0 to skip
-#   RUN_PIPELINE       1 (default) runs the cohort pipeline; set 0 to skip
+#   $WORKSPACE_BUCKET/data/t2d_initial_nodes_complete.csv
+#     or $WORKSPACE_BUCKET/data/t2d_initial_nodes_complete_case.csv
+#   $GOOGLE_PROJECT for requester-pays microarray downloads
 #
-# Required env-vars (set automatically inside the AoU workbench):
-#   GOOGLE_PROJECT     billing project for the requester-pays bucket
-#   WORKSPACE_BUCKET   used by resolve_cohort_csv to fetch the cohort CSV
+# Steps:
+#   1. assert AoU workspace variables exist
+#   2. install `uv` if missing
+#   3. install a minimal stable Rust toolchain if missing (`gamfit` builds from source)
+#   4. locate this checkout, or clone it into $HOME/causal-pred on a fresh workbench
+#   5. `uv sync --dev` into the repo-local .venv
+#   6. install `gnomon` if missing
+#   7. prepare/cached microarray PRS matrix via gnomon score
+#   8. run the real AoU PRS pipeline and cache small outputs in WORKSPACE_BUCKET
 
 set -euo pipefail
 
-REPO_DIR="${REPO_DIR:-$HOME/causal-pred}"
-FETCH_GENOTYPES="${FETCH_GENOTYPES:-1}"
-RUN_PIPELINE="${RUN_PIPELINE:-1}"
-
 log() { printf '\033[1;34m[bootstrap]\033[0m %s\n' "$*"; }
-
-# If GENO_DIR is unset, reuse an existing arrays.{bed,bim,fam} triple
-# wherever we can find one (cwd, $HOME, repo root, $REPO_DIR/genomes) so
-# we don't redownload ~180 GiB. Otherwise default to $REPO_DIR/genomes.
-has_triple() {
-    [[ -s "$1/arrays.bed" && -s "$1/arrays.bim" && -s "$1/arrays.fam" ]]
+die() { printf '\033[1;31m[bootstrap]\033[0m %s\n' "$*" >&2; exit 1; }
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
-if [[ -z "${GENO_DIR:-}" ]]; then
-    for cand in "$PWD" "$HOME" "$REPO_DIR" "$REPO_DIR/genomes"; do
-        if has_triple "$cand"; then
-            GENO_DIR="$cand"
-            log "found existing arrays.{bed,bim,fam} in $GENO_DIR -- skipping download"
-            break
-        fi
-    done
-    GENO_DIR="${GENO_DIR:-$REPO_DIR/genomes}"
-fi
+
+[[ -n "${WORKSPACE_BUCKET:-}" ]] || die "WORKSPACE_BUCKET is not set; run this inside the AoU Researcher Workbench"
+[[ -n "${GOOGLE_PROJECT:-}" ]] || die "GOOGLE_PROJECT is not set; AoU microarray downloads are requester-pays"
+need_cmd curl
+need_cmd git
+need_cmd gsutil
+
+WORKSPACE_BUCKET="${WORKSPACE_BUCKET%/}"
 
 # 1. uv ----------------------------------------------------------------------
 if ! command -v uv >/dev/null 2>&1; then
@@ -54,47 +48,69 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 export PATH="$HOME/.local/bin:$PATH"
 
-# 2. repo --------------------------------------------------------------------
-if [[ -d "$REPO_DIR/.git" ]]; then
-    log "updating repo at $REPO_DIR"
-    git -C "$REPO_DIR" pull --ff-only
-else
-    log "cloning repo into $REPO_DIR"
-    git clone https://github.com/SauersML/causal-pred.git "$REPO_DIR"
+# 2. Rust --------------------------------------------------------------------
+if [[ -f "$HOME/.cargo/env" ]]; then
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
 fi
+if ! command -v rustc >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
+    log "installing stable Rust toolchain"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+elif command -v rustup >/dev/null 2>&1; then
+    log "ensuring stable Rust toolchain is active"
+    rustup default stable
+fi
+
+# 3. repo --------------------------------------------------------------------
+repo_from_script=""
+script_source="${BASH_SOURCE[0]}"
+if [[ -f "$script_source" ]]; then
+    script_dir="$(cd "$(dirname "$script_source")" && pwd)"
+    repo_candidate="$(cd "$script_dir/.." && pwd)"
+    if [[ -f "$repo_candidate/pyproject.toml" && -d "$repo_candidate/src/causal_pred" ]]; then
+        repo_from_script="$repo_candidate"
+    fi
+fi
+
+if [[ -n "$repo_from_script" ]]; then
+    REPO_DIR="$repo_from_script"
+elif [[ -f "$PWD/pyproject.toml" && -d "$PWD/src/causal_pred" ]]; then
+    REPO_DIR="$PWD"
+else
+    REPO_DIR="$HOME/causal-pred"
+    if [[ ! -d "$REPO_DIR/.git" ]]; then
+        [[ ! -e "$REPO_DIR" ]] || die "$REPO_DIR exists but is not a git checkout"
+        log "cloning repo into $REPO_DIR"
+        git clone https://github.com/SauersML/causal-pred.git "$REPO_DIR"
+    fi
+fi
+log "using repo at $REPO_DIR"
 cd "$REPO_DIR"
 
-# 3. python deps -------------------------------------------------------------
+# 4. python deps -------------------------------------------------------------
 log "uv sync --dev"
 uv sync --dev
 
-# 4. gnomon ------------------------------------------------------------------
+# 5. gnomon ------------------------------------------------------------------
 if ! command -v gnomon >/dev/null 2>&1; then
     log "installing gnomon via install.sh"
     curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
 fi
 export PATH="$HOME/.local/bin:$PATH"
 
-# 5. genotypes ---------------------------------------------------------------
-if [[ "$FETCH_GENOTYPES" == "1" ]]; then
-    if [[ -z "${GOOGLE_PROJECT:-}" ]]; then
-        log "WARNING: GOOGLE_PROJECT is not set; cannot bill the requester-pays bucket -- skipping genotype fetch"
-    else
-        log "fetching AoU v8 microarray PLINK files into $GENO_DIR (resumable)"
-        mkdir -p "$GENO_DIR"
-        GENO_DIR="$GENO_DIR" uv run python - <<'PY'
-import os
-from causal_pred.data.cohort import resolve_aou_genotypes
-bed = resolve_aou_genotypes(cache_dir=os.environ["GENO_DIR"])
-print(f"genotypes ready: {bed}")
-PY
-    fi
-fi
+# 6. PRS preparation ---------------------------------------------------------
+log "preparing AoU microarray PRS matrix"
+uv run python scripts/prepare_aou_prs.py
 
-# 6. pipeline ----------------------------------------------------------------
-if [[ "$RUN_PIPELINE" == "1" ]]; then
-    log "running pipeline"
-    uv run python scripts/run_full_pipeline.py
-fi
+# 7. pipeline ----------------------------------------------------------------
+log "running real AoU microarray-PRS pipeline"
+uv run python scripts/run_full_pipeline.py
+
+# 8. cache small outputs ------------------------------------------------------
+log "caching pipeline outputs in WORKSPACE_BUCKET"
+gsutil -m rsync -r outputs "$WORKSPACE_BUCKET/results/causal-pred/latest"
 
 log "done. artefacts in $REPO_DIR/outputs"

@@ -17,21 +17,26 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import pandas as pd
 
-from .data.cohort import EhrPanel, load_cohort_dataset, resolve_cohort_csv
+from .data.cohort import load_cohort_dataset_with_person_ids, resolve_cohort_csv
 from .data.synthetic import SyntheticDataset
 from .dagslam import run_dagslam
 from .mcmc import run_structure_mcmc
 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DEFAULT_CACHE_DIR = os.path.join(REPO_ROOT, "data")
 DEFAULT_OUTPUT_DIR = os.path.join(REPO_ROOT, "outputs")
+DEFAULT_PRS_PATH = os.path.join(DEFAULT_CACHE_DIR, "aou_prs_panel.csv.gz")
 
 THRESHOLD_DEFAULT = 0.5
 
@@ -75,6 +80,136 @@ def _setup_logger(verbose: bool) -> logging.Logger:
     return logger
 
 
+def _read_prs_panel(path: str | os.PathLike) -> pd.DataFrame:
+    """Read the cached AoU PRS panel written by ``prepare_aou_prs.py``."""
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"PRS panel not found: {p}")
+    df = pd.read_csv(p, dtype={0: "string"})
+    index_col = "person_id" if "person_id" in df.columns else df.columns[0]
+    out = df.set_index(index_col)
+    out.index = out.index.astype(str)
+    for col in out.columns:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    if out.shape[1] == 0:
+        raise ValueError(f"PRS panel {p} has no score columns")
+    return out
+
+
+def _prs_node_name(original: str, used: set[str]) -> str:
+    stem = re.sub(r"[^0-9A-Za-z]+", "_", str(original)).strip("_").lower()
+    if not stem:
+        stem = "score"
+    if not stem.startswith("pgs_"):
+        stem = f"pgs_{stem}"
+    stem = stem[:48].rstrip("_")
+    name = stem
+    i = 2
+    while name in used:
+        suffix = f"_{i}"
+        name = f"{stem[:48 - len(suffix)]}{suffix}"
+        i += 1
+    used.add(name)
+    return name
+
+
+def _augment_with_prs_nodes(
+    data: SyntheticDataset,
+    person_ids: Sequence[str],
+    prs_df: pd.DataFrame,
+    *,
+    n_prs_nodes: int,
+    max_missing: float,
+) -> tuple[SyntheticDataset, np.ndarray, Dict[str, Any]]:
+    """Append selected microarray-derived PRS columns as continuous DAG nodes."""
+    if n_prs_nodes <= 0:
+        raise ValueError("n_prs_nodes must be positive when a PRS panel is supplied")
+    if not 0.0 <= max_missing < 1.0:
+        raise ValueError("max_missing must be in [0, 1)")
+    if len(person_ids) != data.n:
+        raise ValueError(
+            f"person_ids has length {len(person_ids)} but dataset has {data.n} rows"
+        )
+    pid = np.asarray([str(p) for p in person_ids])
+    aligned = prs_df.reindex(pid)
+
+    candidates: list[tuple[float, str, np.ndarray]] = []
+    for col in aligned.columns:
+        vals = pd.to_numeric(aligned[col], errors="coerce").to_numpy(dtype=float)
+        finite = np.isfinite(vals)
+        present_rate = float(finite.mean())
+        if present_rate < 1.0 - max_missing:
+            continue
+        if int(finite.sum()) < 100:
+            continue
+        v = vals[finite]
+        sd = float(v.std(ddof=0))
+        if sd == 0.0:
+            continue
+        candidates.append((present_rate, str(col), vals))
+
+    if not candidates:
+        raise ValueError(
+            "no PRS columns have enough non-missing, non-constant data after "
+            "alignment with the cohort"
+        )
+
+    chosen = candidates[: min(n_prs_nodes, len(candidates))]
+
+    keep = np.ones(data.n, dtype=bool)
+    for _present, _col, vals in chosen:
+        keep &= np.isfinite(vals)
+    if int(keep.sum()) < 100:
+        raise ValueError(
+            f"only {int(keep.sum())} rows have complete selected PRS values"
+        )
+
+    prs_cols = []
+    original_names = []
+    present_rates = []
+    used_names = set(data.columns)
+    for present, col, vals in chosen:
+        raw = vals[keep].astype(float)
+        sd = float(raw.std(ddof=0))
+        if sd == 0.0:
+            raise ValueError(f"selected PRS column became constant after row filter: {col}")
+        prs_cols.append((raw - float(raw.mean())) / sd)
+        original_names.append(col)
+        present_rates.append(present)
+
+    X_keep = data.X[keep]
+    X_prs = np.column_stack(prs_cols).astype(np.float64, copy=False)
+    X_aug = np.concatenate([X_keep, X_prs], axis=1)
+    prs_names = tuple(_prs_node_name(c, used_names) for c in original_names)
+    p_old = data.p
+    p_new = X_aug.shape[1]
+    gt = np.zeros((p_new, p_new), dtype=int)
+    if data.ground_truth_adj.size:
+        gt[:p_old, :p_old] = data.ground_truth_adj
+
+    augmented = SyntheticDataset(
+        X=X_aug,
+        time=data.time[keep].copy(),
+        event=data.event[keep].copy(),
+        columns=tuple(data.columns) + prs_names,
+        node_types=tuple(data.node_types) + ("continuous",) * len(prs_names),
+        ground_truth_adj=gt,
+    )
+    meta = {
+        "prs_rows_before_alignment": int(data.n),
+        "prs_rows_after_alignment": int(keep.sum()),
+        "prs_columns_available": int(prs_df.shape[1]),
+        "prs_columns_selected": int(len(prs_names)),
+        "prs_original_names": original_names,
+        "prs_node_names": list(prs_names),
+        "prs_present_rate": present_rates,
+        "prs_max_missing": float(max_missing),
+        "prs_selection_rule": "first_complete_nonconstant_scores_from_curated_panel",
+    }
+    return augmented, pid[keep], meta
+
+
+
 # ---------------------------------------------------------------------------
 # Top-level runner
 # ---------------------------------------------------------------------------
@@ -91,29 +226,19 @@ def run_pipeline(
     mcmc_thin: int = 10,
     mcmc_chains: int = 4,
     threshold: float = THRESHOLD_DEFAULT,
-    cache_dir: str = ".",
+    cache_dir: str = DEFAULT_CACHE_DIR,
     bucket: Optional[str] = None,
     cohort_name: str = "complete",
-    *,
-    base_person_ids: Optional[Sequence[str]] = None,
-    prs_panel: Optional[Any] = None,  # pandas.DataFrame; typed Any to avoid an import cycle
-    ehr_panel: Optional[EhrPanel] = None,
-    crosscoder_kwargs: Optional[Dict[str, Any]] = None,
-    n_promote: int = 32,
-    genome_share_min: float = 0.2,
-    genome_share_max: float = 0.8,
-    min_activation_rate: float = 0.01,
+    prs_path: str = DEFAULT_PRS_PATH,
+    n_prs_nodes: int = 8,
+    prs_max_missing: float = 0.2,
 ) -> PipelineResult:
-    """Cohort CSV -> [optional crosscoder augmentation] -> DAGSLAM -> structure MCMC.
+    """Cohort CSV + cached AoU microarray PRS -> DAGSLAM -> structure MCMC.
 
-    The crosscoder stage runs only when **all three** of ``base_person_ids``,
-    ``prs_panel``, and ``ehr_panel`` are supplied. When it runs, it trains a
-    TopK crosscoder on the aligned (genome, EHR) panels, promotes a small
-    number of cross-modal features (default 32), appends them as new
-    continuous DAG nodes, and re-uses the same downstream stack to recover
-    edges *between* those features and the cohort columns. The promotion
-    rule is structural (cross-modal coherence + activation rate); no
-    auto-interp is performed.
+    ``scripts/prepare_aou_prs.py`` must run first. It scores the AoU
+    microarray PLINK files with gnomon and writes ``prs_path``. This function
+    appends the first complete, non-constant PRS columns from the curated panel
+    as continuous DAG nodes before structure learning.
     """
     logger = _setup_logger(verbose)
     rng = np.random.default_rng(seed)
@@ -125,7 +250,7 @@ def run_pipeline(
     csv_path = resolve_cohort_csv(
         name=cohort_name, cache_dir=cache_dir, bucket=bucket
     )
-    data: SyntheticDataset = load_cohort_dataset(str(csv_path))
+    data, person_ids = load_cohort_dataset_with_person_ids(str(csv_path))
     timings["data"] = time.time() - t0
     logger.info(
         "[data] path=%s n=%d p=%d columns=%s",
@@ -135,59 +260,26 @@ def run_pipeline(
         list(data.columns),
     )
 
-    # -- (optional) crosscoder augmentation ---------------------------
-    if (
-        base_person_ids is not None
-        and prs_panel is not None
-        and ehr_panel is not None
-    ):
-        # Local import keeps top-level pipeline module free of pandas at
-        # import time when the augmentation path is not used.
-        from .genscore.integrate import run_genscore
-
-        t0 = time.time()
-        aug_result, model = run_genscore(
-            base_dataset=data,
-            base_person_ids=base_person_ids,
-            prs_df=prs_panel,
-            ehr_panel=ehr_panel,
-            n_promote=n_promote,
-            genome_share_min=genome_share_min,
-            genome_share_max=genome_share_max,
-            min_activation_rate=min_activation_rate,
-            crosscoder_kwargs=crosscoder_kwargs,
-            rng=rng,
-        )
-        timings["crosscoder"] = time.time() - t0
-
-        sel = aug_result.feature_selection
-        logger.info(
-            "[crosscoder] d=%d k=%d promoted=%d base_n=%d augmented_n=%d "
-            "loss_main_init=%.4f loss_main_final=%.4f frac_dead_final=%.3f",
-            model.d,
-            model.k,
-            int(sel.indices.size),
-            aug_result.base_n,
-            aug_result.augmented_n,
-            float(model.history["loss_main"][0]) if model.history["loss_main"] else float("nan"),
-            float(model.history["loss_main"][-1]) if model.history["loss_main"] else float("nan"),
-            float(model.history["frac_dead"][-1]) if model.history["frac_dead"] else float("nan"),
-        )
-        genscore_features = {
-            "crosscoder_d": int(model.d),
-            "crosscoder_k": int(model.k),
-            "promoted_indices": sel.indices.tolist(),
-            "promoted_names": list(sel.names),
-            "promoted_genome_share": sel.genome_share.tolist(),
-            "promoted_activation_rate": sel.activation_rate.tolist(),
-            "base_n": int(aug_result.base_n),
-            "augmented_n": int(aug_result.augmented_n),
-            "loss_history_step": list(model.history["step"]),
-            "loss_history_main": list(model.history["loss_main"]),
-            "loss_history_aux": list(model.history["loss_aux"]),
-            "frac_dead_history": list(model.history["frac_dead"]),
-        }
-        data = aug_result.dataset
+    # -- microarray-derived PRS nodes --------------------------------
+    t0 = time.time()
+    prs_df = _read_prs_panel(prs_path)
+    data, _kept_person_ids, prs_meta = _augment_with_prs_nodes(
+        data,
+        person_ids,
+        prs_df,
+        n_prs_nodes=n_prs_nodes,
+        max_missing=prs_max_missing,
+    )
+    timings["prs"] = time.time() - t0
+    genscore_features.update({"prs_path": str(prs_path), **prs_meta})
+    logger.info(
+        "[prs] path=%s selected=%d n=%d p=%d nodes=%s",
+        prs_path,
+        int(prs_meta["prs_columns_selected"]),
+        data.n,
+        data.p,
+        prs_meta["prs_node_names"],
+    )
 
     # -- dagslam ------------------------------------------------------
     t0 = time.time()

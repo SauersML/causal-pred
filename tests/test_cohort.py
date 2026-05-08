@@ -319,7 +319,7 @@ def test_load_cohort_csv_rejects_unrelated_csv(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Caching: local-first lookup, build-on-miss, alias filenames
+# Caching: local-first lookup, build-on-miss, notebook filename variants
 # ---------------------------------------------------------------------------
 
 
@@ -330,8 +330,7 @@ def test_resolve_cohort_csv_local_hit(tmp_path):
     assert resolved == p
 
 
-def test_resolve_cohort_csv_accepts_alias_filename(tmp_path):
-    # Older notebooks wrote `_complete_case.csv`. The resolver must accept it.
+def test_resolve_cohort_csv_accepts_complete_case_notebook_name(tmp_path):
     p = tmp_path / "t2d_initial_nodes_complete_case.csv"
     p.write_text("type2_diabetes,bmi\n1,30\n")
     resolved = resolve_cohort_csv(name="complete", cache_dir=tmp_path, bucket=None)

@@ -56,13 +56,13 @@ before touching more than one module.
 
 ### `data/`
 Ingest layer. There is one data-loading entry point used by
-`pipeline.run_pipeline`: it dispatches on the `data_source` argument
-to either the synthetic generator or the cohort CSV loader, but each
-returns the same `SyntheticDataset` shape so downstream stages have a
-single contract. `synthetic.py` generates an AoU-shaped matrix with a
-known ground-truth DAG -- still used by tests and by historical
-benchmarks. `nodes.py` is the single source of truth for the synthetic
-schema's `NODE_NAMES` (length 18) and the parallel `node_types` tuple.
+`pipeline.run_pipeline`: the real complete-case cohort CSV loader. It
+returns the same `SyntheticDataset` shape used by the downstream stages, so
+tests can still exercise synthetic matrices without changing the production
+path. `synthetic.py` generates an AoU-shaped matrix with a known
+ground-truth DAG -- still used by tests and by historical benchmarks.
+`nodes.py` is the single source of truth for the synthetic schema's
+`NODE_NAMES` (length 18) and the parallel `node_types` tuple.
 `real_gwas.py` holds literature-derived IVW beta / SE / SNP-count cells
 with PMID/DOI. `polygenic.py` shells out to the `gnomon` CLI for
 scoring and HWE-PCA ancestry projection; it never reimplements scoring
@@ -73,11 +73,11 @@ normalises units (mmol/L -> mg/dL, mmol/mol -> NGSP %), drops
 physiologically impossible values, removes extreme outliers per-node
 via a conservative IQR rule, collapses repeated measures by median,
 and merges with a binary T2D node from the condition frame to produce
-a 7-node wide CSV. A two-tier cache (`resolve_cohort_csv`: local dir
-first, then `$WORKSPACE_BUCKET/data/` via `gsutil cp`) skips the build
-when the CSVs are already on disk or in the bucket; `load_cohort_dataset`
-returns a `SyntheticDataset` ready to flow through MrDAG -> DAGSLAM ->
-MCMC -> GAM.
+a 7-node wide CSV. The production cache is `data/t2d_initial_nodes_complete.csv`;
+`resolve_cohort_csv` checks that local file first, then copies the same
+canonical filename from `$WORKSPACE_BUCKET/data/` via `gsutil cp`.
+`load_cohort_dataset` returns a `SyntheticDataset` ready to flow through
+DAGSLAM -> MCMC.
 
 ### `mrdag/`
 Produces an edge-inclusion posterior matrix `pi` of shape `(p, p)` from
