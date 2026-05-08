@@ -130,9 +130,9 @@ def test_predict_shape(small_data):
 # ---------------------------------------------------------------------------
 
 
-def test_bma_weights(small_data):
+def test_bma_weights(small_data, monkeypatch):
     from causal_pred.data.nodes import NODE_INDEX
-    from causal_pred.gam.survival import bma_survival
+    import causal_pred.gam.survival as survival_mod
 
     d = small_data
     # Cap rows to respect the laptop budget.
@@ -148,7 +148,27 @@ def test_bma_weights(small_data):
     t_grid = np.array([2.0, 5.0, 10.0])
     X_eval = X_full[:10]
 
-    out = bma_survival(
+    class _FixedSurvivalFit:
+        def __init__(self, offset: float, n_samples: int):
+            self.offset = float(offset)
+            self.n_samples = int(n_samples)
+
+        def predict_survival(self, X_new, t_grid):
+            row_term = (
+                np.arange(X_new.shape[0], dtype=float).reshape(-1, 1) * 0.001
+            )
+            time_term = np.asarray(t_grid, dtype=float).reshape(1, -1) * 0.01
+            mean = 0.9 - self.offset - row_term - time_term
+            return np.repeat(mean[None, :, :], self.n_samples, axis=0)
+
+    def _fixed_fit(_time, _event, _X, columns, **kwargs):
+        offsets = {("BMI", "HbA1c"): 0.0, ("ancestry_PC1",): 0.2}
+        n_samples = kwargs["n_samples"]
+        return _FixedSurvivalFit(offsets[tuple(columns)], n_samples)
+
+    monkeypatch.setattr(survival_mod, "fit_survival_gam", _fixed_fit)
+
+    out = survival_mod.bma_survival(
         parent_sets,
         weights,
         time,

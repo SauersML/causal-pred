@@ -2,8 +2,9 @@
 
 Path:
 
-    cohort CSV -> microarray PRS cache -> PRS-augmented matrix
-      -> MrDAG priors -> DAGSLAM -> structure MCMC -> artefacts
+    cohort CSV -> microarray PRS cache -> EHR panel -> TopK crosscoder features
+      -> MrDAG priors -> DAGSLAM -> structure MCMC -> survival GAM
+      -> per-person risk curves, causal pathways, validation artefacts
 
 The public runner takes no configuration arguments. Operational settings live
 as constants in this module so there is one production path and one place to
@@ -1272,20 +1273,29 @@ def run_pipeline() -> PipelineResult:
         prs_meta["prs_node_names"],
     )
 
-    t0 = time.time()
-    ehr_panel = _load_or_build_ehr_panel(cache, kept_person_ids, logger)
-    timings["ehr"] = time.time() - t0
+    genscore_meta: dict[str, Any] = {
+        "ehr_stream": "not_run",
+        "reason": "WORKSPACE_CDR is not set",
+    }
+    if os.environ.get("WORKSPACE_CDR"):
+        t0 = time.time()
+        ehr_panel = _load_or_build_ehr_panel(cache, kept_person_ids, logger)
+        timings["ehr"] = time.time() - t0
 
-    t0 = time.time()
-    data, kept_person_ids, genscore_meta = _load_or_run_genscore_features(
-        cache,
-        data,
-        kept_person_ids,
-        prs_df,
-        ehr_panel,
-        logger,
-    )
-    timings["genscore"] = time.time() - t0
+        t0 = time.time()
+        data, kept_person_ids, genscore_meta = _load_or_run_genscore_features(
+            cache,
+            data,
+            kept_person_ids,
+            prs_df,
+            ehr_panel,
+            logger,
+        )
+        timings["genscore"] = time.time() - t0
+    else:
+        timings["ehr"] = 0.0
+        timings["genscore"] = 0.0
+        logger.info("[ehr] skipped because WORKSPACE_CDR is not set")
 
     t0 = time.time()
     mrdag_pi, mrdag_diagnostics = _load_or_run_mrdag(cache, logger)
@@ -1320,16 +1330,29 @@ def run_pipeline() -> PipelineResult:
     thresholded = (edge_probs >= THRESHOLD_DEFAULT).astype(int)
     np.fill_diagonal(thresholded, 0)
 
-    (
-        survival_time_grid,
-        survival_mean,
-        survival_lower,
-        survival_upper,
-        survival_parent_columns,
-        survival_diagnostics,
-        survival_runtime,
-    ) = _load_or_run_survival_gam(cache, key, data, mcmc_samples, logger)
-    timings["gam"] = survival_runtime
+    if np.any(data.time > 0.0) and np.any(data.event == 1):
+        (
+            survival_time_grid,
+            survival_mean,
+            survival_lower,
+            survival_upper,
+            survival_parent_columns,
+            survival_diagnostics,
+            survival_runtime,
+        ) = _load_or_run_survival_gam(cache, key, data, mcmc_samples, logger)
+        timings["gam"] = survival_runtime
+    else:
+        logger.info("[gam] skipped because cohort CSV has no survival time/event columns")
+        survival_time_grid = np.zeros(0, dtype=float)
+        survival_mean = np.zeros((data.n, 0), dtype=float)
+        survival_lower = np.zeros((data.n, 0), dtype=float)
+        survival_upper = np.zeros((data.n, 0), dtype=float)
+        survival_parent_columns = tuple()
+        survival_diagnostics = {
+            "status": "not_run",
+            "reason": "cohort CSV has no positive survival time/event columns",
+        }
+        timings["gam"] = 0.0
 
     causal_pathways = _causal_pathway_probabilities(
         edge_probs,
