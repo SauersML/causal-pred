@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Sequence
+from .data.nodes import CANONICAL_EDGES, NODE_INDEX, NODE_NAMES
 
 import numpy as np
 import pandas as pd
@@ -856,11 +857,11 @@ def _mrdag_prior_for_data(mrdag_pi: np.ndarray, columns: Sequence[str]) -> np.nd
     np.fill_diagonal(prior, np.nan)
     return prior
 
-
 def _load_or_run_dagslam(
     cache: WorkspaceCache,
     key: str,
     data: SyntheticDataset,
+    pi_prior: np.ndarray,
     logger: logging.Logger,
 ) -> dict[str, Any]:
     filename = f"dagslam-{key}.npz"
@@ -878,13 +879,14 @@ def _load_or_run_dagslam(
     logger.info("[dagslam] running hill-climb")
     t0 = time.time()
     result = run_dagslam(
-        data=data.X,
-        node_types=data.node_types,
-        max_parents=DAGSLAM_MAX_PARENTS,
-        max_iter=DAGSLAM_MAX_ITER,
-        restarts=DAGSLAM_RESTARTS,
-        rng=np.random.default_rng(PIPELINE_SEED + 2),
-        verbose=PIPELINE_VERBOSE,
+    data=data.X,
+    node_types=data.node_types,
+    max_parents=DAGSLAM_MAX_PARENTS,
+    max_iter=DAGSLAM_MAX_ITER,
+    restarts=DAGSLAM_RESTARTS,
+    rng=np.random.default_rng(PIPELINE_SEED + 2),
+    verbose=PIPELINE_VERBOSE,
+    pi_prior=pi_prior,
     )
     runtime_s = time.time() - t0
     _atomic_npz(
@@ -1303,7 +1305,7 @@ def run_pipeline() -> PipelineResult:
     timings["mrdag"] = time.time() - t0
 
     key = _run_key(data, mrdag_prior)
-    dagslam = _load_or_run_dagslam(cache, key, data, logger)
+    dagslam = _load_or_run_dagslam(cache, key, data,mrdag_prior, logger)
     timings["dagslam"] = float(dagslam["runtime_s"])
     logger.info(
         "[dagslam] log_score=%.3f n_edges=%d",
@@ -1327,8 +1329,7 @@ def run_pipeline() -> PipelineResult:
         float(mcmc_diagnostics.get("min_ess", float("nan"))),
     )
 
-    thresholded = (edge_probs >= THRESHOLD_DEFAULT).astype(int)
-    np.fill_diagonal(thresholded, 0)
+    thresholded = _acyclic_threshold_from_edge_probs(edge_probs, THRESHOLD_DEFAULT)
 
     if np.any(data.time > 0.0) and np.any(data.event == 1):
         (
@@ -1418,6 +1419,57 @@ def _adj_to_edge_list(
                 rows.append((parent, child))
     return rows
 
+def _is_reachable_local(adj: np.ndarray, src: int, dst: int) -> bool:
+    if src == dst:
+        return True
+    p = adj.shape[0]
+    seen = np.zeros(p, dtype=bool)
+    stack = [int(src)]
+    seen[src] = True
+
+    while stack:
+        u = stack.pop()
+        for v in np.flatnonzero(adj[u]):
+            v = int(v)
+            if v == dst:
+                return True
+            if not seen[v]:
+                seen[v] = True
+                stack.append(v)
+
+    return False
+
+# fix thresold graph issue
+def _acyclic_threshold_from_edge_probs(
+    edge_probs: np.ndarray,
+    threshold: float,
+) -> np.ndarray:
+    """
+    Build a high probability DAG by adding edges greedily.
+
+    Edges are considered from highest posterior probability to lowest.
+    An edge is added only if it is above threshold and does not create a cycle.
+    """
+    p = edge_probs.shape[0]
+    adj = np.zeros((p, p), dtype=int)
+
+    candidates = []
+    for i in range(p):
+        for j in range(p):
+            if i == j:
+                continue
+            prob = float(edge_probs[i, j])
+            if np.isfinite(prob) and prob >= threshold:
+                candidates.append((prob, i, j))
+
+    candidates.sort(reverse=True)
+
+    for prob, i, j in candidates:
+        # Adding i -> j creates a cycle iff j can already reach i.
+        if not _is_reachable_local(adj, j, i):
+            adj[i, j] = 1
+
+    return adj
 
 def _edge_prob_long(
     edge_probs: np.ndarray, columns: Sequence[str]
@@ -1447,6 +1499,20 @@ def save_result(
     np.save(paths["mrdag_pi"], result.mrdag_pi)
     paths["mrdag_prior"] = str(out / "mrdag_prior.npy")
     np.save(paths["mrdag_prior"], result.mrdag_prior)
+    paths["mrdag_pi_long_csv"] = str(out / "mrdag_pi_long.csv")
+    with open(paths["mrdag_pi_long_csv"], "w") as fh:
+        fh.write("parent,child,mrdag_pi\n")
+        for i, parent in enumerate(NODE_NAMES):
+            for j, child in enumerate(NODE_NAMES):
+                if i == j:
+                    continue
+                fh.write(f"{parent},{child},{float(result.mrdag_pi[i, j])}\n")
+
+    paths["mrdag_prior_long_csv"] = str(out / "mrdag_prior_long.csv")
+    with open(paths["mrdag_prior_long_csv"], "w") as fh:
+        fh.write("parent,child,mrdag_prior\n")
+        for parent, child, prob in _edge_prob_long(result.mrdag_prior, columns):
+            fh.write(f"{parent},{child},{prob}\n")
     paths["dagslam_adjacency"] = str(out / "dagslam_adjacency.npy")
     np.save(paths["dagslam_adjacency"], result.dagslam_adjacency)
     paths["mcmc_edge_probs"] = str(out / "mcmc_edge_probs.npy")
