@@ -20,7 +20,7 @@
 #   2. install `uv` if missing
 #   3. install a minimal stable Rust toolchain if missing (`gamfit` builds from source)
 #   4. locate this checkout, or clone it into $HOME/causal-pred on a fresh workbench
-#   5. `uv sync --dev` into the repo-local .venv
+#   5. `uv sync --locked --dev` into the repo-local .venv
 #   6. install `gnomon` if missing
 #   7. run the single real pipeline; it prepares/loads cached PRS, builds
 #      EHR crosscoder features, runs MrDAG -> DAGSLAM -> MCMC -> GAM, and
@@ -92,8 +92,8 @@ log "using repo at $REPO_DIR"
 cd "$REPO_DIR"
 
 # 4. python deps -------------------------------------------------------------
-log "uv sync --dev"
-uv sync --dev
+log "uv sync --locked --dev"
+uv sync --locked --dev
 
 # 5. gnomon ------------------------------------------------------------------
 if ! command -v gnomon >/dev/null 2>&1; then
