@@ -97,26 +97,31 @@ def gnomon_available() -> bool:
     return True
 
 
-def _run(cmd: Sequence[str], timeout: int) -> subprocess.CompletedProcess:
-    """Run ``cmd`` with ``check=True`` and surface stderr on failure."""
+def _run(
+    cmd: Sequence[str],
+    timeout: int,
+    *,
+    env: Mapping[str, str] | None = None,
+    label: str = "gnomon invocation",
+) -> subprocess.CompletedProcess:
+    """Run gnomon with stdout/stderr inherited by the caller's terminal."""
+    print(f"[gnomon] {' '.join(cmd)}", flush=True)
     try:
-        return subprocess.run(
+        proc = subprocess.run(
             list(cmd),
-            check=True,
-            capture_output=True,
-            text=True,
+            check=False,
             timeout=timeout,
+            env=env,
         )
-    except subprocess.CalledProcessError as exc:
-        raise PolygenicRunError(
-            f"gnomon invocation failed ({' '.join(cmd)!s}):\n"
-            f"--- stdout ---\n{exc.stdout}\n"
-            f"--- stderr ---\n{exc.stderr}"
-        ) from exc
     except subprocess.TimeoutExpired as exc:
         raise PolygenicRunError(
-            f"gnomon invocation timed out after {timeout}s ({' '.join(cmd)!s})"
+            f"{label} timed out after {timeout}s: {' '.join(cmd)!s}"
         ) from exc
+    if proc.returncode != 0:
+        raise PolygenicRunError(
+            f"{label} failed with exit code {proc.returncode}: {' '.join(cmd)!s}"
+        )
+    return proc
 
 
 def _materialise_genotype(src: str, dst_dir: Path) -> Path:
@@ -366,25 +371,7 @@ def score_cohort(
     def _score_one(score_file: str, work_dir: Path) -> pd.DataFrame:
         genotype_in = _materialise_genotype(genotype_path, work_dir)
         cmd = [binary, "score", str(score_file), str(genotype_in)]
-        try:
-            subprocess.run(
-                cmd,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
-            )
-        except subprocess.CalledProcessError as exc:
-            raise PolygenicRunError(
-                f"gnomon score failed for {score_file}:\n"
-                f"--- stdout ---\n{exc.stdout}\n"
-                f"--- stderr ---\n{exc.stderr}"
-            ) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise PolygenicRunError(
-                f"gnomon score timed out after {timeout}s for {score_file}"
-            ) from exc
+        _run(cmd, timeout, env=env, label=f"gnomon score for {score_file}")
 
         # gnomon writes `<genotype_stem>.sscore` in work_dir.
         stem = Path(genotype_in).stem
@@ -522,25 +509,7 @@ def score_panel(
             genotype_in = _materialise_genotype(genotype_path, work_dir)
             cmd = [binary, "score", str(score_arg), str(genotype_in)]
             started_at = time.time()
-            try:
-                subprocess.run(
-                    cmd,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    env=env,
-                )
-            except subprocess.CalledProcessError as exc:
-                raise PolygenicRunError(
-                    f"gnomon score (panel) failed ({' '.join(cmd)!s}):\n"
-                    f"--- stdout ---\n{exc.stdout}\n"
-                    f"--- stderr ---\n{exc.stderr}"
-                ) from exc
-            except subprocess.TimeoutExpired as exc:
-                raise PolygenicRunError(
-                    f"gnomon score (panel) timed out after {timeout}s"
-                ) from exc
+            _run(cmd, timeout, env=env, label="gnomon score panel")
 
             # gnomon writes <genotype_stem>_<score_basename>.sscore in the dir
             # that holds the staged genotype (that's our work_dir).
