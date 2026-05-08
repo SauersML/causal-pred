@@ -1,9 +1,8 @@
 """Unit tests for the OpenGWAS two-sample MR fetcher.
 
-These tests do not hit the network: ``fetch_tophits`` and
-``fetch_associations`` are monkey-patched to return canned payloads
-so the harmonisation + IVW math + caching layer can be exercised
-deterministically.
+These tests do not hit the network: ``load_live_gwas`` receives fake
+OpenGWAS clients that return canned payloads so the harmonisation + IVW
+math + caching layer can be exercised deterministically.
 """
 
 from __future__ import annotations
@@ -86,11 +85,7 @@ def test_harmonise_drops_incompatible_alleles():
     assert pairs == []
 
 
-def test_load_live_gwas_uses_cache_and_computes_ivw(monkeypatch, tmp_path: Path):
-    # Provide a fake JWT so the loader takes the live path.
-    monkeypatch.setenv("OPENGWAS_JWT", "fake-token-for-test")
-    monkeypatch.delenv("MR_GWAS_SOURCE", raising=False)
-
+def test_load_live_gwas_uses_cache_and_computes_ivw(tmp_path: Path):
     rng = np.random.default_rng(42)
 
     def make_hits(study_id: str) -> list[dict]:
@@ -113,24 +108,38 @@ def test_load_live_gwas_uses_cache_and_computes_ivw(monkeypatch, tmp_path: Path)
             })
         return out
 
-    captured_calls: list[tuple[str, str]] = []
+    captured_calls: list[tuple[str, object]] = []
 
-    def fake_tophits(study_id, *, pval, r2, kb, pop):
-        captured_calls.append(("tophits", study_id))
-        return make_hits(study_id)
+    class FakeClient:
+        @property
+        def authenticated(self) -> bool:
+            return True
+
+        def fetch_tophits(self, study_id, *, pval, r2, kb, pop):
+            del pval, r2, kb, pop
+            captured_calls.append(("tophits", study_id))
+            return make_hits(study_id)
+
+        def fetch_associations_by_study(
+            self,
+            study_ids,
+            rsids,
+            *,
+            max_workers=4,
+        ):
+            del max_workers
+            captured_calls.append(("assocs", tuple(sorted(study_ids))))
+            return {
+                sid: make_assocs(sid, list(rsids), scale_per_outcome[sid])
+                for sid in study_ids
+            }
 
     # We map outcome_id -> scale so we know what IVW should return.
     scale_per_outcome = {opengwas.OPENGWAS_STUDY_IDS[t]: float(i + 1)
                          for i, t in enumerate(opengwas.OPENGWAS_STUDY_IDS)}
+    client = FakeClient()
 
-    def fake_assocs(study_id, rsids):
-        captured_calls.append(("assocs", study_id))
-        return make_assocs(study_id, list(rsids), scale_per_outcome[study_id])
-
-    monkeypatch.setattr(opengwas, "fetch_tophits", fake_tophits)
-    monkeypatch.setattr(opengwas, "fetch_associations", fake_assocs)
-
-    summary = opengwas.load_live_gwas(cache_dir=tmp_path)
+    summary = opengwas.load_live_gwas(client=client, cache_dir=tmp_path)
 
     # We should have at least one usable cell (BMI -> T2D, etc.).
     usable = np.isfinite(summary.betas) & np.isfinite(summary.ses)
@@ -150,24 +159,26 @@ def test_load_live_gwas_uses_cache_and_computes_ivw(monkeypatch, tmp_path: Path)
 
     # Second call should be served entirely from cache.
     captured_calls.clear()
-    summary2 = opengwas.load_live_gwas(cache_dir=tmp_path)
+    summary2 = opengwas.load_live_gwas(client=client, cache_dir=tmp_path)
     assert captured_calls == [], (
         f"second call should be all-cache, but hit network: {captured_calls}"
     )
     np.testing.assert_allclose(summary.betas, summary2.betas, equal_nan=True)
 
 
-def test_no_jwt_yields_all_nan_summary(monkeypatch, tmp_path: Path):
-    monkeypatch.delenv("OPENGWAS_JWT", raising=False)
-    monkeypatch.setenv("MR_GWAS_SOURCE", "live")
+def test_no_jwt_yields_all_nan_summary(tmp_path: Path):
+    class NoTokenClient:
+        @property
+        def authenticated(self) -> bool:
+            return False
 
-    def boom(*args, **kwargs):
-        raise AssertionError("network should not be hit when JWT is missing")
+        def fetch_tophits(self, *args, **kwargs):
+            raise AssertionError("network should not be hit when client has no token")
 
-    monkeypatch.setattr(opengwas, "fetch_tophits", boom)
-    monkeypatch.setattr(opengwas, "fetch_associations", boom)
+        def fetch_associations_by_study(self, *args, **kwargs):
+            raise AssertionError("network should not be hit when client has no token")
 
-    summary = opengwas.load_live_gwas(cache_dir=tmp_path)
+    summary = opengwas.load_live_gwas(client=NoTokenClient(), cache_dir=tmp_path)
     assert not np.any(np.isfinite(summary.betas))
 
 

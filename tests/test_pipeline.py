@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -248,6 +249,46 @@ def test_pipeline_determinism(tmp_path, monkeypatch):
     r2 = pipeline.run_pipeline()
     np.testing.assert_allclose(r1.mcmc_edge_probs, r2.mcmc_edge_probs, atol=1e-12)
     np.testing.assert_array_equal(r1.dagslam_adjacency, r2.dagslam_adjacency)
+
+
+def test_dagslam_receives_mrdag_prior(tmp_path, monkeypatch):
+    from causal_pred import pipeline
+    from causal_pred.data.synthetic import SyntheticDataset
+
+    data = SyntheticDataset(
+        X=np.arange(20, dtype=float).reshape(10, 2),
+        time=np.linspace(1.0, 10.0, 10),
+        event=np.array([0, 1] * 5),
+        columns=("bmi", "type2_diabetes"),
+        node_types=("continuous", "binary"),
+        ground_truth_adj=np.zeros((2, 2), dtype=int),
+    )
+    pi_prior = np.array([[np.nan, 0.95], [0.05, np.nan]], dtype=float)
+    captured = {}
+
+    def fake_run_dagslam(**kwargs):
+        captured["pi_prior"] = np.asarray(kwargs["pi_prior"], dtype=float)
+        return SimpleNamespace(
+            adjacency=np.array([[0, 1], [0, 0]], dtype=int),
+            log_score=12.0,
+            n_edges=1,
+        )
+
+    monkeypatch.setattr(pipeline, "run_dagslam", fake_run_dagslam)
+    cache = pipeline.WorkspaceCache(tmp_path, None)
+
+    result = pipeline._load_or_run_dagslam(
+        cache,
+        "prior-wiring",
+        data,
+        pi_prior,
+        logging.getLogger("test-dagslam-prior"),
+    )
+
+    np.testing.assert_allclose(captured["pi_prior"], pi_prior, equal_nan=True)
+    assert result["n_edges"] == 1
+    with np.load(cache.path("dagslam-prior-wiring.npz"), allow_pickle=False) as z:
+        np.testing.assert_allclose(z["pi_prior"], pi_prior, equal_nan=True)
 
 
 def test_pipeline_builds_survival_outcome_when_csv_lacks_time_event(tmp_path, monkeypatch):

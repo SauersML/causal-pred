@@ -1451,14 +1451,16 @@ def _load_or_run_genscore_features(
 def _mr_gwas_source() -> str:
     """Pick the MR-prior source.
 
-    ``MR_GWAS_SOURCE=live`` (default when ``OPENGWAS_JWT`` is set) runs
-    live two-sample IVW via ``load_live_gwas``.  ``MR_GWAS_SOURCE=literature``
-    forces the hand-coded ``load_real_gwas`` fallback.
+    Default is ``live`` -- the OpenGWAS two-sample IVW path, which
+    serves committed-to-repo cache files under ``data/mr_cache/`` and
+    only hits the network when (a) a cell is uncached AND (b)
+    ``OPENGWAS_JWT`` is set.  ``MR_GWAS_SOURCE=literature`` forces the
+    hand-coded fallback table in ``data/real_gwas.py``.
     """
     explicit = os.environ.get("MR_GWAS_SOURCE", "").strip().lower()
     if explicit in {"live", "literature"}:
         return explicit
-    return "live" if os.environ.get("OPENGWAS_JWT", "").strip() else "literature"
+    return "live"
 
 
 def _mrdag_cache_key() -> str:
@@ -1634,6 +1636,7 @@ def _load_or_run_dagslam(
         log_score=np.array(float(result.log_score)),
         n_edges=np.array(int(result.n_edges)),
         runtime_s=np.array(runtime_s),
+        pi_prior=np.asarray(pi_prior, dtype=float),
     )
     cache.store(path)
     return {
@@ -1874,6 +1877,11 @@ def _load_or_run_survival_gam(
             columns=cols,
             n_samples=GAM_N_SAMPLES,
             rng=np.random.default_rng(PIPELINE_SEED + 20),
+            progress=lambda message, cols=cols: logger.info(
+                "[gamfit] parents=%s %s",
+                ",".join(cols) if cols else "(intercept)",
+                message,
+            ),
         )
         draws = fit.predict_survival(X, t_grid)
         mean = draws.mean(axis=0)

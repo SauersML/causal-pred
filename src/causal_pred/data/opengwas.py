@@ -14,10 +14,10 @@ programmatic fetch + IVW pipeline:
    ``w_j = b_x^2 / se_y^2`` and ``SE = 1 / sqrt(sum(w_j))``.
 
 Results are cached to disk (one JSON per exposure+outcome pair) so
-repeat runs do not re-hit the API.  Authentication is via the
-``OPENGWAS_JWT`` environment variable; without a token the fetcher
-returns a result with NaN cells (the MrDAG pipeline already treats
-NaN as "no MR information").
+repeat runs do not re-hit the API.  Authentication is carried by an
+``OpenGWASClient``; the default client reads ``OPENGWAS_JWT``.  Without
+a token the fetcher returns a result with NaN cells (the MrDAG pipeline
+already treats NaN as "no MR information").
 
 Curated study IDs
 -----------------
@@ -73,7 +73,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 
@@ -132,116 +132,167 @@ PALINDROMIC = {("A", "T"), ("T", "A"), ("C", "G"), ("G", "C")}
 PALINDROME_MAF_BAND = (0.42, 0.58)
 
 
-def _jwt() -> Optional[str]:
-    token = os.environ.get("OPENGWAS_JWT", "").strip()
-    if token:
-        return token
-    home_token = Path.home() / ".opengwas_jwt"
-    if home_token.is_file():
-        try:
-            return home_token.read_text(encoding="utf-8").strip() or None
-        except OSError:
-            return None
-    return None
-
-
-def _post(
-    path: str,
-    body: dict,
-    *,
-    timeout: float = 60.0,
-    retries: int = 3,
-) -> Any:
-    """POST JSON to the OpenGWAS API; retry transient 5xx and 429."""
-    token = _jwt()
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    data = json.dumps(body).encode("utf-8")
-    url = f"{OPENGWAS_BASE}{path}"
-
-    last_err: Optional[Exception] = None
-    for attempt in range(retries):
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            if exc.code in (429, 502, 503, 504) and attempt + 1 < retries:
-                time.sleep(2.0 ** attempt)
-                last_err = exc
-                continue
-            if exc.code == 401:
-                raise RuntimeError(
-                    "OpenGWAS request rejected (401). Set OPENGWAS_JWT to a valid "
-                    "token from https://opengwas.io/profile/."
-                ) from exc
-            raise
-        except urllib.error.URLError as exc:
-            if attempt + 1 < retries:
-                time.sleep(2.0 ** attempt)
-                last_err = exc
-                continue
-            raise
-    if last_err is not None:
-        raise last_err
-    raise RuntimeError(f"OpenGWAS POST {path} failed without an exception")
-
-
-def fetch_tophits(
-    study_id: str,
-    *,
-    pval: float = DEFAULT_PVAL,
-    r2: float = DEFAULT_R2,
-    kb: int = DEFAULT_KB,
-    pop: str = "EUR",
-) -> list[dict]:
-    """Server-side LD-clumped tophits for one exposure GWAS."""
-    body = {
-        "id": study_id,
-        "pval": pval,
-        "r2": r2,
-        "kb": kb,
-        "preclumped": 0,
-        "clump": 1,
-        "force_server": 0,
-        "pop": pop,
-    }
-    out = _post("/tophits", body)
-    if not isinstance(out, list):
-        raise RuntimeError(f"OpenGWAS /tophits returned non-list for {study_id}: {out!r}")
-    return out
-
-
 ASSOCS_BATCH_SIZE = 50
 
 
-def fetch_associations(
-    study_id: str,
-    rsids: Sequence[str],
-) -> list[dict]:
-    """Per-SNP outcome associations.
+class OpenGWASClientLike(Protocol):
+    @property
+    def authenticated(self) -> bool:
+        ...
 
-    Batches rsids in groups of ``ASSOCS_BATCH_SIZE`` (the OpenGWAS
-    /associations endpoint rejects 400 BAD REQUEST when a single
-    request carries too many variants).  Empty input returns an empty
-    list without hitting the API.
-    """
-    rsids = list(rsids)
-    if not rsids:
-        return []
-    out: list[dict] = []
-    for start in range(0, len(rsids), ASSOCS_BATCH_SIZE):
-        chunk = rsids[start:start + ASSOCS_BATCH_SIZE]
-        body = {"id": [study_id], "variant": chunk}
-        resp = _post("/associations", body)
-        if not isinstance(resp, list):
+    def fetch_tophits(
+        self,
+        study_id: str,
+        *,
+        pval: float = DEFAULT_PVAL,
+        r2: float = DEFAULT_R2,
+        kb: int = DEFAULT_KB,
+        pop: str = "EUR",
+    ) -> list[dict]:
+        ...
+
+    def fetch_associations_by_study(
+        self,
+        study_ids: Sequence[str],
+        rsids: Sequence[str],
+        *,
+        max_workers: int = 4,
+    ) -> dict[str, list[dict]]:
+        ...
+
+
+@dataclass(frozen=True)
+class OpenGWASClient:
+    """Small OpenGWAS REST client used by ``load_live_gwas``."""
+
+    token: Optional[str]
+    base_url: str = OPENGWAS_BASE
+    timeout: float = 60.0
+    retries: int = 3
+
+    @classmethod
+    def from_environment(cls) -> "OpenGWASClient":
+        token = os.environ.get("OPENGWAS_JWT", "").strip() or None
+        return cls(token=token)
+
+    @property
+    def authenticated(self) -> bool:
+        return bool(self.token)
+
+    def _post(self, path: str, body: dict) -> Any:
+        """POST JSON to the OpenGWAS API; retry transient 5xx and 429."""
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        data = json.dumps(body).encode("utf-8")
+        url = f"{self.base_url}{path}"
+
+        last_err: Optional[Exception] = None
+        for attempt in range(self.retries):
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                if exc.code in (429, 502, 503, 504) and attempt + 1 < self.retries:
+                    time.sleep(2.0 ** attempt)
+                    last_err = exc
+                    continue
+                if exc.code == 401:
+                    raise RuntimeError(
+                        "OpenGWAS request rejected (401). Set OPENGWAS_JWT to a valid "
+                        "token from https://opengwas.io/profile/."
+                    ) from exc
+                raise
+            except urllib.error.URLError as exc:
+                if attempt + 1 < self.retries:
+                    time.sleep(2.0 ** attempt)
+                    last_err = exc
+                    continue
+                raise
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError(f"OpenGWAS POST {path} failed without an exception")
+
+    def fetch_tophits(
+        self,
+        study_id: str,
+        *,
+        pval: float = DEFAULT_PVAL,
+        r2: float = DEFAULT_R2,
+        kb: int = DEFAULT_KB,
+        pop: str = "EUR",
+    ) -> list[dict]:
+        """Server-side LD-clumped tophits for one exposure GWAS."""
+        body = {
+            "id": study_id,
+            "pval": pval,
+            "r2": r2,
+            "kb": kb,
+            "preclumped": 0,
+            "clump": 1,
+            "force_server": 0,
+            "pop": pop,
+        }
+        out = self._post("/tophits", body)
+        if not isinstance(out, list):
             raise RuntimeError(
-                f"OpenGWAS /associations returned non-list for {study_id} "
-                f"chunk {start}: {resp!r}"
+                f"OpenGWAS /tophits returned non-list for {study_id}: {out!r}"
             )
-        out.extend(resp)
-    return out
+        return out
+
+    def fetch_associations(
+        self,
+        study_id: str,
+        rsids: Sequence[str],
+    ) -> list[dict]:
+        """Per-SNP outcome associations for one outcome GWAS."""
+        rsids = list(rsids)
+        if not rsids:
+            return []
+        out: list[dict] = []
+        for start in range(0, len(rsids), ASSOCS_BATCH_SIZE):
+            chunk = rsids[start:start + ASSOCS_BATCH_SIZE]
+            body = {"id": [study_id], "variant": chunk}
+            resp = self._post("/associations", body)
+            if not isinstance(resp, list):
+                raise RuntimeError(
+                    f"OpenGWAS /associations returned non-list for {study_id} "
+                    f"chunk {start}: {resp!r}"
+                )
+            out.extend(resp)
+        return out
+
+    def fetch_associations_by_study(
+        self,
+        study_ids: Sequence[str],
+        rsids: Sequence[str],
+        *,
+        max_workers: int = 4,
+    ) -> dict[str, list[dict]]:
+        """Per-SNP associations for many outcome studies."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        rsids = list(rsids)
+        study_ids = list(dict.fromkeys(study_ids))
+        out: dict[str, list[dict]] = {sid: [] for sid in study_ids}
+        if not rsids or not study_ids:
+            return out
+
+        if max_workers <= 1 or len(study_ids) == 1:
+            for sid in study_ids:
+                out[sid] = self.fetch_associations(sid, rsids)
+            return out
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(self.fetch_associations, sid, rsids): sid
+                for sid in study_ids
+            }
+            for fut in as_completed(futures):
+                sid = futures[fut]
+                out[sid] = fut.result()
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +446,7 @@ def _per_exposure_tophits_cache_key(study_id: str, pval: float, r2: float, kb: i
 
 def _load_or_fetch_tophits(
     cache_dir: Path,
+    client: OpenGWASClientLike,
     study_id: str,
     pval: float,
     r2: float,
@@ -405,41 +457,16 @@ def _load_or_fetch_tophits(
     cached = _read_cache(path)
     if cached is not None and isinstance(cached.get("tophits"), list):
         return cached["tophits"]
-    hits = fetch_tophits(study_id, pval=pval, r2=r2, kb=kb, pop=pop)
+    hits = client.fetch_tophits(study_id, pval=pval, r2=r2, kb=kb, pop=pop)
     _write_cache(path, {"study_id": study_id, "tophits": hits, "fetched_at": time.time()})
     return hits
-
-
-def _load_or_fetch_assocs(
-    cache_dir: Path,
-    study_id: str,
-    rsids: Sequence[str],
-) -> list[dict]:
-    if not rsids:
-        return []
-    sig = json.dumps(sorted(rsids))
-    digest = abs(hash(sig)) % (10 ** 12)
-    path = cache_dir / f"{CACHE_VERSION}__assocs__{study_id}__{digest}.json"
-    cached = _read_cache(path)
-    if cached is not None and isinstance(cached.get("assocs"), list) and cached.get("rsid_sig") == sig:
-        return cached["assocs"]
-    assocs = fetch_associations(study_id, rsids)
-    _write_cache(
-        path,
-        {
-            "study_id": study_id,
-            "rsid_sig": sig,
-            "assocs": assocs,
-            "fetched_at": time.time(),
-        },
-    )
-    return assocs
 
 
 def load_live_gwas(
     exposures: Sequence[str] = MR_EXPOSURES,
     outcomes: Sequence[str] = MR_OUTCOMES,
     *,
+    client: Optional[OpenGWASClientLike] = None,
     cache_dir: Optional[Path] = None,
     pval: float = DEFAULT_PVAL,
     r2: float = DEFAULT_R2,
@@ -452,14 +479,15 @@ def load_live_gwas(
 
     Returns a ``RealGWASSummary`` (NaN for unavailable cells) so the
     MrDAG pipeline can consume it interchangeably with the hand-coded
-    table.  When ``OPENGWAS_JWT`` is not set, every cell ends up NaN
-    and the function logs a single warning rather than raising.
+    table.  When the client has no token, uncached cells end up NaN and
+    the function logs warnings rather than raising.
     """
     from scipy.stats import norm
 
     exposures = tuple(exposures)
     outcomes = tuple(outcomes)
     n_exp, n_out = len(exposures), len(outcomes)
+    client = OpenGWASClient.from_environment() if client is None else client
 
     cache_root = Path(cache_dir) if cache_dir is not None else (
         Path.home() / "causal-pred" / "data" / "mr_cache"
@@ -473,26 +501,39 @@ def load_live_gwas(
     per_pair: list[_PerPair] = []
     circular = set(CIRCULAR_PAIRS) if drop_circular else set()
 
-    if not _jwt():
-        logger.warning(
-            "[opengwas] OPENGWAS_JWT not set; returning NaN cells. "
-            "Get a token at https://opengwas.io/profile/"
-        )
-
+    # Tophits: always try the on-disk cache first.  Live fetch only
+    # fires when both (a) the cache is missing AND (b) a JWT is set.
+    have_token = bool(client.authenticated)
     tophits_by_exposure: Dict[str, list[dict]] = {}
     for exp in exposures:
         exp_id = OPENGWAS_STUDY_IDS.get(exp)
-        if exp_id is None or not _jwt():
+        if exp_id is None:
+            continue
+        cache_path = cache_root / _per_exposure_tophits_cache_key(
+            exp_id, pval, r2, kb, pop
+        )
+        cached = _read_cache(cache_path)
+        if cached is not None and isinstance(cached.get("tophits"), list):
+            tophits_by_exposure[exp] = cached["tophits"]
+            logger.info(
+                "[opengwas] tophits cache hit %s (%s): n=%d",
+                exp, exp_id, len(tophits_by_exposure[exp]),
+            )
+            continue
+        if not have_token:
+            logger.warning(
+                "[opengwas] no tophits cache for %s (%s) and no OPENGWAS_JWT; "
+                "skipping (set token at https://opengwas.io/profile/ to refresh)",
+                exp, exp_id,
+            )
             continue
         try:
             tophits_by_exposure[exp] = _load_or_fetch_tophits(
-                cache_root, exp_id, pval, r2, kb, pop
+                cache_root, client, exp_id, pval, r2, kb, pop
             )
             logger.info(
-                "[opengwas] tophits %s (%s): n=%d",
-                exp,
-                exp_id,
-                len(tophits_by_exposure[exp]),
+                "[opengwas] tophits fetched %s (%s): n=%d",
+                exp, exp_id, len(tophits_by_exposure[exp]),
             )
         except Exception as exc:
             if raise_on_error:
@@ -503,59 +544,99 @@ def load_live_gwas(
 
     for i, exp in enumerate(exposures):
         exp_id = OPENGWAS_STUDY_IDS.get(exp)
-        row_max_n = 0
-        for j, out in enumerate(outcomes):
+        hits = tophits_by_exposure.get(exp, []) if exp_id else []
+        rsids: list[str] = (
+            [h["rsid"] for h in hits if isinstance(h.get("rsid"), str) and h["rsid"]]
+            if hits
+            else []
+        )
+        # Pass 1: enumerate every (exposure, outcome) target, classify
+        # each as cached / circular / no_id / needs_fetch.
+        per_pair_results: dict[str, dict] = {}
+        outcomes_to_fetch: list[str] = []
+        for out in outcomes:
             if exp == out:
                 continue
             out_id = OPENGWAS_STUDY_IDS.get(out)
             if (exp, out) in circular:
-                _emit(per_pair, _PerPair(exp, out, exp_id or "", out_id or "",
-                                          float("nan"), float("nan"), 0,
-                                          source="circular"))
+                per_pair_results[out] = {
+                    "exp_id": exp_id or "", "out_id": out_id or "",
+                    "beta": float("nan"), "se": float("nan"), "n_snps": 0,
+                    "source": "circular", "note": "",
+                }
                 continue
             if not exp_id or not out_id:
-                _emit(per_pair, _PerPair(exp, out, exp_id or "", out_id or "",
-                                          float("nan"), float("nan"), 0,
-                                          source="no_id",
-                                          note="missing exposure or outcome study id"))
+                per_pair_results[out] = {
+                    "exp_id": exp_id or "", "out_id": out_id or "",
+                    "beta": float("nan"), "se": float("nan"), "n_snps": 0,
+                    "source": "no_id",
+                    "note": "missing exposure or outcome study id",
+                }
                 continue
-            hits = tophits_by_exposure.get(exp, [])
             if not hits:
-                _emit(per_pair, _PerPair(exp, out, exp_id, out_id,
-                                          float("nan"), float("nan"), 0,
-                                          source="no_id",
-                                          note="no tophits for exposure"))
+                per_pair_results[out] = {
+                    "exp_id": exp_id, "out_id": out_id,
+                    "beta": float("nan"), "se": float("nan"), "n_snps": 0,
+                    "source": "no_id", "note": "no tophits for exposure",
+                }
                 continue
             cache_path = cache_root / _cache_key(exp_id, out_id, pval, r2, kb, pop)
             cached = _read_cache(cache_path)
             if cached is not None and "beta" in cached and "se" in cached:
                 beta = float(cached["beta"]) if cached["beta"] is not None else float("nan")
                 se = float(cached["se"]) if cached["se"] is not None else float("nan")
-                k = int(cached.get("n_snps", 0))
-                src = "cache"
-                note = cached.get("note", "")
-            else:
-                rsids = [
-                    h["rsid"]
-                    for h in hits
-                    if isinstance(h.get("rsid"), str) and h["rsid"]
-                ]
-                try:
-                    assocs = _load_or_fetch_assocs(cache_root, out_id, rsids)
-                except Exception as exc:
-                    if raise_on_error:
-                        raise
-                    logger.warning(
-                        "[opengwas] assocs FAILED for %s in %s: %s", exp, out_id, exc
-                    )
-                    _emit(per_pair, _PerPair(exp, out, exp_id, out_id,
-                                              float("nan"), float("nan"), 0,
-                                              source="error", note=str(exc)))
-                    continue
+                per_pair_results[out] = {
+                    "exp_id": exp_id, "out_id": out_id,
+                    "beta": beta, "se": se,
+                    "n_snps": int(cached.get("n_snps", 0)),
+                    "source": "cache", "note": cached.get("note", ""),
+                }
+                continue
+            # Needs fetch.
+            outcomes_to_fetch.append(out)
+
+        # Pass 2: fetch any uncached outcomes via fan-out single-id calls
+        # (one thread per outcome study).  Skipped silently when no JWT
+        # is available so the loader can still serve cached pairs.
+        if outcomes_to_fetch and not have_token:
+            for out in outcomes_to_fetch:
+                out_id = OPENGWAS_STUDY_IDS[out]
+                per_pair_results[out] = {
+                    "exp_id": exp_id, "out_id": out_id,
+                    "beta": float("nan"), "se": float("nan"), "n_snps": 0,
+                    "source": "no_id", "note": "uncached and OPENGWAS_JWT unset",
+                }
+            outcomes_to_fetch = []
+        if outcomes_to_fetch and rsids and exp_id:
+            study_ids_to_fetch = [OPENGWAS_STUDY_IDS[o] for o in outcomes_to_fetch]
+            try:
+                assocs_by_id = client.fetch_associations_by_study(
+                    study_ids_to_fetch,
+                    rsids,
+                )
+            except Exception as exc:
+                if raise_on_error:
+                    raise
+                logger.warning(
+                    "[opengwas] multi-assocs FAILED for %s: %s", exp, exc
+                )
+                assocs_by_id = {sid: [] for sid in study_ids_to_fetch}
+                err = str(exc)
+                for out in outcomes_to_fetch:
+                    out_id = OPENGWAS_STUDY_IDS[out]
+                    per_pair_results[out] = {
+                        "exp_id": exp_id, "out_id": out_id,
+                        "beta": float("nan"), "se": float("nan"), "n_snps": 0,
+                        "source": "error", "note": err,
+                    }
+                outcomes_to_fetch = []
+
+            for out in outcomes_to_fetch:
+                out_id = OPENGWAS_STUDY_IDS[out]
+                assocs = assocs_by_id.get(out_id, [])
                 pairs = harmonise_pairs(hits, assocs)
                 beta, se, k = ivw(pairs)
-                src = "fetched"
-                note = ""
+                cache_path = cache_root / _cache_key(exp_id, out_id, pval, r2, kb, pop)
                 _write_cache(
                     cache_path,
                     {
@@ -570,22 +651,43 @@ def load_live_gwas(
                         "fetched_at": time.time(),
                     },
                 )
+                per_pair_results[out] = {
+                    "exp_id": exp_id, "out_id": out_id,
+                    "beta": beta, "se": se, "n_snps": int(k),
+                    "source": "fetched", "note": "",
+                }
+
+        # Pass 3: stamp results into the (β, SE) matrices.
+        row_max_n = 0
+        for j, out in enumerate(outcomes):
+            if exp == out:
+                continue
+            r = per_pair_results.get(out)
+            if r is None:
+                continue
+            beta = float(r["beta"])
+            se = float(r["se"])
+            k = int(r["n_snps"])
             if k == 0 or not np.isfinite(beta) or not np.isfinite(se) or se <= 0.0:
-                _emit(per_pair, _PerPair(exp, out, exp_id, out_id,
-                                          float("nan"), float("nan"), int(k),
-                                          source="no_overlap" if k == 0 else "error",
-                                          note=note))
+                _emit(per_pair, _PerPair(
+                    exp, out, str(r["exp_id"]), str(r["out_id"]),
+                    float("nan"), float("nan"), k,
+                    source=("no_overlap" if k == 0 and r["source"] == "fetched"
+                            else r["source"]),
+                    note=str(r.get("note", "")),
+                ))
                 continue
             betas[i, j] = beta
             ses[i, j] = se
-            row_max_n = max(row_max_n, int(k))
+            row_max_n = max(row_max_n, k)
             citations[(exp, out)] = (
-                f"OpenGWAS IVW: {STUDY_CITATIONS.get(exp_id, exp_id)} -> "
-                f"{STUDY_CITATIONS.get(out_id, out_id)}"
+                f"OpenGWAS IVW: {STUDY_CITATIONS.get(str(r['exp_id']), str(r['exp_id']))} -> "
+                f"{STUDY_CITATIONS.get(str(r['out_id']), str(r['out_id']))}"
             )
-            _emit(per_pair, _PerPair(exp, out, exp_id, out_id,
-                                      beta, se, int(k),
-                                      source=src))
+            _emit(per_pair, _PerPair(
+                exp, out, str(r["exp_id"]), str(r["out_id"]),
+                beta, se, k, source=str(r["source"]),
+            ))
         n_snps[i] = row_max_n
 
     with np.errstate(invalid="ignore"):
@@ -609,8 +711,8 @@ def load_live_gwas(
 __all__ = [
     "OPENGWAS_STUDY_IDS",
     "STUDY_CITATIONS",
-    "fetch_tophits",
-    "fetch_associations",
+    "OpenGWASClient",
+    "OpenGWASClientLike",
     "harmonise_pairs",
     "ivw",
     "load_live_gwas",

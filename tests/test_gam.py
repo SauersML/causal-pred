@@ -49,6 +49,7 @@ def test_fit_smoke(medium_data):
     event = d.event[keep]
 
     t0 = _time.perf_counter()
+    progress_messages = []
     gam_model = fit_survival_gam(
         time,
         event,
@@ -56,6 +57,7 @@ def test_fit_smoke(medium_data):
         columns=parents,
         n_samples=100,
         rng=np.random.default_rng(7),
+        progress=progress_messages.append,
     )
     elapsed = _time.perf_counter() - t0
     assert elapsed < 60.0, f"fit took {elapsed:.1f}s (limit 60)"
@@ -81,6 +83,8 @@ def test_fit_smoke(medium_data):
     ):
         assert key in diag, f"missing diagnostic {key!r}"
     assert bool(diag["converged"]) is True
+    assert any(message.startswith("fit start ") for message in progress_messages)
+    assert any(message.startswith("fit complete") for message in progress_messages)
 
 
 # ---------------------------------------------------------------------------

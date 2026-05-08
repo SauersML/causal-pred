@@ -26,13 +26,26 @@ the posterior-predictive variance of ``S(t | x)`` into a parametric
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
 import gamfit as gam
+
+
+logger = logging.getLogger(__name__)
+ProgressCallback = Callable[[str], None]
+
+
+def _progress_callback(progress: bool | ProgressCallback) -> Optional[ProgressCallback]:
+    if callable(progress):
+        return progress
+    if progress:
+        return logger.info
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +104,7 @@ def _fit_gam(
     X: np.ndarray,
     columns: Tuple[str, ...],
     survival_likelihood: str = "location-scale",
+    progress: bool | ProgressCallback = False,
 ) -> _SubmodelFit:
     """Fit a survival GAM through ``gamfit.fit`` and return a ``_SubmodelFit``.
 
@@ -127,11 +141,33 @@ def _fit_gam(
         }
     )
 
+    emit = _progress_callback(progress)
+    if emit is not None:
+        emit(
+            "fit start "
+            f"n={time.shape[0]} events={int(np.sum(event > 0.0))} "
+            f"p={len(columns)} likelihood={survival_likelihood} formula={formula}"
+        )
     model = gam.fit(df, formula, survival_likelihood=survival_likelihood)
 
     # ``Summary`` is a frozen dict-wrapper; expose its payload directly so
     # caller-visible diagnostics carry every field the library emitted.
     train_summary: Dict[str, Any] = dict(model.summary().to_dict())
+    if emit is not None:
+        summary_items = []
+        for key in (
+            "reml_iterations",
+            "iterations",
+            "reml_score",
+            "edf_total",
+            "deviance",
+            "sigma_residual",
+        ):
+            value = train_summary.get(key)
+            if value is not None:
+                summary_items.append(f"{key}={value}")
+        suffix = " " + " ".join(summary_items) if summary_items else ""
+        emit(f"fit complete{suffix}")
 
     return _SubmodelFit(
         model=model,
@@ -311,7 +347,7 @@ def fit_survival_gam(
     columns: Optional[Tuple[str, ...]] = None,
     n_samples: int = 1000,
     rng: Optional[np.random.Generator] = None,
-    progress: bool = False,
+    progress: bool | ProgressCallback = False,
 ) -> SurvivalGAM:
     """Fit a distributional survival GAM via the gamfit Python library.
 
@@ -331,8 +367,11 @@ def fit_survival_gam(
         for shape-contract compatibility with downstream BMA: the library
         returns a single point estimate, which is broadcast across this
         axis at predict time.
+    progress : bool or callable
+        When callable, receives concise gamfit fit/summary messages. When
+        True, messages are sent to this module's logger.
     """
-    del rng, progress  # accepted for API compat; library is deterministic
+    del rng  # accepted for API compat; library is deterministic
 
     time = np.asarray(time, dtype=float)
     event = np.asarray(event, dtype=float)
@@ -345,7 +384,7 @@ def fit_survival_gam(
         columns = tuple(f"x{i}" for i in range(X.shape[1]))
     columns = tuple(columns)
 
-    fit = _fit_gam(time, event, X, columns)
+    fit = _fit_gam(time, event, X, columns, progress=progress)
 
     X_design = {
         name: {"kind": fit.kinds[i], "index": i}
