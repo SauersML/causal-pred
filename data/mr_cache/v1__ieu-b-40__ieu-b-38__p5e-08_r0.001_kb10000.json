@@ -1,0 +1,16 @@
+{
+  "beta": -0.5361734570348239,
+  "exposure": "BMI",
+  "exposure_id": "ieu-b-40",
+  "fetched_at": 1778280866.42687,
+  "n_snps": 495,
+  "outcome": "systolic_BP",
+  "outcome_id": "ieu-b-38",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.09455820811758762
+}

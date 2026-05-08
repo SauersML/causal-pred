@@ -1,0 +1,16 @@
+{
+  "beta": -1.1699493343633596,
+  "exposure": "hypertension",
+  "exposure_id": "ukb-b-12493",
+  "fetched_at": 1778281221.552772,
+  "n_snps": 61,
+  "outcome": "LDL",
+  "outcome_id": "ieu-b-110",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.05696323536085576
+}

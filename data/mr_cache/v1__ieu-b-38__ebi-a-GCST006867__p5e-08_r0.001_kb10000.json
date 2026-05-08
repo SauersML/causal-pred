@@ -1,0 +1,16 @@
+{
+  "beta": 0.018842521710796103,
+  "exposure": "systolic_BP",
+  "exposure_id": "ieu-b-38",
+  "fetched_at": 1778281168.116153,
+  "n_snps": 338,
+  "outcome": "T2D",
+  "outcome_id": "ebi-a-GCST006867",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.0015764654879550706
+}

@@ -1,0 +1,16 @@
+{
+  "beta": -0.008585545787038523,
+  "exposure": "physical_activity",
+  "exposure_id": "ukb-b-4710",
+  "fetched_at": 1778281188.618195,
+  "n_snps": 16,
+  "outcome": "hypertension",
+  "outcome_id": "ukb-b-12493",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.005583487766660208
+}

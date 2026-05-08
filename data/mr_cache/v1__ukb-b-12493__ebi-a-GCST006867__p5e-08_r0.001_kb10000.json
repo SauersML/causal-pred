@@ -1,0 +1,16 @@
+{
+  "beta": 2.0360422113353613,
+  "exposure": "hypertension",
+  "exposure_id": "ukb-b-12493",
+  "fetched_at": 1778281221.5806909,
+  "n_snps": 49,
+  "outcome": "T2D",
+  "outcome_id": "ebi-a-GCST006867",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.23178765271457366
+}

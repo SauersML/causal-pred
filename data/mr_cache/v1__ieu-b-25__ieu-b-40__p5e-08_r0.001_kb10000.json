@@ -1,0 +1,16 @@
+{
+  "beta": 0.017844613719472605,
+  "exposure": "years_smoking",
+  "exposure_id": "ieu-b-25",
+  "fetched_at": 1778281179.787675,
+  "n_snps": 6,
+  "outcome": "BMI",
+  "outcome_id": "ieu-b-40",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.008952382352320324
+}

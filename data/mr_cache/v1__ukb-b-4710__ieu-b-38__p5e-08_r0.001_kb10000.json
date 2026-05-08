@@ -1,0 +1,16 @@
+{
+  "beta": 0.7231837689677599,
+  "exposure": "physical_activity",
+  "exposure_id": "ukb-b-4710",
+  "fetched_at": 1778281188.6173189,
+  "n_snps": 14,
+  "outcome": "systolic_BP",
+  "outcome_id": "ieu-b-38",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.27381715615933383
+}

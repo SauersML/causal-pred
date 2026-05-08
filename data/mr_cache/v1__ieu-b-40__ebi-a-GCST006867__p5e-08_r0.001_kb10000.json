@@ -1,0 +1,16 @@
+{
+  "beta": 0.9857746320625774,
+  "exposure": "BMI",
+  "exposure_id": "ieu-b-40",
+  "fetched_at": 1778280866.431421,
+  "n_snps": 452,
+  "outcome": "T2D",
+  "outcome_id": "ebi-a-GCST006867",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.024646979532018762
+}

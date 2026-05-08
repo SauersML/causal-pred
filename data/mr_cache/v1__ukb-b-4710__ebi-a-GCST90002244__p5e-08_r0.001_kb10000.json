@@ -1,0 +1,16 @@
+{
+  "beta": 0.004542575677275004,
+  "exposure": "physical_activity",
+  "exposure_id": "ukb-b-4710",
+  "fetched_at": 1778281188.6148171,
+  "n_snps": 16,
+  "outcome": "HbA1c",
+  "outcome_id": "ebi-a-GCST90002244",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.011638542424458335
+}

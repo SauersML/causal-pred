@@ -1,0 +1,16 @@
+{
+  "beta": 0.427353436854447,
+  "exposure": "BMI",
+  "exposure_id": "ieu-b-40",
+  "fetched_at": 1778280866.430038,
+  "n_snps": 495,
+  "outcome": "cardiovascular_disease",
+  "outcome_id": "ebi-a-GCST005195",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.021784900547617326
+}

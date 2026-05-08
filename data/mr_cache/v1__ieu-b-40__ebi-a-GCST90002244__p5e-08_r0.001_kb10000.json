@@ -1,0 +1,16 @@
+{
+  "beta": 0.03613298546309427,
+  "exposure": "BMI",
+  "exposure_id": "ieu-b-40",
+  "fetched_at": 1778280866.4247239,
+  "n_snps": 487,
+  "outcome": "HbA1c",
+  "outcome_id": "ebi-a-GCST90002244",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.004135761055582044
+}

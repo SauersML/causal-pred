@@ -1,0 +1,16 @@
+{
+  "beta": -0.07521599977339535,
+  "exposure": "BMI",
+  "exposure_id": "ieu-b-40",
+  "fetched_at": 1778280866.421994,
+  "n_snps": 496,
+  "outcome": "LDL",
+  "outcome_id": "ieu-b-110",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.006512108577869733
+}

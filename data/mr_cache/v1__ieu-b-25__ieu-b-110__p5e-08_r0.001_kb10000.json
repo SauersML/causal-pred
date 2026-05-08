@@ -1,0 +1,16 @@
+{
+  "beta": 0.011720905527090628,
+  "exposure": "years_smoking",
+  "exposure_id": "ieu-b-25",
+  "fetched_at": 1778281179.7908008,
+  "n_snps": 22,
+  "outcome": "LDL",
+  "outcome_id": "ieu-b-110",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.007912387217630927
+}

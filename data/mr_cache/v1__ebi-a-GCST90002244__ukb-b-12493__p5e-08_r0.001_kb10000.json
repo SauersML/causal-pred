@@ -1,0 +1,16 @@
+{
+  "beta": 0.013118471518107808,
+  "exposure": "HbA1c",
+  "exposure_id": "ebi-a-GCST90002244",
+  "fetched_at": 1778280969.183719,
+  "n_snps": 71,
+  "outcome": "hypertension",
+  "outcome_id": "ukb-b-12493",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.005655583114171594
+}

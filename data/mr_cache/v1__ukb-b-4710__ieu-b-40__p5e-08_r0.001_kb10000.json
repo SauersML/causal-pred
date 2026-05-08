@@ -1,0 +1,16 @@
+{
+  "beta": -0.12215418156917737,
+  "exposure": "physical_activity",
+  "exposure_id": "ukb-b-4710",
+  "fetched_at": 1778281188.610132,
+  "n_snps": 5,
+  "outcome": "BMI",
+  "outcome_id": "ieu-b-40",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.02579239600037127
+}

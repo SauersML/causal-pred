@@ -1,0 +1,16 @@
+{
+  "beta": 0.00037059644810049806,
+  "exposure": "systolic_BP",
+  "exposure_id": "ieu-b-38",
+  "fetched_at": 1778281168.0991948,
+  "n_snps": 435,
+  "outcome": "HbA1c",
+  "outcome_id": "ebi-a-GCST90002244",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.000244823972667775
+}

@@ -1,0 +1,16 @@
+{
+  "beta": -0.11409239292893894,
+  "exposure": "physical_activity",
+  "exposure_id": "ukb-b-4710",
+  "fetched_at": 1778281188.620853,
+  "n_snps": 12,
+  "outcome": "T2D",
+  "outcome_id": "ebi-a-GCST006867",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.077598224483347
+}

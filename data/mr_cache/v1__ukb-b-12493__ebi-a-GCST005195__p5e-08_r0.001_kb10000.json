@@ -1,0 +1,16 @@
+{
+  "beta": 4.975242805695629,
+  "exposure": "hypertension",
+  "exposure_id": "ukb-b-12493",
+  "fetched_at": 1778281221.575521,
+  "n_snps": 67,
+  "outcome": "cardiovascular_disease",
+  "outcome_id": "ebi-a-GCST005195",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.1841621989843251
+}

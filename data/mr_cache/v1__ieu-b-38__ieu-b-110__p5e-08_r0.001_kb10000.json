@@ -1,0 +1,16 @@
+{
+  "beta": -0.008068279478355339,
+  "exposure": "systolic_BP",
+  "exposure_id": "ieu-b-38",
+  "fetched_at": 1778281168.094398,
+  "n_snps": 440,
+  "outcome": "LDL",
+  "outcome_id": "ieu-b-110",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.0003788634360544679
+}

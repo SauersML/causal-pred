@@ -1,0 +1,16 @@
+{
+  "beta": 72.62890794900729,
+  "exposure": "hypertension",
+  "exposure_id": "ukb-b-12493",
+  "fetched_at": 1778281221.5733051,
+  "n_snps": 60,
+  "outcome": "systolic_BP",
+  "outcome_id": "ieu-b-38",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.8334480328788538
+}

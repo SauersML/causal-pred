@@ -1,0 +1,16 @@
+{
+  "beta": -0.11533746660409235,
+  "exposure": "physical_activity",
+  "exposure_id": "ukb-b-4710",
+  "fetched_at": 1778281188.619052,
+  "n_snps": 16,
+  "outcome": "cardiovascular_disease",
+  "outcome_id": "ebi-a-GCST005195",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.05864356008719803
+}

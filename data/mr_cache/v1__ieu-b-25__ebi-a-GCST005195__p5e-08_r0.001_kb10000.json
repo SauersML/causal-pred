@@ -1,0 +1,16 @@
+{
+  "beta": 0.0588231540780898,
+  "exposure": "years_smoking",
+  "exposure_id": "ieu-b-25",
+  "fetched_at": 1778281179.7954361,
+  "n_snps": 21,
+  "outcome": "cardiovascular_disease",
+  "outcome_id": "ebi-a-GCST005195",
+  "params": {
+    "kb": 10000,
+    "pop": "EUR",
+    "pval": 5e-08,
+    "r2": 0.001
+  },
+  "se": 0.026703774514027372
+}
