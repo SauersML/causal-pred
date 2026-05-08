@@ -39,10 +39,9 @@ Architecture choices, fixed (no width / sparsity sweeps):
   streams, so per-stream norms are directly comparable.
 * **Standardised inputs** -- per-column z-scoring before encoding; with mean
   zero this absorbs the role of an explicit pre-encoder bias.
-* **Manual Adam in NumPy** -- keeps the project's dependency surface small
-  (no torch). All math is dense matmul; biobank-scale (n ~ 200k, m ~ a few
-  thousand, d ~ 4*m) trains in minutes on CPU. Swap the matmuls for a torch
-  GPU equivalent if you outgrow this.
+* **Torch accelerator training** -- dense minibatch matmuls, TopK, AuxK, and
+  Adam run on CUDA or MPS. CPU-only hosts can still import this module and
+  inspect trained models; training itself requires an accelerator.
 
 References
 ----------
@@ -57,7 +56,7 @@ References
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -156,23 +155,178 @@ def _topk_per_row(pre: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
     z = np.where(mask, pre, 0.0)
     return z, mask
 
-
 def encode(
-    model: TopKCrosscoder, A: np.ndarray, B: np.ndarray
+    model: TopKCrosscoder,
+    A: np.ndarray,
+    B: np.ndarray,
+    *,
+    batch_size: Optional[int] = None,
+    device: str | None = None,
+    dtype: str = "float32",
 ) -> np.ndarray:
     """Compute the sparse latent ``z`` for each participant.
+
+    Passing ``device="auto"``, ``"cuda"``, or ``"mps"`` runs the dense
+    encoding matmuls on the accelerator in batches. Leaving ``device`` as
+    ``None`` uses the NumPy path, which is useful for small already-trained
+    models and keeps non-training utilities usable on CPU-only hosts.
 
     Returns
     -------
     z : (n, d)
         TopK-sparse activations per participant.
     """
+    if device is not None:
+        return encode_batched(
+            model,
+            A,
+            B,
+            batch_size=batch_size or 65536,
+            device=device,
+            dtype=dtype,
+        )
+
     a_z = (A - model.mean_G) / model.std_G
     b_z = (B - model.mean_E) / model.std_E
     x = np.concatenate([a_z, b_z], axis=1)
     pre = x @ model.W_e + model.b_enc
     z, _ = _topk_per_row(pre, model.k)
     return z
+
+
+def encode_batched(
+    model: TopKCrosscoder,
+    A: np.ndarray,
+    B: np.ndarray,
+    *,
+    batch_size: int = 65536,
+    device: str | None = "auto",
+    dtype: str = "float32",
+) -> np.ndarray:
+    """Encode rows in accelerator batches and return all latent activations."""
+    import torch
+
+    resolved = _resolve_torch_device(device)
+    torch_dtype = _torch_float_dtype(dtype)
+    _configure_torch_matmul(resolved)
+    tensors = _torch_model_tensors(model, resolved, torch_dtype)
+
+    A_np = np.asarray(A)
+    B_np = np.asarray(B)
+    if A_np.shape[0] != B_np.shape[0]:
+        raise ValueError(
+            f"A and B must share rows, got {A_np.shape[0]} vs {B_np.shape[0]}"
+        )
+    n = A_np.shape[0]
+    z_out = np.empty((n, model.d), dtype=np.float32)
+
+    with torch.no_grad():
+        for start in range(0, n, batch_size):
+            stop = min(start + batch_size, n)
+            a = torch.as_tensor(A_np[start:stop], dtype=torch_dtype, device=resolved)
+            b = torch.as_tensor(B_np[start:stop], dtype=torch_dtype, device=resolved)
+            x = torch.cat(
+                (
+                    (a - tensors["mean_G"]) / tensors["std_G"],
+                    (b - tensors["mean_E"]) / tensors["std_E"],
+                ),
+                dim=1,
+            )
+            pre = x @ tensors["W_e"] + tensors["b_enc"]
+            z, _ = _torch_topk_per_row(pre, model.k)
+            z_out[start:stop] = z.float().cpu().numpy()
+    return z_out
+
+
+def encode_selected_batched(
+    model: TopKCrosscoder,
+    A: np.ndarray,
+    B: np.ndarray,
+    feature_indices: Sequence[int] | np.ndarray,
+    *,
+    batch_size: int = 65536,
+    device: str | None = "auto",
+    dtype: str = "float32",
+) -> np.ndarray:
+    """Encode only selected latent columns without materialising full ``z``."""
+    import torch
+
+    resolved = _resolve_torch_device(device)
+    torch_dtype = _torch_float_dtype(dtype)
+    _configure_torch_matmul(resolved)
+    tensors = _torch_model_tensors(model, resolved, torch_dtype)
+
+    A_np = np.asarray(A)
+    B_np = np.asarray(B)
+    if A_np.shape[0] != B_np.shape[0]:
+        raise ValueError(
+            f"A and B must share rows, got {A_np.shape[0]} vs {B_np.shape[0]}"
+        )
+    idx_np = np.asarray(feature_indices, dtype=np.int64)
+    idx = torch.as_tensor(idx_np, dtype=torch.long, device=resolved)
+    n = A_np.shape[0]
+    z_out = np.empty((n, idx_np.size), dtype=np.float32)
+
+    with torch.no_grad():
+        for start in range(0, n, batch_size):
+            stop = min(start + batch_size, n)
+            a = torch.as_tensor(A_np[start:stop], dtype=torch_dtype, device=resolved)
+            b = torch.as_tensor(B_np[start:stop], dtype=torch_dtype, device=resolved)
+            x = torch.cat(
+                (
+                    (a - tensors["mean_G"]) / tensors["std_G"],
+                    (b - tensors["mean_E"]) / tensors["std_E"],
+                ),
+                dim=1,
+            )
+            pre = x @ tensors["W_e"] + tensors["b_enc"]
+            z, _ = _torch_topk_per_row(pre, model.k)
+            z_out[start:stop] = z.index_select(1, idx).float().cpu().numpy()
+    return z_out
+
+
+def activation_rate_batched(
+    model: TopKCrosscoder,
+    A: np.ndarray,
+    B: np.ndarray,
+    *,
+    batch_size: int = 65536,
+    device: str | None = "auto",
+    dtype: str = "float32",
+) -> np.ndarray:
+    """Compute per-feature activation rates on the accelerator in batches."""
+    import torch
+
+    resolved = _resolve_torch_device(device)
+    torch_dtype = _torch_float_dtype(dtype)
+    _configure_torch_matmul(resolved)
+    tensors = _torch_model_tensors(model, resolved, torch_dtype)
+
+    A_np = np.asarray(A)
+    B_np = np.asarray(B)
+    if A_np.shape[0] != B_np.shape[0]:
+        raise ValueError(
+            f"A and B must share rows, got {A_np.shape[0]} vs {B_np.shape[0]}"
+        )
+    n = A_np.shape[0]
+    counts = torch.zeros(model.d, dtype=torch.float32, device=resolved)
+
+    with torch.no_grad():
+        for start in range(0, n, batch_size):
+            stop = min(start + batch_size, n)
+            a = torch.as_tensor(A_np[start:stop], dtype=torch_dtype, device=resolved)
+            b = torch.as_tensor(B_np[start:stop], dtype=torch_dtype, device=resolved)
+            x = torch.cat(
+                (
+                    (a - tensors["mean_G"]) / tensors["std_G"],
+                    (b - tensors["mean_E"]) / tensors["std_E"],
+                ),
+                dim=1,
+            )
+            pre = x @ tensors["W_e"] + tensors["b_enc"]
+            _, mask = _torch_topk_per_row(pre, model.k)
+            counts += mask.sum(dim=0, dtype=torch.float32)
+    return (counts / float(n)).cpu().numpy()
 
 
 def reconstruct(
@@ -269,6 +423,8 @@ def train_crosscoder(
     dead_steps: int = 200,
     rng: Optional[np.random.Generator] = None,
     log_every: int = 100,
+    device: str | None = "auto",
+    dtype: str = "float32",
 ) -> TopKCrosscoder:
     """Train a TopK crosscoder on paired (genome, EHR) activations.
 
@@ -299,6 +455,12 @@ def train_crosscoder(
         Random source. Defaults to ``np.random.default_rng(0)``.
     log_every : int
         Step interval at which to record diagnostics into ``history``.
+    device : str, optional
+        ``"auto"`` selects CUDA first, then MPS. CPU is rejected for training.
+    dtype : {"float32", "float16", "bfloat16"}
+        Floating dtype used for accelerator tensors. ``float32`` is the
+        default because it is robust and uses TF32 matmul on supported CUDA
+        devices.
 
     Returns
     -------
@@ -306,40 +468,59 @@ def train_crosscoder(
         Trained model. The decoder columns satisfy the joint unit-norm
         constraint at return time.
     """
+    import torch
+
     rng_local = rng if rng is not None else np.random.default_rng(0)
-    A = np.asarray(A, dtype=np.float64)
-    B = np.asarray(B, dtype=np.float64)
-    if A.shape[0] != B.shape[0]:
+    resolved = _resolve_torch_device(device)
+    torch_dtype = _torch_float_dtype(dtype)
+    _configure_torch_matmul(resolved)
+
+    A_np = np.ascontiguousarray(np.asarray(A, dtype=np.float32))
+    B_np = np.ascontiguousarray(np.asarray(B, dtype=np.float32))
+    if A_np.shape[0] != B_np.shape[0]:
         raise ValueError(
-            f"A and B must share rows, got {A.shape[0]} vs {B.shape[0]}"
+            f"A and B must share rows, got {A_np.shape[0]} vs {B_np.shape[0]}"
         )
-    n, m_G = A.shape
-    m_E = B.shape[1]
+    n, m_G = A_np.shape
+    m_E = B_np.shape[1]
     d_lat: int = int(d) if d is not None else 4 * (m_G + m_E)
     if k > d_lat:
         raise ValueError(f"k={k} must be <= d={d_lat}")
+    if n <= 0:
+        raise ValueError("crosscoder training requires at least one row")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if n_steps <= 0:
+        raise ValueError(f"n_steps must be positive, got {n_steps}")
 
     # --- standardisation -------------------------------------------------
-    mean_G = A.mean(axis=0)
-    std_G = A.std(axis=0)
-    std_G = np.where(std_G > 1e-8, std_G, 1.0)
-    mean_E = B.mean(axis=0)
-    std_E = B.std(axis=0)
-    std_E = np.where(std_E > 1e-8, std_E, 1.0)
-    A_z = (A - mean_G) / std_G
-    B_z = (B - mean_E) / std_E
-    X = np.concatenate([A_z, B_z], axis=1)            # (n, m_G + m_E)
+    A_t = torch.as_tensor(A_np, dtype=torch_dtype, device=resolved)
+    B_t = torch.as_tensor(B_np, dtype=torch_dtype, device=resolved)
+    mean_G = A_t.mean(dim=0)
+    std_G = A_t.std(dim=0, unbiased=False).clamp_min(1e-8)
+    mean_E = B_t.mean(dim=0)
+    std_E = B_t.std(dim=0, unbiased=False).clamp_min(1e-8)
+    A_z = (A_t - mean_G) / std_G
+    B_z = (B_t - mean_E) / std_E
+    del A_t, B_t
     m = m_G + m_E
 
     # --- initialisation --------------------------------------------------
     # Encoder: scaled Gaussian. Decoder: take the encoder transpose split
     # across the two streams, then apply the joint unit-norm projection.
+    seed = int(rng_local.integers(0, 2**63 - 1))
+    torch.manual_seed(seed)
+    gen = torch.Generator(device=resolved).manual_seed(seed) if resolved.type == "cuda" else None
     scale = 1.0 / np.sqrt(m)
-    W_e = rng_local.standard_normal((m, d_lat)) * scale
-    b_enc = np.zeros(d_lat)
-    W_d_G = W_e[:m_G, :].T.copy()
-    W_d_E = W_e[m_G:, :].T.copy()
-    W_d_G, W_d_E = _normalise_decoders(W_d_G, W_d_E)
+    randn_kwargs = {"dtype": torch_dtype, "device": resolved}
+    if gen is not None:
+        randn_kwargs["generator"] = gen
+    W_e = torch.randn((m, d_lat), **randn_kwargs)
+    W_e.mul_(scale)
+    b_enc = torch.zeros(d_lat, dtype=torch_dtype, device=resolved)
+    W_d_G = W_e[:m_G, :].T.contiguous().clone()
+    W_d_E = W_e[m_G:, :].T.contiguous().clone()
+    _normalise_decoders_torch(W_d_G, W_d_E)
 
     # --- Adam state ------------------------------------------------------
     params = {
@@ -348,12 +529,12 @@ def train_crosscoder(
         "W_d_G": W_d_G,
         "W_d_E": W_d_E,
     }
-    m_state = {p: np.zeros_like(v) for p, v in params.items()}
-    v_state = {p: np.zeros_like(v) for p, v in params.items()}
+    m_state = {p: torch.zeros_like(v, dtype=torch.float32) for p, v in params.items()}
+    v_state = {p: torch.zeros_like(v, dtype=torch.float32) for p, v in params.items()}
     beta1, beta2, eps = 0.9, 0.999, 1e-8
 
     # --- dead-feature tracker -------------------------------------------
-    steps_since_active = np.zeros(d_lat, dtype=np.int64)
+    steps_since_active = torch.zeros(d_lat, dtype=torch.int64, device=resolved)
 
     inv_m_G = 1.0 / m_G
     inv_m_E = 1.0 / m_E
@@ -365,129 +546,120 @@ def train_crosscoder(
         "frac_dead": [],
     }
 
-    for step in range(1, n_steps + 1):
-        idx = rng_local.integers(0, n, size=batch_size)
-        x_batch = X[idx]                              # (B, m)
-        a_target = A_z[idx]                           # (B, m_G)
-        b_target = B_z[idx]                           # (B, m_E)
-        bs = x_batch.shape[0]
+    with torch.no_grad():
+        for step in range(1, n_steps + 1):
+            randint_kwargs = {"dtype": torch.long, "device": resolved}
+            if gen is not None:
+                randint_kwargs["generator"] = gen
+            idx = torch.randint(n, (batch_size,), **randint_kwargs)
+            a_target = A_z.index_select(0, idx)
+            b_target = B_z.index_select(0, idx)
+            x_batch = torch.cat((a_target, b_target), dim=1)
+            bs = x_batch.shape[0]
 
-        # ---- forward (main path) ---------------------------------------
-        pre = x_batch @ params["W_e"] + params["b_enc"]   # (B, d)
-        z, mask = _topk_per_row(pre, k)                   # (B, d)
+            # ---- forward (main path) -----------------------------------
+            pre = x_batch @ params["W_e"] + params["b_enc"]
+            z, mask = _torch_topk_per_row(pre, k)
 
-        a_hat = z @ params["W_d_G"]                       # (B, m_G)
-        b_hat = z @ params["W_d_E"]                       # (B, m_E)
+            a_hat = z @ params["W_d_G"]
+            b_hat = z @ params["W_d_E"]
 
-        res_G = a_hat - a_target                          # (B, m_G)
-        res_E = b_hat - b_target                          # (B, m_E)
+            res_G = a_hat - a_target
+            res_E = b_hat - b_target
 
-        loss_main = 0.5 * (
-            inv_m_G * np.mean(np.sum(res_G ** 2, axis=1))
-            + inv_m_E * np.mean(np.sum(res_E ** 2, axis=1))
-        )
-        # Equivalent compact form (and what we actually backprop through):
-        # loss_main = 0.5 * (inv_m_G * mean(res_G^2)*m_G + ...) =
-        #             0.5 * (mean(res_G^2) + mean(res_E^2)).
+            loss_main = 0.5 * (
+                inv_m_G * torch.mean(torch.sum(res_G * res_G, dim=1))
+                + inv_m_E * torch.mean(torch.sum(res_E * res_E, dim=1))
+            )
 
-        # ---- backward (main path) --------------------------------------
-        # d/dres_G of 0.5 * mean(sum_j res_G[:, j]^2) = res_G / B
-        d_a_hat = res_G / bs                              # (B, m_G)
-        d_b_hat = res_E / bs                              # (B, m_E)
-        # Re-include the per-stream weighting we used for loss_main.
-        d_a_hat = d_a_hat                                  # already weighted
-        d_b_hat = d_b_hat
-        # Note: the simplification 0.5 * (mean(res_G^2) + mean(res_E^2))
-        # gives gradient res / B per stream without any extra factors --
-        # the per-feature scaling cancels because mean is over the (B, m)
-        # block. Keep it that way; consistent with the loss expression.
+            # ---- backward (main path) ----------------------------------
+            d_a_hat = res_G / bs
+            d_b_hat = res_E / bs
 
-        # Decoder gradients
-        g_W_d_G = z.T @ d_a_hat                           # (d, m_G)
-        g_W_d_E = z.T @ d_b_hat                           # (d, m_E)
+            g_W_d_G = z.T @ d_a_hat
+            g_W_d_E = z.T @ d_b_hat
 
-        # Latent gradient
-        d_z = d_a_hat @ params["W_d_G"].T + d_b_hat @ params["W_d_E"].T
-        d_pre = np.where(mask, d_z, 0.0)                  # TopK is identity-on-mask
+            d_z = d_a_hat @ params["W_d_G"].T + d_b_hat @ params["W_d_E"].T
+            d_pre = torch.where(mask, d_z, torch.zeros_like(d_z))
 
-        # Encoder gradients
-        g_W_e = x_batch.T @ d_pre                         # (m, d)
-        g_b_enc = d_pre.sum(axis=0)                       # (d,)
+            g_W_e = x_batch.T @ d_pre
+            g_b_enc = d_pre.sum(dim=0)
 
-        # ---- AuxK on dead features -------------------------------------
-        loss_aux = 0.0
-        dead_mask = steps_since_active >= dead_steps
-        n_dead = int(dead_mask.sum())
-        if n_dead > 0 and aux_k > 0 and aux_coef > 0:
-            kk = min(aux_k, n_dead)
-            pre_dead = np.where(dead_mask[None, :], pre, -np.inf)
-            z_aux, mask_aux = _topk_per_row(pre_dead, kk)
+            # ---- AuxK on dead features ---------------------------------
+            loss_aux = pre.new_zeros(())
+            dead_mask = steps_since_active >= dead_steps
+            if step >= dead_steps and aux_k > 0 and aux_coef > 0:
+                kk = min(aux_k, d_lat)
+                pre_dead = pre.masked_fill(~dead_mask[None, :], float("-inf"))
+                z_aux, mask_aux = _torch_topk_per_row(pre_dead, kk)
 
-            # AuxK predicts the residual e = target - x_hat from dead latents.
-            # In our sign convention, residual = -res. So we want
-            # e_hat ~ -res, i.e. minimise ||e_hat + res||^2.
-            e_hat_G = z_aux @ params["W_d_G"]
-            e_hat_E = z_aux @ params["W_d_E"]
-            aux_G = e_hat_G + res_G                       # (B, m_G)
-            aux_E = e_hat_E + res_E                       # (B, m_E)
-            loss_aux = 0.5 * (np.mean(aux_G ** 2) + np.mean(aux_E ** 2))
+                e_hat_G = z_aux @ params["W_d_G"]
+                e_hat_E = z_aux @ params["W_d_E"]
+                row_aux = mask_aux.any(dim=1).to(torch_dtype)[:, None]
+                aux_G = (e_hat_G + res_G) * row_aux
+                aux_E = (e_hat_E + res_E) * row_aux
+                loss_aux = 0.5 * (
+                    torch.mean(aux_G * aux_G) + torch.mean(aux_E * aux_E)
+                )
 
-            # Backprop AuxK loss. Treat res_G / res_E as constants here so
-            # the auxiliary head only updates dead-feature parameters; the
-            # main-path gradients above already covered the live features.
-            d_e_hat_G = aux_coef * aux_G / bs
-            d_e_hat_E = aux_coef * aux_E / bs
+                d_e_hat_G = aux_coef * aux_G / bs
+                d_e_hat_E = aux_coef * aux_E / bs
 
-            g_W_d_G = g_W_d_G + z_aux.T @ d_e_hat_G
-            g_W_d_E = g_W_d_E + z_aux.T @ d_e_hat_E
+                g_W_d_G = g_W_d_G + z_aux.T @ d_e_hat_G
+                g_W_d_E = g_W_d_E + z_aux.T @ d_e_hat_E
 
-            d_z_aux = d_e_hat_G @ params["W_d_G"].T + d_e_hat_E @ params["W_d_E"].T
-            d_pre_aux = np.where(mask_aux, d_z_aux, 0.0)
-            g_W_e = g_W_e + x_batch.T @ d_pre_aux
-            g_b_enc = g_b_enc + d_pre_aux.sum(axis=0)
+                d_z_aux = (
+                    d_e_hat_G @ params["W_d_G"].T
+                    + d_e_hat_E @ params["W_d_E"].T
+                )
+                d_pre_aux = torch.where(mask_aux, d_z_aux, torch.zeros_like(d_z_aux))
+                g_W_e = g_W_e + x_batch.T @ d_pre_aux
+                g_b_enc = g_b_enc + d_pre_aux.sum(dim=0)
 
-        # ---- update dead-feature tracker -------------------------------
-        active_this_step = mask.any(axis=0)               # (d,)
-        steps_since_active += 1
-        steps_since_active[active_this_step] = 0
+            # ---- update dead-feature tracker ---------------------------
+            active_this_step = mask.any(dim=0)
+            steps_since_active.add_(1)
+            steps_since_active.masked_fill_(active_this_step, 0)
 
-        # ---- Adam step --------------------------------------------------
-        grads = {
-            "W_e": g_W_e,
-            "b_enc": g_b_enc,
-            "W_d_G": g_W_d_G,
-            "W_d_E": g_W_d_E,
-        }
-        bc1 = 1.0 - beta1 ** step
-        bc2 = 1.0 - beta2 ** step
-        for name, g in grads.items():
-            m_state[name] = beta1 * m_state[name] + (1.0 - beta1) * g
-            v_state[name] = beta2 * v_state[name] + (1.0 - beta2) * (g * g)
-            m_hat = m_state[name] / bc1
-            v_hat = v_state[name] / bc2
-            params[name] -= lr * m_hat / (np.sqrt(v_hat) + eps)
+            # ---- Adam step ----------------------------------------------
+            grads = {
+                "W_e": g_W_e,
+                "b_enc": g_b_enc,
+                "W_d_G": g_W_d_G,
+                "W_d_E": g_W_d_E,
+            }
+            bc1 = 1.0 - beta1 ** step
+            bc2 = 1.0 - beta2 ** step
+            for name, g in grads.items():
+                g32 = g.float()
+                m_state[name].mul_(beta1).add_(g32, alpha=1.0 - beta1)
+                v_state[name].mul_(beta2).addcmul_(g32, g32, value=1.0 - beta2)
+                m_hat = m_state[name] / bc1
+                denom = (v_state[name] / bc2).sqrt().add_(eps)
+                params[name].add_((-lr * (m_hat / denom)).to(params[name].dtype))
 
-        # ---- enforce decoder unit-norm constraint ----------------------
-        params["W_d_G"], params["W_d_E"] = _normalise_decoders(
-            params["W_d_G"], params["W_d_E"]
-        )
+            # ---- enforce decoder unit-norm constraint ------------------
+            _normalise_decoders_torch(params["W_d_G"], params["W_d_E"])
 
-        # ---- diagnostics -----------------------------------------------
-        if step == 1 or step == n_steps or step % log_every == 0:
-            history["step"].append(step)
-            history["loss_main"].append(float(loss_main))
-            history["loss_aux"].append(float(loss_aux))
-            history["frac_dead"].append(float(n_dead) / d_lat)
+            # ---- diagnostics -------------------------------------------
+            if step == 1 or step == n_steps or step % log_every == 0:
+                n_dead = int(dead_mask.sum().item())
+                history["step"].append(step)
+                history["loss_main"].append(float(loss_main.item()))
+                history["loss_aux"].append(float(loss_aux.item()))
+                history["frac_dead"].append(float(n_dead) / d_lat)
 
     return TopKCrosscoder(
-        W_e=params["W_e"],
-        b_enc=params["b_enc"],
-        W_d_G=params["W_d_G"],
-        W_d_E=params["W_d_E"],
-        mean_G=mean_G,
-        std_G=std_G,
-        mean_E=mean_E,
-        std_E=std_E,
+        W_e=params["W_e"].float().cpu().numpy(),
+        b_enc=params["b_enc"].float().cpu().numpy(),
+        W_d_G=params["W_d_G"].float().cpu().numpy(),
+        W_d_E=params["W_d_E"].float().cpu().numpy(),
+        mean_G=mean_G.float().cpu().numpy(),
+        std_G=std_G.float().cpu().numpy(),
+        mean_E=mean_E.float().cpu().numpy(),
+        std_E=std_E.float().cpu().numpy(),
         k=k,
         history=history,
+        device=str(resolved),
+        dtype=dtype,
     )

@@ -23,23 +23,18 @@ which makes the validation framework meaningful even on synthetic data.
 ## Pipeline
 
 ```text
-  External GWAS            AoU cohort CSV from the workspace bucket
-  summary stats            individual-level matrix
+  External GWAS            AoU cohort CSV + microarray genotypes
+  summary stats            from the workspace/local caches
         |                            |
         v                            v
-      MrDAG  -- edge priors pi -->  DAGSLAM -- starting DAG -->
-                                        |
-                                        v
-                            Structure MCMC over DAGs
-                                        |
-                            posterior parent sets
-                                        |
-                                        v
-                        Distributional Survival GAM
-                        (SauersML/gam, REML + NUTS)
-                                        |
-                                        v
-                    survival curves  +  causal-pathway probs
+      MrDAG  -- edge priors pi -->  gnomon-scored PRS nodes
+                     |                         |
+                     +----------+--------------+
+                                v
+                  DAGSLAM warm start -> Structure MCMC
+                                |
+                                v
+                  posterior edge probabilities + validation
 ```
 
 ## Layout
@@ -71,9 +66,10 @@ Install (requires `uv` and a working Rust toolchain for the `gam` extension):
 uv sync --dev
 ```
 
-Run the real cohort pipeline. It resolves `data/t2d_initial_nodes_complete.csv`
-locally first, then copies `$WORKSPACE_BUCKET/data/t2d_initial_nodes_complete.csv`
-on AoU:
+Run the real cohort pipeline. It resolves the cohort CSV locally first, copies
+from `$WORKSPACE_BUCKET/data/` on AoU when needed, prepares or restores the
+gnomon-scored PRS matrix, and reuses keyed MrDAG/DAGSLAM/MCMC intermediates
+from `data/intermediates/causal-pred/` or the workspace bucket:
 
 ```sh
 uv run python scripts/run_full_pipeline.py
@@ -91,5 +87,5 @@ On the AoU Researcher Workbench, run the one-shot bootstrap:
 bash causal-pred/scripts/bootstrap_aou.sh
 ```
 
-See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for full instructions,
-real-genotype scoring with `gnomon`, and troubleshooting.
+See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for full instructions and
+troubleshooting.

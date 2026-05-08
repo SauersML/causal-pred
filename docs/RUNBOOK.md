@@ -20,23 +20,31 @@ below for `rustc missing`.
 
 The real-data path expects the complete-case T2D node file at
 `$WORKSPACE_BUCKET/data/t2d_initial_nodes_complete.csv`. On the AoU
-Researcher Workbench, the bootstrap verifies that object, installs the
-local toolchain, syncs dependencies, copies the CSV into `data/`, and runs
-the pipeline:
+Researcher Workbench, the bootstrap verifies the workspace inputs, installs
+the local toolchain, syncs dependencies, installs `gnomon`, and runs the
+single pipeline:
 
 ```sh
 bash causal-pred/scripts/bootstrap_aou.sh
 ```
 
-This writes `outputs/summary.json` and the edge artefacts under `outputs/`.
+This writes `outputs/summary.json` and the edge artefacts under `outputs/`,
+then mirrors those small outputs to `$WORKSPACE_BUCKET/results/causal-pred/latest`.
 
 ## Run the full pipeline
 
 The pipeline is a single fixed path: cohort wide CSV (resolved via the
-local `data/` cache, then `$WORKSPACE_BUCKET/data/`) -> DAGSLAM hill-climb
--> structure MCMC -> save artefacts under `outputs/`. There are no
-command-line flags; defaults are the configuration. To override hyperparameters, edit
-``run_pipeline``'s defaults in `src/causal_pred/pipeline.py`.
+local `data/` cache, then `$WORKSPACE_BUCKET/data/`) -> load/build cached
+microarray PRS with `gnomon` -> MrDAG priors -> DAGSLAM hill-climb ->
+structure MCMC -> save artefacts under `outputs/`. There are no command-line
+flags and `run_pipeline()` takes no configuration arguments; edit the constants
+in `src/causal_pred/pipeline.py` when the production configuration changes.
+
+Reusable intermediates live under `data/intermediates/causal-pred/` and are
+mirrored to `$WORKSPACE_BUCKET/intermediates/causal-pred/` when the workspace
+bucket is available. The cache key includes the augmented matrix, MrDAG prior,
+and pipeline constants, so precomputed DAGSLAM/MCMC results are loaded only
+when they match the current run.
 
 ```sh
 uv run python scripts/run_full_pipeline.py
@@ -152,22 +160,17 @@ If that fails with a linker or `cc` error, install rustup and rerun
 `uv sync --dev`.
 
 ### R-hat larger than 1.1 in MCMC
-Too few MCMC samples or bad warm-start. Bump ``mcmc_samples`` /
-``mcmc_burn_in`` defaults in
-``src/causal_pred/pipeline.py``'s ``run_pipeline`` signature, or supply
-a better warm-start via ``dagslam`` and rerun
-``scripts/run_full_pipeline.py``.
+Too few MCMC samples or bad warm-start. Bump `MCMC_SAMPLES` /
+`MCMC_BURN_IN` in `src/causal_pred/pipeline.py` and rerun
+`scripts/run_full_pipeline.py`.
 
 ### Memory pressure
-Reduce ``mcmc_samples`` and ``mcmc_chains`` defaults in
-``run_pipeline``. The distributional GAM is the largest
-allocator; dropping NUTS draws from 2000 to 500 is usually enough.
+Reduce `MCMC_SAMPLES` and `MCMC_CHAINS` in `src/causal_pred/pipeline.py`.
 
 ### `NotImplementedError: partial availability`
 Triggered when a stage tries to run on an incomplete input set (eg a real
 biobank loader that has BMI but not HbA1c). Fix the loader to match the
-column convention in `docs/ARCHITECTURE.md`, or pass `--allow-partial` if
-the stage is explicitly designed for it.
+column convention in `docs/ARCHITECTURE.md`.
 
 ### Cleanup
 

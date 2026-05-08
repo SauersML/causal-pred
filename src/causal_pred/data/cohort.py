@@ -35,7 +35,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -52,16 +52,37 @@ CACHE_FILENAMES: dict = {
 
 COHORT_NODES: Tuple[str, ...] = (
     "type2_diabetes",
+    "age",
+    "sex",
+    "ancestry_pc1",
+    "family_history_t2d",
+    "years_smoking",
+    "current_smoker",
+    "physical_activity",
+    "diet_quality",
+    "healthcare_access",
     "bmi",
     "hba1c",
+    "fasting_glucose",
     "hdl_cholesterol",
     "ldl_cholesterol",
     "triglycerides",
     "systolic_bp",
+    "hypertension",
+    "cardiovascular_disease",
 )
 
 COHORT_NODE_TYPES: dict = {
     "type2_diabetes": "binary",
+    "age": "continuous",
+    "sex": "binary",
+    "ancestry_pc1": "continuous",
+    "family_history_t2d": "binary",
+    "years_smoking": "continuous",
+    "current_smoker": "binary",
+    "physical_activity": "continuous",
+    "diet_quality": "continuous",
+    "healthcare_access": "continuous",
     "bmi": "continuous",
     "hba1c": "continuous",
     "hdl_cholesterol": "continuous",
@@ -69,7 +90,25 @@ COHORT_NODE_TYPES: dict = {
     "triglycerides": "continuous",
     "systolic_bp": "continuous",
     "fasting_glucose": "continuous",
+    "hypertension": "binary",
+    "cardiovascular_disease": "binary",
 }
+
+SURVIVAL_TIME_COLUMNS: Tuple[str, ...] = (
+    "time",
+    "followup_years",
+    "follow_up_years",
+    "followup_time",
+    "t2d_time",
+    "time_to_t2d",
+    "survival_time",
+)
+
+SURVIVAL_EVENT_COLUMNS: Tuple[str, ...] = (
+    "event",
+    "t2d_event",
+    "type2_diabetes_event",
+)
 
 # Canonical units after :func:`clean_measurements`:
 #   bmi              kg/m^2
@@ -423,6 +462,51 @@ def load_cohort_csv(
     return X, tuple(present), types
 
 
+def _first_present(columns: Sequence[str], candidates: Sequence[str]) -> Optional[str]:
+    present = set(columns)
+    for c in candidates:
+        if c in present:
+            return c
+    return None
+
+
+def _extract_survival_columns(raw: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Extract time/event arrays from a cohort CSV when present.
+
+    The cohort table may be a static binary endpoint table or a survival
+    table. Static tables return zero-filled arrays and mark
+    ``has_survival=false``. Survival tables must carry one recognised time
+    column and either an explicit event column or ``type2_diabetes``.
+    """
+    n = int(raw.shape[0])
+    time_col = _first_present(raw.columns, SURVIVAL_TIME_COLUMNS)
+    if time_col is None:
+        return (
+            np.zeros(n, dtype=float),
+            np.zeros(n, dtype=int),
+            {"has_survival": False, "time_col": None, "event_col": None},
+        )
+
+    event_col = _first_present(raw.columns, SURVIVAL_EVENT_COLUMNS)
+    if event_col is None and "type2_diabetes" in raw.columns:
+        event_col = "type2_diabetes"
+    if event_col is None:
+        raise ValueError(
+            f"cohort CSV has survival time column {time_col!r} but no event "
+            f"column from {SURVIVAL_EVENT_COLUMNS!r} or 'type2_diabetes'"
+        )
+
+    time = pd.to_numeric(raw[time_col], errors="coerce").to_numpy(dtype=float)
+    event = pd.to_numeric(raw[event_col], errors="coerce").to_numpy(dtype=float)
+    event = np.rint(event).astype(float)
+    meta = {
+        "has_survival": True,
+        "time_col": time_col,
+        "event_col": event_col,
+    }
+    return time, event, meta
+
+
 def load_cohort_dataset_with_person_ids(
     path: str,
     standardise_continuous: bool = True,
@@ -443,6 +527,7 @@ def load_cohort_dataset_with_person_ids(
         raise ValueError(f"cohort CSV {path!r} must contain person_id for genomic alignment")
 
     person_id = raw["person_id"].astype("string").copy()
+    time, event, survival_meta = _extract_survival_columns(raw)
     df = raw.drop(columns=["person_id"])
 
     present = [c for c in COHORT_NODES if c in df.columns]
@@ -458,8 +543,18 @@ def load_cohort_dataset_with_person_ids(
 
     if drop_incomplete:
         keep = ~df.isna().any(axis=1)
+        if survival_meta["has_survival"]:
+            keep &= np.isfinite(time)
+            keep &= np.isfinite(event)
+            keep &= time > 0.0
         df = df.loc[keep].copy()
         person_id = person_id.loc[keep].copy()
+        time = time[keep.to_numpy()]
+        event = event[keep.to_numpy()]
+    elif survival_meta["has_survival"] and (
+        (not np.all(np.isfinite(time))) or (not np.all(np.isfinite(event)))
+    ):
+        raise ValueError("survival time/event columns contain non-finite values")
 
     types = tuple(COHORT_NODE_TYPES[c] for c in present)
 
@@ -481,8 +576,8 @@ def load_cohort_dataset_with_person_ids(
     n, p = X.shape
     dataset = SyntheticDataset(
         X=X,
-        time=np.zeros(n, dtype=float),
-        event=np.zeros(n, dtype=int),
+        time=time.astype(float, copy=False) if survival_meta["has_survival"] else np.zeros(n, dtype=float),
+        event=event.astype(int, copy=False) if survival_meta["has_survival"] else np.zeros(n, dtype=int),
         columns=tuple(present),
         node_types=types,
         ground_truth_adj=np.zeros((p, p), dtype=int),
@@ -510,16 +605,38 @@ def load_cohort_dataset(
     """
     from .synthetic import SyntheticDataset
 
+    raw = pd.read_csv(path)
+    time, event, survival_meta = _extract_survival_columns(raw)
     X, columns, node_types = load_cohort_csv(
         path,
         standardise_continuous=standardise_continuous,
         drop_incomplete=drop_incomplete,
     )
     n, p = X.shape
+    if survival_meta["has_survival"]:
+        df = raw.copy()
+        if "person_id" in df.columns:
+            df = df.drop(columns=["person_id"])
+        present = [c for c in COHORT_NODES if c in df.columns]
+        for col in present:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        keep = np.ones(raw.shape[0], dtype=bool)
+        if drop_incomplete:
+            keep &= (~df[present].isna().any(axis=1)).to_numpy()
+        keep &= np.isfinite(time)
+        keep &= np.isfinite(event)
+        keep &= time > 0.0
+        time = time[keep]
+        event = event[keep]
+        if time.shape[0] != n:
+            raise RuntimeError("internal survival row alignment mismatch")
+    else:
+        time = np.zeros(n, dtype=float)
+        event = np.zeros(n, dtype=int)
     return SyntheticDataset(
         X=X,
-        time=np.zeros(n, dtype=float),
-        event=np.zeros(n, dtype=int),
+        time=time.astype(float, copy=False),
+        event=event.astype(int, copy=False),
         columns=columns,
         node_types=node_types,
         ground_truth_adj=np.zeros((p, p), dtype=int),
@@ -710,26 +827,6 @@ def resolve_aou_genotypes(
     return bed
 
 
-def load_or_build_cohort(
-    name: str = "complete",
-    cache_dir: str | os.PathLike = ".",
-    bucket: Optional[str] = None,
-    builder: Optional[Callable[[], CohortBuildResult]] = None,
-    upload_after_build: bool = False,
-) -> Path:
-    """Resolve a cached cohort CSV; build it on cache miss."""
-    try:
-        return resolve_cohort_csv(name=name, cache_dir=cache_dir, bucket=bucket)
-    except FileNotFoundError:
-        if builder is None:
-            raise
-        result = builder()
-        pl, cc = write_cohort_cache(
-            result, cache_dir=cache_dir, bucket=bucket, upload=upload_after_build
-        )
-        return cc if name == "complete" else pl
-
-
 # ---------------------------------------------------------------------------
 # Genotype discovery (cheap pre-check before resolve_aou_genotypes downloads)
 # ---------------------------------------------------------------------------
@@ -764,217 +861,6 @@ def discover_genotype_dir(extra: Sequence[str | os.PathLike] = ()) -> Optional[P
         if c.is_dir() and _has_genotype_triple(c):
             return c
     return None
-
-
-# ---------------------------------------------------------------------------
-# OMOP long-frame fetcher (BigQuery; AoU CDR via $WORKSPACE_CDR)
-# ---------------------------------------------------------------------------
-
-
-# Curated common-disease panel used as the default condition filter for the
-# OMOP fetch. Includes T2D, T2D-relevant comorbidities (cardiometabolic,
-# renal, hepatic, neurologic) and other prevalent conditions; covers most
-# of what the EHR-stream crosscoder needs without dragging in the full
-# concept_ancestor closure.
-CURATED_OMOP_CONDITION_IDS: Tuple[int, ...] = (
-    316866, 432867, 80180, 433736, 321588, 440383, 435524, 318800, 439777,
-    201826, 440069, 4152280, 313459, 317009, 443392, 4030518, 44784217,
-    81902, 257007, 318443, 441408, 140673, 317576, 46271022, 436962,
-    4283893, 318736, 192359, 4226263, 378416, 316139, 197320, 4185932,
-    197032, 255848, 437833, 255573, 195562, 31317, 374366, 4027396, 192671,
-    313217, 37311061, 80502, 4212540, 4319447, 436676, 321052, 381591,
-    201340, 379019, 201620, 132797, 4256228, 317002, 437541, 432870, 30753,
-    321318, 444247, 441848, 434610, 441788, 319049, 4318985, 436073, 440674,
-    372328, 443454, 380378, 435224, 4112853, 439727, 80809, 312327, 137053,
-    4174977, 440417, 4163261, 438120, 444429, 4133004, 193782, 438409,
-    4322024, 374377, 4064161, 432585, 73754, 139900, 134438, 441284, 140168,
-    4137275, 201254, 199074, 4266367, 373503, 200528, 4260535, 438130,
-    257628, 374028, 133444, 4286201, 4067106, 319041, 4182210, 24609,
-    4103295, 133834, 4078925, 378414, 4028363, 433527, 254443, 432881,
-    4311499, 4038838, 443727, 4131909, 375806, 440940, 4002359, 4331304,
-    201606, 374919, 45763653, 4024659, 4281232, 434119, 434592, 81893,
-    444044, 4091559, 4180790, 4242574, 198985, 4245975, 432791, 4074815,
-    434821, 434557, 381270, 197508, 321042,
-)
-
-
-def fetch_omop_long_frames(
-    person_ids: Sequence[str],
-    cdr: Optional[str] = None,
-    cache_dir: str | os.PathLike = "data/omop",
-    condition_concept_ids: Optional[Sequence[int]] = CURATED_OMOP_CONDITION_IDS,
-    drug_concept_ids: Optional[Sequence[int]] = None,
-    measurement_concept_ids: Optional[Sequence[int]] = None,
-    fetch_drugs: bool = False,
-    fetch_measurements: bool = False,
-) -> dict[str, pd.DataFrame]:
-    """Pull the four OMOP long-frames consumed by :func:`build_ehr_panel` from the AoU CDR.
-
-    Conditions are filtered to a curated common-disease panel by default so
-    the query is tractable on cohorts of 100k+ participants; pass
-    ``condition_concept_ids=None`` to disable filtering (expensive). Drugs
-    and measurements are skipped by default because their unfiltered tables
-    are billions of rows on AoU; set ``fetch_drugs`` /
-    ``fetch_measurements=True`` (with a non-empty ``*_concept_ids`` list,
-    or ``None`` to mean "all" if you really want it) to include them.
-
-    BigQuery is imported lazily so the module stays importable off-workbench.
-    The cache is keyed on a SHA1 of the sorted ``person_ids`` tuple plus
-    the active filter sets, stored next to each parquet as ``<table>.key``;
-    changing the cohort or the filters silently invalidates the cache
-    without a manual purge.
-    """
-    import hashlib
-    from google.cloud import bigquery
-
-    cdr = cdr if cdr is not None else os.environ.get("WORKSPACE_CDR")
-    if not cdr:
-        raise RuntimeError("WORKSPACE_CDR is not set; pass cdr=... explicitly")
-    cdr = cdr.strip().strip("`")
-
-    pid_int = sorted({int(p) for p in person_ids})
-    cond_ids = (
-        sorted({int(c) for c in condition_concept_ids})
-        if condition_concept_ids is not None
-        else None
-    )
-    drug_ids = (
-        sorted({int(c) for c in drug_concept_ids})
-        if drug_concept_ids is not None
-        else None
-    )
-    meas_ids = (
-        sorted({int(c) for c in measurement_concept_ids})
-        if measurement_concept_ids is not None
-        else None
-    )
-
-    def _key_for(table: str) -> str:
-        salt: tuple = (tuple(pid_int),)
-        if table == "condition_long":
-            salt += (("cond", tuple(cond_ids) if cond_ids is not None else None),)
-        elif table == "drug_long":
-            salt += (("drug", tuple(drug_ids) if drug_ids is not None else None),)
-        elif table == "measurement_long":
-            salt += (("meas", tuple(meas_ids) if meas_ids is not None else None),)
-        return hashlib.sha1(repr(salt).encode("utf-8")).hexdigest()
-
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    cond_filter = (
-        " AND condition_concept_id IN UNNEST(@condition_concept_ids)"
-        if cond_ids is not None
-        else ""
-    )
-    drug_filter = (
-        " AND drug_concept_id IN UNNEST(@drug_concept_ids)"
-        if drug_ids is not None
-        else ""
-    )
-    meas_filter = (
-        " AND m.measurement_concept_id IN UNNEST(@measurement_concept_ids)"
-        if meas_ids is not None
-        else ""
-    )
-
-    queries: dict[str, tuple[str, list]] = {
-        "condition_long": (
-            f"SELECT CAST(person_id AS STRING) AS person_id, "
-            f"CAST(condition_concept_id AS STRING) AS phecode, "
-            f"condition_start_datetime AS datetime "
-            f"FROM `{cdr}.condition_occurrence` "
-            f"WHERE person_id IN UNNEST(@person_ids){cond_filter}",
-            (
-                [bigquery.ArrayQueryParameter("condition_concept_ids", "INT64", cond_ids)]
-                if cond_ids is not None else []
-            ),
-        ),
-        "visit_long": (
-            f"SELECT CAST(person_id AS STRING) AS person_id, "
-            f"visit_start_datetime AS datetime "
-            f"FROM `{cdr}.visit_occurrence` "
-            f"WHERE person_id IN UNNEST(@person_ids)",
-            [],
-        ),
-    }
-    if fetch_drugs:
-        queries["drug_long"] = (
-            f"SELECT CAST(person_id AS STRING) AS person_id, "
-            f"CAST(drug_concept_id AS STRING) AS atc_class, "
-            f"drug_exposure_start_datetime AS datetime "
-            f"FROM `{cdr}.drug_exposure` "
-            f"WHERE person_id IN UNNEST(@person_ids){drug_filter}",
-            (
-                [bigquery.ArrayQueryParameter("drug_concept_ids", "INT64", drug_ids)]
-                if drug_ids is not None else []
-            ),
-        )
-    if fetch_measurements:
-        queries["measurement_long"] = (
-            f"SELECT CAST(m.person_id AS STRING) AS person_id, "
-            f"c.concept_name AS lab, "
-            f"m.value_as_number AS value, "
-            f"m.measurement_datetime AS datetime "
-            f"FROM `{cdr}.measurement` AS m "
-            f"JOIN `{cdr}.concept` AS c "
-            f"ON m.measurement_concept_id = c.concept_id "
-            f"WHERE m.person_id IN UNNEST(@person_ids) "
-            f"AND m.value_as_number IS NOT NULL{meas_filter}",
-            (
-                [bigquery.ArrayQueryParameter("measurement_concept_ids", "INT64", meas_ids)]
-                if meas_ids is not None else []
-            ),
-        )
-
-    client = None
-    out: dict[str, pd.DataFrame] = {}
-    for table, (sql, extra_params) in queries.items():
-        parquet_path = cache_dir / f"{table}.parquet"
-        key_path = cache_dir / f"{table}.key"
-        key = _key_for(table)
-        if (
-            parquet_path.is_file()
-            and key_path.is_file()
-            and key_path.read_text().strip() == key
-        ):
-            out[table] = pd.read_parquet(parquet_path)
-            continue
-        if client is None:
-            client = bigquery.Client()
-        params = [bigquery.ArrayQueryParameter("person_ids", "INT64", pid_int)] + extra_params
-        job_config = bigquery.QueryJobConfig(query_parameters=params)
-        frame = client.query(sql, job_config=job_config).to_dataframe()
-        frame["person_id"] = frame["person_id"].astype(str)
-        frame.to_parquet(parquet_path, index=False)
-        key_path.write_text(key)
-        out[table] = frame
-
-    return out
-
-
-def resolve_baseline_dt(
-    person_ids: Sequence[str],
-    visit_long: pd.DataFrame,
-) -> pd.Series:
-    """Define each participant's baseline as their earliest AoU encounter.
-
-    First-visit anchoring is a no-lookahead choice that exists for every
-    participant (cases and non-cases alike), unlike diagnosis date which is
-    only defined for incident T2D. Persons with no visits keep ``NaT`` so
-    downstream filters drop them rather than silently leaking future data.
-    """
-    pids = pd.Index([str(p) for p in person_ids], name="person_id").unique()
-    if visit_long is None or len(visit_long) == 0:
-        return pd.Series(
-            pd.NaT, index=pids, name="baseline_dt", dtype="datetime64[ns]"
-        )
-    vl = visit_long[["person_id", "datetime"]].copy()
-    vl["person_id"] = vl["person_id"].astype(str)
-    vl["datetime"] = pd.to_datetime(vl["datetime"], errors="coerce")
-    vl = vl.dropna(subset=["datetime"])
-    earliest = vl.groupby("person_id", sort=False)["datetime"].min()
-    return earliest.reindex(pids).rename("baseline_dt")
 
 
 # ---------------------------------------------------------------------------
@@ -1335,9 +1221,6 @@ __all__ = [
     "resolve_aou_genotypes",
     "AOU_GENOTYPE_BUCKET",
     "AOU_GENOTYPE_FILES",
-    "fetch_omop_long_frames",
-    "resolve_baseline_dt",
-    "CURATED_OMOP_CONDITION_IDS",
     "build_ehr_panel",
     "CohortBuildResult",
     "EhrPanel",

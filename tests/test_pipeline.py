@@ -27,6 +27,7 @@ def _make_tiny_cohort_csv(path):
     t2d = (rng.random(n) < p).astype(int)
     pd.DataFrame(
         {
+            "person_id": [str(1000 + i) for i in range(n)],
             "type2_diabetes": t2d,
             "bmi": bmi,
             "hba1c": hba1c,
@@ -37,9 +38,23 @@ def _make_tiny_cohort_csv(path):
     ).to_csv(path, index=False)
 
 
+def _make_tiny_prs_csv(path):
+    rng = np.random.default_rng(1)
+    n = 80
+    pd.DataFrame(
+        {
+            "person_id": [str(1000 + i) for i in range(n)],
+            "PGS_T2D": rng.normal(size=n),
+            "PGS_BMI": rng.normal(size=n),
+            "PGS_LDL": rng.normal(size=n),
+        }
+    ).to_csv(path, index=False)
+
+
 def test_pipeline_runs_end_to_end(tmp_path):
     """``run_pipeline`` finishes and ``save_result`` writes every artefact."""
     _make_tiny_cohort_csv(tmp_path / "t2d_initial_nodes_complete.csv")
+    _make_tiny_prs_csv(tmp_path / "aou_prs_panel.csv.gz")
 
     from causal_pred.pipeline import (
         PipelineResult,
@@ -57,6 +72,8 @@ def test_pipeline_runs_end_to_end(tmp_path):
         mcmc_thin=5,
         mcmc_chains=2,
         cache_dir=str(tmp_path),
+        prs_path=str(tmp_path / "aou_prs_panel.csv.gz"),
+        n_prs_nodes=2,
     )
 
     assert isinstance(result, PipelineResult)
@@ -68,6 +85,8 @@ def test_pipeline_runs_end_to_end(tmp_path):
         "hdl_cholesterol",
         "ldl_cholesterol",
         "triglycerides",
+        "pgs_t2d",
+        "pgs_bmi",
     )
     assert tuple(result.columns) == expected_columns
     p = len(result.columns)
@@ -102,6 +121,7 @@ def test_pipeline_runs_end_to_end(tmp_path):
 def test_pipeline_determinism(tmp_path):
     """Two runs with the same seed produce identical edge_probs."""
     _make_tiny_cohort_csv(tmp_path / "t2d_initial_nodes_complete.csv")
+    _make_tiny_prs_csv(tmp_path / "aou_prs_panel.csv.gz")
 
     from causal_pred.pipeline import run_pipeline
 
@@ -115,6 +135,8 @@ def test_pipeline_determinism(tmp_path):
         mcmc_thin=5,
         mcmc_chains=2,
         cache_dir=str(tmp_path),
+        prs_path=str(tmp_path / "aou_prs_panel.csv.gz"),
+        n_prs_nodes=2,
     )
     r2 = run_pipeline(
         seed=7,
@@ -126,6 +148,8 @@ def test_pipeline_determinism(tmp_path):
         mcmc_thin=5,
         mcmc_chains=2,
         cache_dir=str(tmp_path),
+        prs_path=str(tmp_path / "aou_prs_panel.csv.gz"),
+        n_prs_nodes=2,
     )
     np.testing.assert_allclose(r1.mcmc_edge_probs, r2.mcmc_edge_probs, atol=1e-12)
     np.testing.assert_array_equal(r1.dagslam_adjacency, r2.dagslam_adjacency)

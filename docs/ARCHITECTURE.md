@@ -76,8 +76,9 @@ and merges with a binary T2D node from the condition frame to produce
 a 7-node wide CSV. The production cache is `data/t2d_initial_nodes_complete.csv`;
 `resolve_cohort_csv` checks that local file first, then copies the same
 canonical filename from `$WORKSPACE_BUCKET/data/` via `gsutil cp`.
-`load_cohort_dataset` returns a `SyntheticDataset` ready to flow through
-DAGSLAM -> MCMC.
+`load_cohort_dataset_with_person_ids` is the production loader because the
+single pipeline always aligns microarray-derived PRS back to participant IDs
+before DAGSLAM -> MCMC.
 
 ### `mrdag/`
 Produces an edge-inclusion posterior matrix `pi` of shape `(p, p)` from
@@ -171,14 +172,13 @@ plink manifests that `gnomon` expects, and shells out to
 (b) HWE-PCA ancestry projection and (c) sample-term inference. The Python
 code never recomputes any of these; it only parses the JSON/TSV output and
 caches it alongside the input path. If `gnomon` is absent the wrapper
-raises a clear `NotImplementedError` naming the missing binary rather than
-falling back to an inexact Python reimplementation.
+raises a clear `NotImplementedError` naming the missing binary.
 
 ### How to retarget at a different biobank
-1. Write a loader that yields `(X, time, event, node_types)` matching the
-   column order in `data/nodes.py`. Keep clinical units.
-2. Point `pipeline.py` at the new loader behind a `--data` flag rather
-   than editing the synthetic generator.
+1. Write a loader that yields the cohort CSV plus stable participant IDs.
+   Keep clinical units and map the model columns in `pipeline.py`.
+2. Update the single loader/constants in `pipeline.py`; do not add a second
+   production entry path.
 3. Provide per-ancestry HWE-PCA eigenvectors so `gnomon` can project new
    samples into the reference PC space.
 4. Re-examine the `real_gwas.py` IVs: some will not transport (eg HbA1c
