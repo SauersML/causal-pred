@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .data.cohort import load_cohort_dataset, resolve_cohort_csv
+from .data.cohort import EhrPanel, load_cohort_dataset, resolve_cohort_csv
 from .data.synthetic import SyntheticDataset
 from .dagslam import run_dagslam
 from .mcmc import run_structure_mcmc
@@ -54,6 +54,7 @@ class PipelineResult:
     thresholded_adjacency: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=int))
     threshold: float = THRESHOLD_DEFAULT
     timings: Dict[str, float] = field(default_factory=dict)
+    genscore_features: Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -93,11 +94,31 @@ def run_pipeline(
     cache_dir: str = ".",
     bucket: Optional[str] = None,
     cohort_name: str = "complete",
+    *,
+    base_person_ids: Optional[Sequence[str]] = None,
+    prs_panel: Optional[Any] = None,  # pandas.DataFrame; typed Any to avoid an import cycle
+    ehr_panel: Optional[EhrPanel] = None,
+    crosscoder_kwargs: Optional[Dict[str, Any]] = None,
+    n_promote: int = 32,
+    genome_share_min: float = 0.2,
+    genome_share_max: float = 0.8,
+    min_activation_rate: float = 0.01,
 ) -> PipelineResult:
-    """Cohort CSV -> DAGSLAM -> structure MCMC -> result."""
+    """Cohort CSV -> [optional crosscoder augmentation] -> DAGSLAM -> structure MCMC.
+
+    The crosscoder stage runs only when **all three** of ``base_person_ids``,
+    ``prs_panel``, and ``ehr_panel`` are supplied. When it runs, it trains a
+    TopK crosscoder on the aligned (genome, EHR) panels, promotes a small
+    number of cross-modal features (default 32), appends them as new
+    continuous DAG nodes, and re-uses the same downstream stack to recover
+    edges *between* those features and the cohort columns. The promotion
+    rule is structural (cross-modal coherence + activation rate); no
+    auto-interp is performed.
+    """
     logger = _setup_logger(verbose)
     rng = np.random.default_rng(seed)
     timings: Dict[str, float] = {}
+    genscore_features: Dict[str, Any] = {}
 
     # -- data ---------------------------------------------------------
     t0 = time.time()
@@ -113,6 +134,60 @@ def run_pipeline(
         data.p,
         list(data.columns),
     )
+
+    # -- (optional) crosscoder augmentation ---------------------------
+    if (
+        base_person_ids is not None
+        and prs_panel is not None
+        and ehr_panel is not None
+    ):
+        # Local import keeps top-level pipeline module free of pandas at
+        # import time when the augmentation path is not used.
+        from .genscore.integrate import run_genscore
+
+        t0 = time.time()
+        aug_result, model = run_genscore(
+            base_dataset=data,
+            base_person_ids=base_person_ids,
+            prs_df=prs_panel,
+            ehr_panel=ehr_panel,
+            n_promote=n_promote,
+            genome_share_min=genome_share_min,
+            genome_share_max=genome_share_max,
+            min_activation_rate=min_activation_rate,
+            crosscoder_kwargs=crosscoder_kwargs,
+            rng=rng,
+        )
+        timings["crosscoder"] = time.time() - t0
+
+        sel = aug_result.feature_selection
+        logger.info(
+            "[crosscoder] d=%d k=%d promoted=%d base_n=%d augmented_n=%d "
+            "loss_main_init=%.4f loss_main_final=%.4f frac_dead_final=%.3f",
+            model.d,
+            model.k,
+            int(sel.indices.size),
+            aug_result.base_n,
+            aug_result.augmented_n,
+            float(model.history["loss_main"][0]) if model.history["loss_main"] else float("nan"),
+            float(model.history["loss_main"][-1]) if model.history["loss_main"] else float("nan"),
+            float(model.history["frac_dead"][-1]) if model.history["frac_dead"] else float("nan"),
+        )
+        genscore_features = {
+            "crosscoder_d": int(model.d),
+            "crosscoder_k": int(model.k),
+            "promoted_indices": sel.indices.tolist(),
+            "promoted_names": list(sel.names),
+            "promoted_genome_share": sel.genome_share.tolist(),
+            "promoted_activation_rate": sel.activation_rate.tolist(),
+            "base_n": int(aug_result.base_n),
+            "augmented_n": int(aug_result.augmented_n),
+            "loss_history_step": list(model.history["step"]),
+            "loss_history_main": list(model.history["loss_main"]),
+            "loss_history_aux": list(model.history["loss_aux"]),
+            "frac_dead_history": list(model.history["frac_dead"]),
+        }
+        data = aug_result.dataset
 
     # -- dagslam ------------------------------------------------------
     t0 = time.time()
@@ -179,6 +254,7 @@ def run_pipeline(
         thresholded_adjacency=thresholded,
         threshold=float(threshold),
         timings=timings,
+        genscore_features=genscore_features,
     )
 
 
@@ -285,6 +361,7 @@ def save_result(
         "mcmc_diagnostics": diagnostics,
         "threshold": result.threshold,
         "timings": result.timings,
+        "genscore_features": result.genscore_features,
     }
     paths["summary_json"] = os.path.join(outdir, "summary.json")
     with open(paths["summary_json"], "w") as fh:

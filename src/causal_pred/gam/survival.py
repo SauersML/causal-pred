@@ -152,12 +152,11 @@ def _predict_survival_matrix(
 ) -> np.ndarray:
     """Return ``(n_new, n_t)`` survival probabilities S(t | x).
 
-    Builds a prediction frame with the same ``entry`` / ``exit`` /
-    ``event`` columns the fit consumed (their values are only used by
-    the library to choose its dense FFI grid endpoints; ``survival_at``
-    interpolates the resulting surface at the user-supplied
-    ``t_grid``). Binary covariate columns are passed through unchanged;
-    continuous columns enter directly as floats.
+    The gamfit library evaluates the survival surface at each prediction
+    row's own ``exit`` time. To recover the full ``(n_new, n_t)`` curve
+    we expand the input into ``n_new * n_t`` rows -- each X repeated
+    across the ``t_grid`` with ``exit`` set to that grid point -- then
+    reshape the per-row survival probabilities back to ``(n_new, n_t)``.
     """
     p = len(fit.columns)
     if p > 0:
@@ -171,30 +170,36 @@ def _predict_survival_matrix(
     if n_new == 0 or n_t == 0:
         return np.zeros((n_new, n_t), dtype=float)
 
-    # The library auto-builds its 64-point FFI grid from the entry/exit
-    # range in df_new. Span ``exit`` slightly past max(t_grid) so
-    # ``survival_at`` can interpolate at the boundary without clipping.
-    span_max = float(np.max(t_grid)) * 1.05 + 1e-9
+    # Long format: one row per (individual, time-point) pair.
+    rep_X = (
+        np.repeat(X_new, n_t, axis=0)
+        if p > 0
+        else np.zeros((n_new * n_t, 0))
+    )
+    rep_t = np.tile(t_grid, n_new)
+    rep_entry = np.zeros_like(rep_t, dtype=float)
+    rep_event = np.ones_like(rep_t, dtype=float)
+
     df_new = pd.DataFrame(
         {
-            "entry": np.zeros(n_new, dtype=float),
-            "exit": np.full(n_new, span_max, dtype=float),
-            "event": np.ones(n_new, dtype=float),
-            **{name: X_new[:, i] for i, name in enumerate(fit.columns)},
+            "entry": rep_entry,
+            "exit": rep_t,
+            "event": rep_event,
+            **{name: rep_X[:, i] for i, name in enumerate(fit.columns)},
         }
     )
 
     pred = fit.model.predict(df_new)
-    S_mean = np.asarray(pred.survival_at(t_grid), dtype=float)
-    if S_mean.shape != (n_new, n_t):
+    surv = np.asarray(pred.survival, dtype=float)         # (n_new * n_t, 1)
+    if surv.shape != (n_new * n_t, 1):
         raise RuntimeError(
-            f"survival_at returned shape {S_mean.shape}; "
-            f"expected ({n_new}, {n_t})"
+            f"gamfit returned survival of shape {surv.shape}; "
+            f"expected ({n_new * n_t}, 1)"
         )
+    S_mean = surv.reshape(n_new, n_t)
 
     # S must be non-increasing in t; enforce by left-to-right cumulative
-    # minimum so any tiny interpolation overshoot does not violate
-    # monotonicity downstream.
+    # minimum so floating-point noise can't violate monotonicity.
     S_mean = np.minimum.accumulate(S_mean, axis=1)
     return np.clip(S_mean, 0.0, 1.0)
 

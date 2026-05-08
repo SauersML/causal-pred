@@ -425,6 +425,144 @@ def score_cohort(
     return merged
 
 
+def score_panel(
+    genotype_path: str,
+    score_path: str | Sequence[str],
+    out_dir: str | None = None,
+    n_threads: int | None = None,
+    timeout: int = 1800,
+) -> pd.DataFrame:
+    """Score a cohort against a *panel* of PGS files in a single gnomon call.
+
+    ``gnomon score`` accepts a path to either a single PGS file or a
+    directory of PGS files (per ``cli/main.rs`` ``ScoreArgs::score`` doc).
+    Given a directory it natively parallelises across both samples and score
+    files via rayon, writes one merged ``<cohort>_<dirname>.sscore`` to the
+    genotype's directory, and the score column names come from the **headers
+    of each PGS file** (one ``<name>_AVG`` column per score-name in the file
+    header). Many PGS files in one directory thus produce one ``.sscore``
+    with one column per score-name, alphabetically ordered (gnomon collects
+    the names through a ``BTreeSet`` in ``score/prepare.rs``).
+
+    This wrapper accepts either a directory or a list of files:
+
+    * If ``score_path`` is a string and points to an existing directory,
+      gnomon is invoked directly against it.
+    * If it is a string pointing to a single file, this is just a single-PGS
+      score run (still uses one process).
+    * If it is a sequence of file paths, the wrapper stages them into a
+      private scratch directory and invokes gnomon once against that
+      directory.
+
+    Parameters
+    ----------
+    genotype_path : str
+        Path to a PLINK prefix / ``.bed`` / VCF / BCF input.
+    score_path : str or sequence of str
+        Either a directory of PGS files, a single PGS file, or a list of
+        PGS files to be staged into one directory.
+    out_dir : str, optional
+        Directory to hold gnomon artefacts. If ``None`` a scratch directory
+        is used and the parsed frame is returned before cleanup.
+    n_threads : int, optional
+        Forwarded as ``RAYON_NUM_THREADS`` to gnomon.
+    timeout : int
+        Subprocess timeout (seconds). Defaults to 30 min for biobank-scale
+        panels.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Indexed by sample IID (string), one ``float64`` column per
+        score-name read from the PGS-file headers. Column order matches
+        gnomon's internal ordering (alphabetical via ``BTreeSet``); use
+        ``df.columns`` to discover what came back.
+    """
+    binary = _locate_gnomon()
+
+    env = os.environ.copy()
+    if n_threads is not None:
+        env["RAYON_NUM_THREADS"] = str(int(n_threads))
+
+    # Resolve score_path into either an existing directory or a list of files
+    # we have to stage.
+    files_to_stage: Optional[list[str]] = None
+    direct_score_path: Optional[Path] = None
+    if isinstance(score_path, str):
+        sp = Path(score_path)
+        if not sp.exists():
+            raise FileNotFoundError(f"score path does not exist: {score_path}")
+        direct_score_path = sp
+    else:
+        files_to_stage = list(score_path)
+        if not files_to_stage:
+            raise ValueError("score_path sequence must be non-empty")
+
+    def _run_panel(work_dir: Path) -> pd.DataFrame:
+        if files_to_stage is not None:
+            scores_dir = work_dir / "scores"
+            scores_dir.mkdir(parents=True, exist_ok=True)
+            for sf in files_to_stage:
+                src = Path(sf)
+                if not src.is_file():
+                    raise FileNotFoundError(f"score file does not exist: {sf}")
+                link = scores_dir / src.name
+                if link.exists():
+                    continue
+                try:
+                    os.symlink(src.resolve(), link)
+                except OSError:
+                    shutil.copy2(src, link)
+            score_arg: Path = scores_dir
+        else:
+            assert direct_score_path is not None
+            score_arg = direct_score_path
+
+        genotype_in = _materialise_genotype(genotype_path, work_dir)
+        cmd = [binary, "score", str(score_arg), str(genotype_in)]
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise PolygenicRunError(
+                f"gnomon score (panel) failed ({' '.join(cmd)!s}):\n"
+                f"--- stdout ---\n{exc.stdout}\n"
+                f"--- stderr ---\n{exc.stderr}"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise PolygenicRunError(
+                f"gnomon score (panel) timed out after {timeout}s"
+            ) from exc
+
+        # gnomon writes <genotype_stem>_<score_basename>.sscore in the dir
+        # that holds the staged genotype (that's our work_dir).
+        candidates = list(work_dir.glob("*.sscore"))
+        if not candidates:
+            raise PolygenicRunError(
+                f"gnomon score produced no .sscore in {work_dir}"
+            )
+        # Pick the candidate whose stem starts with the genotype stem.
+        gstem = Path(genotype_in).stem
+        preferred = [c for c in candidates if c.stem.startswith(gstem)]
+        sscore = preferred[0] if preferred else candidates[0]
+
+        frame = parse_sscore(sscore)
+        return frame
+
+    if out_dir is None:
+        with tempfile.TemporaryDirectory(prefix="gnomon_panel_") as td:
+            return _run_panel(Path(td))
+    base = Path(out_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    return _run_panel(base)
+
+
 def fit_pca(
     genotype_path: str,
     n_pcs: int = 10,
@@ -755,6 +893,7 @@ __all__ = [
     "PolygenicRunError",
     "gnomon_available",
     "score_cohort",
+    "score_panel",
     "fit_pca",
     "project_pca",
     "infer_terms",

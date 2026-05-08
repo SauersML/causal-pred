@@ -35,7 +35,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -468,8 +468,16 @@ def load_cohort_dataset(
 # ---------------------------------------------------------------------------
 
 
+AOU_GENOTYPE_BUCKET: str = "gs://fc-aou-datasets-controlled/v8/microarray/plink"
+AOU_GENOTYPE_FILES: Tuple[str, ...] = ("arrays.bed", "arrays.bim", "arrays.fam")
+
+
 def _gsutil() -> Optional[str]:
     return shutil.which("gsutil")
+
+
+def _gcloud() -> Optional[str]:
+    return shutil.which("gcloud")
 
 
 def _bucket_path(bucket: str, filename: str) -> str:
@@ -567,6 +575,65 @@ def write_cohort_cache(
     return pl, cc
 
 
+def resolve_aou_genotypes(
+    cache_dir: str | os.PathLike = ".",
+    bucket: str = AOU_GENOTYPE_BUCKET,
+    billing_project: Optional[str] = None,
+) -> Path:
+    """Return the local path to the AoU v8 microarray PLINK ``.bed`` prefix.
+
+    Looks for ``arrays.bed``, ``arrays.bim``, ``arrays.fam`` under
+    ``cache_dir`` and downloads only the files that are missing (or
+    zero-byte) from ``bucket`` via ``gcloud storage cp``. Existing files
+    are kept as-is, so calling this after a partial download resumes the
+    untransferred members of the triple without re-fetching the rest.
+
+    The bucket is requester-pays: ``billing_project`` (or the
+    ``GOOGLE_PROJECT`` env-var, which the AoU Researcher Workbench sets
+    automatically) is forwarded to ``gcloud storage cp --billing-project``.
+    Subprocess output is **not** captured so progress streams to the
+    terminal -- the full triple is ~180 GiB and takes ~20 min on the
+    workbench's default network.
+
+    Returns the path to ``arrays.bed``; pass this (or its prefix without
+    the suffix) to gnomon / PLINK callers.
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    bucket = bucket.rstrip("/")
+
+    missing = [
+        fname
+        for fname in AOU_GENOTYPE_FILES
+        if not (cache_dir / fname).is_file() or (cache_dir / fname).stat().st_size == 0
+    ]
+
+    if missing:
+        gc = _gcloud()
+        if gc is None:
+            raise RuntimeError(
+                "gcloud is not on PATH; cannot fetch from the AoU controlled bucket"
+            )
+        project = billing_project or os.environ.get("GOOGLE_PROJECT")
+        if not project:
+            raise RuntimeError(
+                "billing_project / $GOOGLE_PROJECT must be set to download from "
+                f"the requester-pays bucket {bucket!r}"
+            )
+        for fname in missing:
+            src = f"{bucket}/{fname}"
+            dst = cache_dir / fname
+            subprocess.run(
+                [gc, "storage", "cp", src, str(dst), f"--billing-project={project}"],
+                check=True,
+            )
+
+    bed = cache_dir / AOU_GENOTYPE_FILES[0]
+    if not bed.is_file():
+        raise FileNotFoundError(f"missing PLINK .bed after fetch: {bed}")
+    return bed
+
+
 def load_or_build_cohort(
     name: str = "complete",
     cache_dir: str | os.PathLike = ".",
@@ -593,6 +660,343 @@ def load_or_build_cohort(
         return cc if name == "complete" else pl
 
 
+# ---------------------------------------------------------------------------
+# EHR panel: high-dim baseline-censored matrix for the crosscoder's EHR stream
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EhrPanel:
+    """Wide, baseline-censored EHR feature matrix.
+
+    Attributes
+    ----------
+    matrix : (n, m_E) float64
+        One row per participant, in the order of ``person_id``.
+    person_id : (n,) array of str
+        Participant identifiers (string).
+    feature_names : tuple of str, length m_E
+        Column names of ``matrix``.
+    feature_kinds : tuple of str, length m_E
+        Per-column kind tag, one of ``"condition"``, ``"drug"``, ``"lab_mean"``,
+        ``"lab_min"``, ``"lab_max"``, ``"lab_slope"``, ``"utilisation"``.
+        Useful for downstream reweighting / residualisation.
+    """
+
+    matrix: np.ndarray
+    person_id: np.ndarray
+    feature_names: Tuple[str, ...]
+    feature_kinds: Tuple[str, ...]
+
+    @property
+    def n(self) -> int:
+        return int(self.matrix.shape[0])
+
+    @property
+    def m(self) -> int:
+        return int(self.matrix.shape[1])
+
+
+def _filter_pre_baseline(
+    long_df: pd.DataFrame,
+    datetime_col: str,
+    baseline_dt: pd.Series,
+    lookback_days: Optional[int],
+    person_col: str,
+) -> pd.DataFrame:
+    """Keep only events strictly before each person's baseline datetime.
+
+    ``baseline_dt`` is a Series indexed by ``person_id`` carrying the baseline
+    datetime (the GAM ``time = 0``). If ``lookback_days`` is given, events
+    older than ``baseline - lookback_days`` are dropped as well.
+    """
+    df = long_df.copy()
+    df[datetime_col] = pd.to_datetime(df[datetime_col], errors="coerce")
+    df = df.dropna(subset=[datetime_col, person_col])
+    bd = baseline_dt.reindex(df[person_col]).to_numpy()
+    keep = df[datetime_col].to_numpy() < bd
+    if lookback_days is not None:
+        lookback_floor = pd.to_datetime(bd) - pd.Timedelta(days=int(lookback_days))
+        keep &= df[datetime_col].to_numpy() >= lookback_floor.to_numpy()
+    return df.loc[keep].copy()
+
+
+def _wide_indicator(
+    long_df: pd.DataFrame,
+    person_col: str,
+    group_col: str,
+    person_order: pd.Series,
+    min_prevalence: int,
+    prefix: str,
+) -> Tuple[np.ndarray, list[str]]:
+    """Return a binary (n, m) matrix and column names for a long event frame.
+
+    Each row is a participant in the order of ``person_order``; each column is
+    a group whose count of distinct participants meets ``min_prevalence``.
+    Cells are 1 if the (person, group) pair has at least one row, else 0.
+    """
+    if long_df.empty:
+        return np.zeros((len(person_order), 0), dtype=np.float64), []
+    counts = (
+        long_df.drop_duplicates([person_col, group_col])
+        .groupby(group_col)[person_col]
+        .nunique()
+    )
+    keep_groups = counts[counts >= min_prevalence].index.tolist()
+    if not keep_groups:
+        return np.zeros((len(person_order), 0), dtype=np.float64), []
+    idx_by_pid = {pid: i for i, pid in enumerate(person_order.tolist())}
+    col_by_grp = {g: j for j, g in enumerate(keep_groups)}
+    n = len(person_order)
+    m = len(keep_groups)
+    mat = np.zeros((n, m), dtype=np.float64)
+    sub = long_df[long_df[group_col].isin(set(keep_groups))]
+    pids = sub[person_col].to_numpy()
+    grps = sub[group_col].to_numpy()
+    for pid, grp in zip(pids, grps):
+        i = idx_by_pid.get(pid)
+        if i is None:
+            continue
+        mat[i, col_by_grp[grp]] = 1.0
+    cols = [f"{prefix}:{g}" for g in keep_groups]
+    return mat, cols
+
+
+def _lab_summary(
+    long_df: pd.DataFrame,
+    person_col: str,
+    lab_col: str,
+    value_col: str,
+    datetime_col: str,
+    baseline_dt: pd.Series,
+    person_order: pd.Series,
+    min_observations: int,
+) -> Tuple[np.ndarray, list[str], list[str]]:
+    """Per-(person, lab) summary stats: mean / min / max / slope (yr^-1).
+
+    The slope is OLS of ``value`` on ``years_until_baseline`` (so a *positive*
+    slope means the lab has been rising as the person approaches baseline).
+    Persons / labs with fewer than ``min_observations`` measurements get NaN
+    in the slope; the per-lab column mean fills NaN at the end. Labs whose
+    *number of distinct participants* with any measurement is below
+    ``min_observations`` are dropped.
+    """
+    if long_df.empty:
+        return np.zeros((len(person_order), 0), dtype=np.float64), [], []
+    df = long_df.copy()
+    df[datetime_col] = pd.to_datetime(df[datetime_col], errors="coerce")
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+    df = df.dropna(subset=[person_col, lab_col, value_col, datetime_col])
+    bd = baseline_dt.reindex(df[person_col]).to_numpy()
+    df["years_until_baseline"] = (
+        bd - df[datetime_col].to_numpy()
+    ) / np.timedelta64(365, "D")
+    df["years_until_baseline"] = -df["years_until_baseline"].astype(float)
+    # i.e. negative for events in the past.
+
+    lab_counts = df.groupby(lab_col)[person_col].nunique()
+    keep_labs = sorted(lab_counts[lab_counts >= min_observations].index.tolist())
+    if not keep_labs:
+        return np.zeros((len(person_order), 0), dtype=np.float64), [], []
+    df = df[df[lab_col].isin(set(keep_labs))]
+
+    idx_by_pid = {pid: i for i, pid in enumerate(person_order.tolist())}
+    col_by_lab = {lab: j for j, lab in enumerate(keep_labs)}
+    n = len(person_order)
+    m = len(keep_labs)
+
+    means = np.full((n, m), np.nan, dtype=np.float64)
+    mins = np.full((n, m), np.nan, dtype=np.float64)
+    maxs = np.full((n, m), np.nan, dtype=np.float64)
+    slopes = np.full((n, m), np.nan, dtype=np.float64)
+
+    for (pid, lab), g in df.groupby([person_col, lab_col]):
+        i = idx_by_pid.get(pid)
+        if i is None:
+            continue
+        j = col_by_lab[lab]
+        v = g[value_col].to_numpy(dtype=float)
+        means[i, j] = float(np.mean(v))
+        mins[i, j] = float(np.min(v))
+        maxs[i, j] = float(np.max(v))
+        if len(v) >= 2:
+            t = g["years_until_baseline"].to_numpy(dtype=float)
+            tc = t - t.mean()
+            denom = float(np.sum(tc * tc))
+            if denom > 1e-12:
+                slopes[i, j] = float(np.sum(tc * (v - v.mean())) / denom)
+
+    def _impute_col_means(mat: np.ndarray) -> np.ndarray:
+        col_means = np.nanmean(mat, axis=0)
+        col_means = np.where(np.isfinite(col_means), col_means, 0.0)
+        out = np.where(np.isnan(mat), col_means[None, :], mat)
+        return out
+
+    means = _impute_col_means(means)
+    mins = _impute_col_means(mins)
+    maxs = _impute_col_means(maxs)
+    slopes = _impute_col_means(slopes)
+
+    block = np.concatenate([means, mins, maxs, slopes], axis=1)
+    names = (
+        [f"lab_mean:{lab}" for lab in keep_labs]
+        + [f"lab_min:{lab}" for lab in keep_labs]
+        + [f"lab_max:{lab}" for lab in keep_labs]
+        + [f"lab_slope:{lab}" for lab in keep_labs]
+    )
+    kinds = (
+        ["lab_mean"] * m + ["lab_min"] * m + ["lab_max"] * m + ["lab_slope"] * m
+    )
+    return block, names, kinds
+
+
+def build_ehr_panel(
+    person_ids: Sequence[str],
+    baseline_dt: pd.Series,
+    *,
+    condition_long: Optional[pd.DataFrame] = None,
+    drug_long: Optional[pd.DataFrame] = None,
+    measurement_long: Optional[pd.DataFrame] = None,
+    visit_long: Optional[pd.DataFrame] = None,
+    person_col: str = "person_id",
+    condition_group_col: str = "phecode",
+    drug_group_col: str = "atc_class",
+    measurement_lab_col: str = "lab",
+    measurement_value_col: str = "value",
+    datetime_col: str = "datetime",
+    min_prevalence: int = 50,
+    min_lab_observations: int = 50,
+    lookback_days: Optional[int] = 365 * 5,
+) -> EhrPanel:
+    """Assemble the EHR-stream panel from baseline-censored OMOP long-frames.
+
+    All event frames are filtered to *strictly before* each participant's
+    baseline datetime (``time = 0`` for the survival GAM). This is the hard
+    no-lookahead invariant -- features must not be informed by anything that
+    happens after the prediction horizon starts.
+
+    Parameters
+    ----------
+    person_ids : sequence of str
+        Cohort participants. The output ``matrix`` rows are in this order.
+    baseline_dt : pandas.Series
+        Series indexed by ``person_id`` with each participant's baseline
+        datetime. Persons missing here have all events dropped.
+    condition_long : DataFrame, optional
+        Long frame of conditions with columns
+        ``[person_col, condition_group_col, datetime_col]``. Each row is one
+        condition occurrence; ``condition_group_col`` is the rolled-up group
+        (PheCode is the canonical choice; ``condition_concept_id`` is a
+        usable fallback that yields a more granular but noisier panel).
+    drug_long : DataFrame, optional
+        Long frame of drug exposures with columns
+        ``[person_col, drug_group_col, datetime_col]``. ATC level-3 is the
+        canonical group; ``drug_concept_id`` works as a fallback.
+    measurement_long : DataFrame, optional
+        Long frame of lab measurements with columns
+        ``[person_col, measurement_lab_col, measurement_value_col,
+        datetime_col]``. Values must be in canonical units already (use
+        :func:`clean_measurements` upstream).
+    visit_long : DataFrame, optional
+        Long frame of healthcare encounters with columns
+        ``[person_col, datetime_col]``. Used to add a single ``utilisation``
+        covariate (count of pre-baseline encounters).
+    min_prevalence : int
+        Minimum number of distinct participants a condition / drug group
+        must touch to be retained.
+    min_lab_observations : int
+        Minimum number of distinct participants a lab must touch to be kept.
+    lookback_days : int, optional
+        If set, drop events older than ``baseline - lookback_days``.
+        ``None`` keeps the participant's full pre-baseline history.
+
+    Returns
+    -------
+    EhrPanel
+    """
+    pid_array = np.asarray([str(p) for p in person_ids])
+    person_order = pd.Series(pid_array, name=person_col)
+    bd = pd.to_datetime(baseline_dt, errors="coerce")
+    bd.index = bd.index.astype(str)
+
+    blocks: list[np.ndarray] = []
+    names: list[str] = []
+    kinds: list[str] = []
+
+    def _push(mat: np.ndarray, cols: list[str], kind: str) -> None:
+        if mat.shape[1] == 0:
+            return
+        blocks.append(mat)
+        names.extend(cols)
+        kinds.extend([kind] * mat.shape[1])
+
+    if condition_long is not None and len(condition_long):
+        cf = _filter_pre_baseline(
+            condition_long, datetime_col, bd, lookback_days, person_col
+        )
+        cf[person_col] = cf[person_col].astype(str)
+        cf[condition_group_col] = cf[condition_group_col].astype(str)
+        mat, cols = _wide_indicator(
+            cf, person_col, condition_group_col, person_order,
+            min_prevalence, prefix="cond",
+        )
+        _push(mat, cols, "condition")
+
+    if drug_long is not None and len(drug_long):
+        df = _filter_pre_baseline(
+            drug_long, datetime_col, bd, lookback_days, person_col
+        )
+        df[person_col] = df[person_col].astype(str)
+        df[drug_group_col] = df[drug_group_col].astype(str)
+        mat, cols = _wide_indicator(
+            df, person_col, drug_group_col, person_order,
+            min_prevalence, prefix="drug",
+        )
+        _push(mat, cols, "drug")
+
+    if measurement_long is not None and len(measurement_long):
+        mf = _filter_pre_baseline(
+            measurement_long, datetime_col, bd, lookback_days, person_col
+        )
+        mf[person_col] = mf[person_col].astype(str)
+        mf[measurement_lab_col] = mf[measurement_lab_col].astype(str)
+        block, lab_names, lab_kinds = _lab_summary(
+            mf,
+            person_col,
+            measurement_lab_col,
+            measurement_value_col,
+            datetime_col,
+            bd,
+            person_order,
+            min_observations=min_lab_observations,
+        )
+        if block.shape[1] > 0:
+            blocks.append(block)
+            names.extend(lab_names)
+            kinds.extend(lab_kinds)
+
+    if visit_long is not None and len(visit_long):
+        vf = _filter_pre_baseline(
+            visit_long, datetime_col, bd, lookback_days, person_col
+        )
+        vf[person_col] = vf[person_col].astype(str)
+        counts = vf.groupby(person_col).size()
+        util = counts.reindex(pid_array, fill_value=0).to_numpy(dtype=float)
+        _push(util.reshape(-1, 1), ["utilisation:n_encounters"], "utilisation")
+
+    if not blocks:
+        matrix = np.zeros((len(pid_array), 0), dtype=np.float64)
+    else:
+        matrix = np.concatenate(blocks, axis=1)
+
+    return EhrPanel(
+        matrix=matrix.astype(np.float64, copy=False),
+        person_id=pid_array,
+        feature_names=tuple(names),
+        feature_kinds=tuple(kinds),
+    )
+
+
 __all__ = [
     "COHORT_NODES",
     "COHORT_NODE_TYPES",
@@ -608,7 +1012,12 @@ __all__ = [
     "load_cohort_csv",
     "load_cohort_dataset",
     "resolve_cohort_csv",
+    "resolve_aou_genotypes",
+    "AOU_GENOTYPE_BUCKET",
+    "AOU_GENOTYPE_FILES",
     "write_cohort_cache",
     "load_or_build_cohort",
+    "build_ehr_panel",
     "CohortBuildResult",
+    "EhrPanel",
 ]
