@@ -35,9 +35,10 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -669,6 +670,12 @@ def _bucket_path(bucket: str, filename: str) -> str:
     return f"{bucket}/data/{filename}"
 
 
+def _bucket_prefixed_path(bucket: str, prefix: str, filename: str) -> str:
+    bucket = bucket.rstrip("/")
+    prefix = prefix.strip("/")
+    return f"{bucket}/{prefix}/{filename}"
+
+
 def _gsutil_exists(uri: str) -> bool:
     gs = _gsutil()
     if gs is None:
@@ -681,7 +688,34 @@ def _gsutil_copy(src: str, dst: str) -> None:
     gs = _gsutil()
     if gs is None:
         raise RuntimeError("gsutil is not on PATH; cannot fetch from bucket")
-    subprocess.run([gs, "cp", src, dst], check=True)
+    proc = subprocess.run(
+        [gs, "cp", src, dst],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "gsutil cp failed exit_code={code} src={src!r} dst={dst!r}\n"
+            "stderr (last 4KiB):\n{stderr}".format(
+                code=proc.returncode,
+                src=src,
+                dst=dst,
+                stderr=(proc.stderr or "")[-4096:],
+            )
+        )
+
+
+def _restore_bucket_file(uri: str, dst: Path) -> bool:
+    if not _gsutil_exists(uri):
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    part = dst.with_name(dst.name + ".part")
+    if part.exists():
+        part.unlink()
+    _gsutil_copy(uri, str(part))
+    os.replace(part, dst)
+    return True
 
 
 def resolve_cohort_csv(
@@ -939,19 +973,25 @@ def fetch_omop_long_frames(
     *,
     cdr: Optional[str] = None,
     cache_dir: str | os.PathLike = "data/omop",
+    workspace_bucket: Optional[str] = None,
+    workspace_prefix: str = "intermediates/causal-pred/omop",
     condition_concept_ids: Optional[Sequence[int]] = CURATED_OMOP_CONDITION_IDS,
     drug_concept_ids: Optional[Sequence[int]] = None,
     measurement_concept_ids: Optional[Sequence[int]] = None,
     fetch_drugs: bool = False,
     fetch_measurements: bool = False,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Fetch cached AoU OMOP long frames for the EHR feature stream.
 
     The production pipeline currently consumes the prepared wide cohort CSV.
     This helper is kept wired for the EHR/crosscoder branch: it fetches
     baseline-censorable OMOP frames from the AoU CDR, caches only parquet
-    intermediates under ``cache_dir``, and never uploads or copies genotype
-    files.
+    intermediates under ``cache_dir``, and mirrors those parquets to the
+    workspace bucket when available. It never uploads or copies genotype
+    files. Visit data is aggregated to each participant's earliest visit
+    before it leaves BigQuery; the pipeline only needs that baseline date, and
+    downloading every visit row is the slow path at AoU scale.
     """
     from google.cloud import bigquery
 
@@ -961,7 +1001,15 @@ def fetch_omop_long_frames(
 
     pid_str, pid_int = _normalise_person_ids(person_ids)
     cache_root = Path(cache_dir)
-    client = bigquery.Client()
+    workspace_bucket = (
+        workspace_bucket or os.environ.get("WORKSPACE_BUCKET") or ""
+    ).rstrip("/")
+    workspace_bucket = workspace_bucket or None
+    client: Optional[bigquery.Client] = None
+
+    def _emit(message: str) -> None:
+        if progress is not None:
+            progress(message)
 
     def _array_param(name: str, values: Sequence[int]) -> bigquery.ArrayQueryParameter:
         return bigquery.ArrayQueryParameter(name, "INT64", [int(v) for v in values])
@@ -972,18 +1020,86 @@ def fetch_omop_long_frames(
         params: Sequence[bigquery.ScalarQueryParameter | bigquery.ArrayQueryParameter],
         payload: dict,
     ) -> pd.DataFrame:
+        nonlocal client
         key = _omop_cache_key({"cdr": cdr, "person_ids": pid_str, **payload})
         path = cache_root / f"{name}-{key}.parquet"
         cached = _read_omop_cache(path, key)
         if cached is not None:
+            _emit(f"{name} cache hit rows={len(cached)} cols={cached.shape[1]}")
             return cached
+        key_path = path.with_suffix(path.suffix + ".key")
+        if workspace_bucket is not None:
+            data_uri = _bucket_prefixed_path(
+                workspace_bucket, workspace_prefix, path.name
+            )
+            key_uri = _bucket_prefixed_path(
+                workspace_bucket, workspace_prefix, key_path.name
+            )
+            if _restore_bucket_file(data_uri, path) and _restore_bucket_file(
+                key_uri, key_path
+            ):
+                cached = _read_omop_cache(path, key)
+                if cached is not None:
+                    _emit(
+                        f"{name} workspace cache hit rows={len(cached)} "
+                        f"cols={cached.shape[1]}"
+                    )
+                    return cached
+        _emit(f"{name} BigQuery start cdr={cdr} n_persons={len(pid_str)}")
+        started_at = time.time()
         job_config = bigquery.QueryJobConfig(query_parameters=list(params))
-        df = client.query(sql, job_config=job_config).to_dataframe()
+        if client is None:
+            client = bigquery.Client()
+        try:
+            job = client.query(sql, job_config=job_config)
+            _emit(
+                f"{name} BigQuery job submitted job_id={getattr(job, 'job_id', '?')}"
+            )
+            df = job.to_dataframe(create_bqstorage_client=True)
+        except Exception as exc:
+            raise RuntimeError(
+                "BigQuery {name} failed cdr={cdr} n_persons={n} "
+                "elapsed={elapsed:.1f}s exc_type={etype} exc={exc}".format(
+                    name=name,
+                    cdr=cdr,
+                    n=len(pid_str),
+                    elapsed=time.time() - started_at,
+                    etype=type(exc).__name__,
+                    exc=exc,
+                )
+            ) from exc
         _write_omop_cache(path, key, df)
+        if workspace_bucket is not None:
+            _gsutil_copy(
+                str(path),
+                _bucket_prefixed_path(workspace_bucket, workspace_prefix, path.name),
+            )
+            _gsutil_copy(
+                str(key_path),
+                _bucket_prefixed_path(workspace_bucket, workspace_prefix, key_path.name),
+            )
+        _emit(
+            f"{name} BigQuery done rows={len(df)} cols={df.shape[1]} "
+            f"elapsed={time.time() - started_at:.1f}s"
+        )
         return df
 
     person_param = _array_param("person_ids", pid_int)
     frames: dict[str, pd.DataFrame] = {}
+
+    frames["visit_baseline"] = _query(
+        "visit_baseline",
+        f"""
+        SELECT
+          CAST(person_id AS STRING) AS person_id,
+          MIN(COALESCE(CAST(visit_start_datetime AS TIMESTAMP), TIMESTAMP(visit_start_date))) AS baseline_dt
+        FROM `{cdr}.visit_occurrence`
+        WHERE person_id IN UNNEST(@person_ids)
+        GROUP BY person_id
+        """,
+        [person_param],
+        {"table": "visit_occurrence", "aggregation": "baseline"},
+    )
 
     condition_ids = (
         tuple(int(x) for x in condition_concept_ids)
@@ -1004,26 +1120,18 @@ def fetch_omop_long_frames(
         SELECT
           CAST(person_id AS STRING) AS person_id,
           CAST(condition_concept_id AS STRING) AS phecode,
-          condition_start_datetime AS datetime
+          MIN(COALESCE(CAST(condition_start_datetime AS TIMESTAMP), TIMESTAMP(condition_start_date))) AS datetime
         FROM `{cdr}.condition_occurrence`
         WHERE person_id IN UNNEST(@person_ids)
           {condition_filter}
+        GROUP BY person_id, condition_concept_id
         """,
         condition_params,
-        {"table": "condition_occurrence", "condition_ids": condition_ids},
-    )
-
-    frames["visit_long"] = _query(
-        "visit_long",
-        f"""
-        SELECT
-          CAST(person_id AS STRING) AS person_id,
-          visit_start_datetime AS datetime
-        FROM `{cdr}.visit_occurrence`
-        WHERE person_id IN UNNEST(@person_ids)
-        """,
-        [person_param],
-        {"table": "visit_occurrence"},
+        {
+            "table": "condition_occurrence",
+            "condition_ids": condition_ids,
+            "aggregation": "min_datetime_by_person_condition",
+        },
     )
 
     if fetch_drugs:
@@ -1042,13 +1150,18 @@ def fetch_omop_long_frames(
             SELECT
               CAST(person_id AS STRING) AS person_id,
               CAST(drug_concept_id AS STRING) AS atc_class,
-              drug_exposure_start_datetime AS datetime
+              MIN(COALESCE(CAST(drug_exposure_start_datetime AS TIMESTAMP), TIMESTAMP(drug_exposure_start_date))) AS datetime
             FROM `{cdr}.drug_exposure`
             WHERE person_id IN UNNEST(@person_ids)
               {drug_filter}
+            GROUP BY person_id, drug_concept_id
             """,
             drug_params,
-            {"table": "drug_exposure", "drug_ids": drug_ids},
+            {
+                "table": "drug_exposure",
+                "drug_ids": drug_ids,
+                "aggregation": "min_datetime_by_person_drug",
+            },
         )
 
     if fetch_measurements:
@@ -1074,7 +1187,7 @@ def fetch_omop_long_frames(
               CAST(person_id AS STRING) AS person_id,
               CAST(measurement_concept_id AS STRING) AS lab,
               value_as_number AS value,
-              measurement_datetime AS datetime
+              COALESCE(CAST(measurement_datetime AS TIMESTAMP), TIMESTAMP(measurement_date)) AS datetime
             FROM `{cdr}.measurement`
             WHERE person_id IN UNNEST(@person_ids)
               AND value_as_number IS NOT NULL
@@ -1188,19 +1301,19 @@ def _wide_indicator(
     keep_groups = counts[counts >= min_prevalence].index.tolist()
     if not keep_groups:
         return np.zeros((len(person_order), 0), dtype=np.float64), []
-    idx_by_pid = {pid: i for i, pid in enumerate(person_order.tolist())}
-    col_by_grp = {g: j for j, g in enumerate(keep_groups)}
     n = len(person_order)
     m = len(keep_groups)
     mat = np.zeros((n, m), dtype=np.float64)
-    sub = long_df[long_df[group_col].isin(set(keep_groups))]
-    pids = sub[person_col].to_numpy()
-    grps = sub[group_col].to_numpy()
-    for pid, grp in zip(pids, grps):
-        i = idx_by_pid.get(pid)
-        if i is None:
-            continue
-        mat[i, col_by_grp[grp]] = 1.0
+    sub = long_df.loc[
+        long_df[group_col].isin(set(keep_groups)), [person_col, group_col]
+    ].drop_duplicates()
+    row_idx = pd.Categorical(
+        sub[person_col].astype(str),
+        categories=person_order.astype(str).tolist(),
+    ).codes
+    col_idx = pd.Categorical(sub[group_col], categories=keep_groups).codes
+    valid = (row_idx >= 0) & (col_idx >= 0)
+    mat[row_idx[valid], col_idx[valid]] = 1.0
     cols = [f"{prefix}:{g}" for g in keep_groups]
     return mat, cols
 

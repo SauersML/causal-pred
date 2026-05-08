@@ -31,19 +31,19 @@ HAS_GNOMON = pg.gnomon_available()
 
 
 def test_binary_present_or_skipped(monkeypatch):
-    """If gnomon is installed, ``gnomon --version`` must run cleanly; if it
+    """If gnomon is installed, ``gnomon --help`` must run cleanly; if it
     isn't, every public function raises :class:`PolygenicToolMissing`."""
     if HAS_GNOMON:
         import subprocess
 
         result = subprocess.run(
-            [pg._locate_gnomon(), "version"],
+            [pg._locate_gnomon(), "--help"],
             capture_output=True,
             text=True,
             timeout=30,
         )
         assert result.returncode == 0
-        assert "gnomon" in (result.stdout + result.stderr).lower()
+        assert "usage" in (result.stdout + result.stderr).lower()
         return
 
     # Force the "missing" code path even on a machine that has gnomon.
@@ -129,6 +129,65 @@ def test_tsv_parsing_sscore_with_region_header(tmp_path):
     df = pg.parse_sscore(sscore)
     assert df.shape == (2, 1)
     assert df.loc["S2", "T2D"] == pytest.approx(-0.5)
+
+
+def test_tsv_parsing_sscore_filters_iids_while_streaming(tmp_path):
+    """Cohort-filtered parsing should keep AVG scores and skip missingness columns."""
+    sscore = tmp_path / "cohort.sscore"
+    _write_mock_sscore(
+        sscore,
+        iids=["S1", "S2", "S3", "S4"],
+        avg_cols=["T2D", "BMI"],
+        values=[[0.1, 1.1], [0.2, 1.2], [0.3, 1.3], [0.4, 1.4]],
+        missing_pct=0.5,
+    )
+
+    df = pg.parse_sscore(sscore, keep_iids={"S2", "S4"}, chunksize=2)
+
+    assert list(df.index.astype(str)) == ["S2", "S4"]
+    assert list(df.columns) == ["T2D", "BMI"]
+    assert df.shape == (2, 2)
+    assert df.loc["S2", "T2D"] == pytest.approx(0.2)
+    assert df.loc["S4", "BMI"] == pytest.approx(1.4)
+
+
+def test_score_panel_passes_matching_keep_iids_to_gnomon(monkeypatch, tmp_path):
+    """keep_iids should constrain gnomon itself, not only the Python parser."""
+    import subprocess
+
+    geno = tmp_path / "geno.bed"
+    geno.write_bytes(b"")
+    geno.with_suffix(".bim").write_text("1\trs1\t0\t1\tA\tG\n")
+    geno.with_suffix(".fam").write_text(
+        "F1 S1 0 0 0 -9\n"
+        "F2 S2 0 0 0 -9\n"
+    )
+    score = tmp_path / "score.gnomon.tsv"
+    score.write_text("variant_id\teffect_allele\tother_allele\tT2D\n")
+    captured = {}
+
+    def fake_run(cmd, timeout, *, env=None, label="gnomon invocation"):
+        captured["cmd"] = list(cmd)
+        keep_path = Path(cmd[cmd.index("--keep") + 1])
+        captured["keep"] = keep_path.read_text().splitlines()
+        out = Path(cmd[-1]).parent / "geno_score.sscore"
+        out.write_text("#IID\tT2D_AVG\tT2D_MISSING_PCT\nS1\t0.25\t0\n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(pg, "_locate_gnomon", lambda: "/usr/bin/gnomon")
+    monkeypatch.setattr(pg, "_run", fake_run)
+
+    df = pg.score_panel(
+        genotype_path=str(geno),
+        score_path=str(score),
+        out_dir=str(tmp_path / "out"),
+        keep_iids={"S1", "S3"},
+    )
+
+    assert "--keep" in captured["cmd"]
+    assert captured["keep"] == ["S1"]
+    assert list(df.index.astype(str)) == ["S1"]
+    assert df.loc["S1", "T2D"] == pytest.approx(0.25)
 
 
 def test_tsv_parsing_sex(tmp_path):
@@ -285,12 +344,12 @@ def test_augment_synthetic_validates_arguments():
 
 
 @pytest.mark.skipif(not HAS_GNOMON, reason="gnomon binary not installed")
-def test_gnomon_version_runs_cleanly():
+def test_gnomon_help_runs_cleanly():
     """The smoke test from the teammate spec: a real invocation succeeds."""
     import subprocess
 
     result = subprocess.run(
-        [pg._locate_gnomon(), "version"],
+        [pg._locate_gnomon(), "--help"],
         capture_output=True,
         text=True,
         timeout=30,

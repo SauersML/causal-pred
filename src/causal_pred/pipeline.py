@@ -8,25 +8,31 @@ Path:
 
 The public runner takes no configuration arguments. Operational settings live
 as constants in this module so there is one production path and one place to
-change it. Small reusable intermediates are cached locally under ``data/`` and,
+change it. Reusable intermediates are cached locally under ``data/`` and,
 when ``WORKSPACE_BUCKET`` is present, mirrored under
-``$WORKSPACE_BUCKET/intermediates/causal-pred``. Cached files are keyed by the
-actual matrix/configuration that produced them.
+``$WORKSPACE_BUCKET/intermediates/causal-pred``. This includes PRS score
+outputs, OMOP parquets, EHR panels, feature matrices, and downstream model
+artefacts, but never genotype files. Cached files are keyed by the actual
+matrix/configuration that produced them.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Iterator, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -38,11 +44,10 @@ from .data.cohort import (
     fetch_omop_long_frames,
     load_cohort_dataset_with_person_ids,
     resolve_aou_genotypes,
-    resolve_baseline_dt,
     resolve_cohort_csv,
 )
 from .data.nodes import CANONICAL_EDGES, NODE_INDEX
-from .data.polygenic import score_panel
+from .data.polygenic import parse_sscore, score_panel
 from .data.real_gwas import load_real_gwas
 from .data.synthetic import SyntheticDataset
 from .dagslam import run_dagslam
@@ -209,8 +214,14 @@ class WorkspaceCache:
         *,
         overwrite: bool = False,
     ) -> Path:
+        logger = logging.getLogger("causal_pred.pipeline")
         dst = local_path if local_path is not None else self.path(filename)
         if dst.is_file() and dst.stat().st_size > 0 and not overwrite:
+            logger.info(
+                "[cache] hit %s size=%.1fMiB",
+                dst,
+                _path_size_mib(dst),
+            )
             return dst
         uri = self.uri(filename)
         if uri is not None and _gsutil_exists(uri):
@@ -218,14 +229,38 @@ class WorkspaceCache:
             part = dst.with_name(dst.name + ".part")
             if part.exists():
                 part.unlink()
+            t0 = time.time()
+            logger.info("[cache] downloading %s -> %s", uri, dst)
             subprocess.run(["gsutil", "cp", uri, str(part)], check=True)
             os.replace(part, dst)
+            logger.info(
+                "[cache] downloaded %s size=%.1fMiB elapsed=%s",
+                dst,
+                _path_size_mib(dst),
+                _format_seconds(time.time() - t0),
+            )
         return dst
 
     def store(self, src: Path, filename: Optional[str] = None) -> None:
+        logger = logging.getLogger("causal_pred.pipeline")
         uri = self.uri(filename or src.name)
         if uri is not None:
+            t0 = time.time()
+            logger.info(
+                "[cache] uploading %s size=%.1fMiB -> %s",
+                src,
+                _path_size_mib(src),
+                uri,
+            )
             subprocess.run(["gsutil", "cp", str(src), uri], check=True)
+            logger.info(
+                "[cache] uploaded %s elapsed=%s",
+                uri,
+                _format_seconds(time.time() - t0),
+            )
+
+
+PIPELINE_LOG_FILENAME = "pipeline.log"
 
 
 def _setup_logger(verbose: bool) -> logging.Logger:
@@ -236,9 +271,118 @@ def _setup_logger(verbose: bool) -> logging.Logger:
         logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
     )
     logger.addHandler(handler)
+    log_dir = Path(DEFAULT_CACHE_DIR)
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / PIPELINE_LOG_FILENAME
+        file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        file_handler.setFormatter(
+            logging.Formatter(
+                "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        file_handler.setLevel(logging.DEBUG)
+        logger.addHandler(file_handler)
+        logger.info(
+            "[pipeline] log file %s pid=%d python=%s",
+            log_path,
+            os.getpid(),
+            sys.version.split()[0],
+        )
+    except OSError as exc:
+        sys.stderr.write(
+            f"[pipeline] WARNING failed to attach file log under {log_dir}: {exc}\n"
+        )
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     logger.propagate = False
     return logger
+
+
+def _flush_log_handlers(logger: logging.Logger) -> None:
+    for handler in logger.handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
+
+
+_SIGNAL_HANDLERS_INSTALLED = False
+
+
+def _install_signal_handlers(logger: logging.Logger) -> None:
+    """Log a banner if the process receives a termination signal.
+
+    SIGKILL cannot be caught from Python; everything catchable
+    (SIGTERM/SIGHUP/SIGUSR1/SIGUSR2/SIGXCPU/SIGPIPE) gets logged before the
+    default handler runs so silent terminations are easier to diagnose. The
+    OS-level OOM killer typically uses SIGKILL — that one stays invisible to
+    user code, so the persistent log file is the only forensic trace.
+    """
+    global _SIGNAL_HANDLERS_INSTALLED
+    if _SIGNAL_HANDLERS_INSTALLED:
+        return
+    _SIGNAL_HANDLERS_INSTALLED = True
+
+    def _make_handler(signum: int):
+        def _handler(_signum, _frame):
+            try:
+                name = signal.Signals(_signum).name
+            except ValueError:
+                name = f"signal_{_signum}"
+            logger.error(
+                "[pipeline] received %s — re-raising for default handling",
+                name,
+            )
+            _flush_log_handlers(logger)
+            signal.signal(_signum, signal.SIG_DFL)
+            os.kill(os.getpid(), _signum)
+
+        return _handler
+
+    for attr in ("SIGTERM", "SIGHUP", "SIGUSR1", "SIGUSR2", "SIGXCPU", "SIGPIPE"):
+        sig = getattr(signal, attr, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _make_handler(int(sig)))
+        except (ValueError, OSError):
+            pass
+
+
+@contextlib.contextmanager
+def _phase(logger: logging.Logger, name: str) -> Iterator[None]:
+    """Wrap a pipeline phase so failures log the phase name + elapsed time.
+
+    The exception is re-raised unchanged; this only adds context to the log.
+    """
+    started_at = time.time()
+    try:
+        yield
+    except BaseException as exc:
+        logger.error(
+            "[%s] FAILED after elapsed=%s with %s: %s",
+            name,
+            _format_seconds(time.time() - started_at),
+            type(exc).__name__,
+            exc,
+        )
+        _flush_log_handlers(logger)
+        raise
+
+
+def _format_seconds(seconds: float) -> str:
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes, rem = divmod(seconds, 60.0)
+    if minutes < 60.0:
+        return f"{int(minutes)}m{rem:04.1f}s"
+    hours, rem_minutes = divmod(minutes, 60.0)
+    return f"{int(hours)}h{int(rem_minutes):02d}m{rem:04.1f}s"
+
+
+def _path_size_mib(path: Path) -> float:
+    return path.stat().st_size / (1024.0 * 1024.0)
 
 
 def _workspace_bucket() -> Optional[str]:
@@ -314,6 +458,37 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _file_stat_fingerprint(path: Path) -> dict[str, Any]:
+    st = path.stat()
+    return {"name": path.name, "size": int(st.st_size)}
+
+
+def _plink_stat_fingerprint(bed: Path) -> dict[str, Any]:
+    prefix = bed.with_suffix("")
+    files = []
+    for suffix in (".bed", ".bim", ".fam"):
+        p = prefix.with_suffix(suffix)
+        files.append(_file_stat_fingerprint(p))
+    return {"prefix": prefix.name, "files": files}
+
+
+def _gnomon_score_cache_filename(bed: Path, score_files: Sequence[Path]) -> str:
+    return "gnomon-scores-" + _short_hash(
+        {
+            "version": PIPELINE_CONFIG_VERSION,
+            "genotype": _plink_stat_fingerprint(bed),
+            "score_files": [
+                {
+                    "name": p.name,
+                    "size": int(p.stat().st_size),
+                    "sha256": _file_sha256(p),
+                }
+                for p in sorted(score_files, key=lambda x: x.name)
+            ],
+        }
+    ) + ".sscore"
 
 
 def _pipeline_config() -> dict[str, Any]:
@@ -441,26 +616,11 @@ def _resolve_microarray_bed() -> Path:
     return resolve_aou_genotypes(cache_dir=GENOTYPE_CACHE_DIR)
 
 
-def _build_prs_panel(cohort_csv: Path, path: Path, logger: logging.Logger) -> pd.DataFrame:
-    person_ids = _cohort_person_ids(cohort_csv)
-    bed = _resolve_microarray_bed()
-    panel_dir = Path(DEFAULT_CACHE_DIR) / PGS_PANEL_DIRNAME
-    out_dir = Path(DEFAULT_CACHE_DIR) / GNOMON_OUT_DIRNAME
-    panel_dir.mkdir(parents=True, exist_ok=True)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info("[prs] downloading PGS scoring panel into %s", panel_dir)
-    score_files = download_panel(panel_dir)
-    logger.info("[prs] scoring AoU microarray genotypes at %s", bed)
-    scores = score_panel(
-        genotype_path=str(bed),
-        score_path=[str(p) for p in score_files],
-        out_dir=str(out_dir),
-        n_threads=os.cpu_count(),
-        timeout=GNOMON_TIMEOUT_SECONDS,
-    )
+def _cohort_scores_from_gnomon_scores(
+    scores: pd.DataFrame,
+    person_ids: pd.Series,
+) -> tuple[pd.DataFrame, int]:
     scores.index = scores.index.astype(str)
-
     overlap = person_ids.astype(str).isin(scores.index)
     min_required = min(PRS_MIN_COMPLETE_ROWS, int(person_ids.size))
     n_overlap = int(overlap.sum())
@@ -476,19 +636,129 @@ def _build_prs_panel(cohort_csv: Path, path: Path, logger: logging.Logger) -> pd
             f"gnomon produced {cohort_scores.shape[1]} usable PRS columns; "
             f"required at least {PRS_NODES}"
         )
+    return cohort_scores, n_overlap
 
+
+def _restore_gnomon_scores(
+    cache: Optional[WorkspaceCache],
+    local_sscore: Path,
+    remote_name: str,
+    person_ids: pd.Series,
+    logger: logging.Logger,
+) -> Optional[pd.DataFrame]:
+    if cache is None:
+        return None
+    restored = cache.fetch(remote_name, local_sscore)
+    if not restored.is_file() or restored.stat().st_size == 0:
+        return None
+    logger.info(
+        "[prs] parsing cached gnomon scores %s size=%.1fMiB",
+        restored,
+        _path_size_mib(restored),
+    )
+    t_parse = time.time()
+    scores = parse_sscore(restored, keep_iids=person_ids.astype(str).tolist())
+    logger.info(
+        "[prs] parsed cached gnomon scores rows=%d cols=%d elapsed=%s",
+        scores.shape[0],
+        scores.shape[1],
+        _format_seconds(time.time() - t_parse),
+    )
+    return scores
+
+
+def _latest_sscore(out_dir: Path, started_at: float) -> Optional[Path]:
+    candidates = [
+        p
+        for p in out_dir.glob("*.sscore")
+        if p.stat().st_size > 0 and p.stat().st_mtime >= started_at - 1.0
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _build_prs_panel(
+    cohort_csv: Path,
+    path: Path,
+    logger: logging.Logger,
+    cache: Optional[WorkspaceCache] = None,
+) -> pd.DataFrame:
+    person_ids = _cohort_person_ids(cohort_csv)
+    bed = _resolve_microarray_bed()
+    panel_dir = Path(DEFAULT_CACHE_DIR) / PGS_PANEL_DIRNAME
+    out_dir = Path(DEFAULT_CACHE_DIR) / GNOMON_OUT_DIRNAME
+    panel_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("[prs] downloading PGS scoring panel into %s", panel_dir)
+    score_files = [Path(p) for p in download_panel(panel_dir)]
+    sscore_name = _gnomon_score_cache_filename(bed, score_files)
+    local_sscore = out_dir / sscore_name
+    remote_sscore = f"{GNOMON_OUT_DIRNAME}/{sscore_name}"
+    scores = _restore_gnomon_scores(
+        cache,
+        local_sscore,
+        remote_sscore,
+        person_ids,
+        logger,
+    )
+    if scores is None:
+        logger.info(
+            "[prs] scoring AoU microarray genotypes bed=%s cohort_ids=%d score_files=%d",
+            bed,
+            int(person_ids.size),
+            len(score_files),
+        )
+        t_score = time.time()
+        started_at = time.time()
+        scores = score_panel(
+            genotype_path=str(bed),
+            score_path=[str(p) for p in score_files],
+            out_dir=str(out_dir),
+            n_threads=os.cpu_count(),
+            timeout=GNOMON_TIMEOUT_SECONDS,
+            keep_iids=person_ids.astype(str).tolist(),
+        )
+        logger.info(
+            "[prs] parsed gnomon scores rows=%d cols=%d elapsed=%s",
+            scores.shape[0],
+            scores.shape[1],
+            _format_seconds(time.time() - t_score),
+        )
+        raw_sscore = _latest_sscore(out_dir, started_at)
+        if raw_sscore is not None:
+            if raw_sscore != local_sscore:
+                shutil.copy2(raw_sscore, local_sscore)
+            if cache is not None:
+                cache.store(local_sscore, remote_sscore)
+
+    cohort_scores, n_overlap = _cohort_scores_from_gnomon_scores(scores, person_ids)
     path.parent.mkdir(parents=True, exist_ok=True)
     part = path.with_name(path.name + ".part")
     if part.exists():
         part.unlink()
-    cohort_scores.to_csv(part, index_label="person_id", compression="gzip")
+    t_write = time.time()
+    logger.info(
+        "[prs] writing cohort score cache %s rows=%d cols=%d",
+        path,
+        cohort_scores.shape[0],
+        cohort_scores.shape[1],
+    )
+    cohort_scores.to_csv(
+        part,
+        index_label="person_id",
+        compression={"method": "gzip", "compresslevel": 1, "mtime": 1},
+    )
     os.replace(part, path)
     logger.info(
-        "[prs] built %s rows=%d overlap=%d cols=%d",
+        "[prs] built %s rows=%d overlap=%d cols=%d size=%.1fMiB write_elapsed=%s",
         path,
         cohort_scores.shape[0],
         n_overlap,
         cohort_scores.shape[1],
+        _path_size_mib(path),
+        _format_seconds(time.time() - t_write),
     )
     return cohort_scores
 
@@ -509,7 +779,7 @@ def _load_or_build_prs_panel(
         logger.info("[prs] restored workspace cache %s", path)
         return _read_prs_panel(path), str(path)
 
-    panel = _build_prs_panel(cohort_csv, path, logger)
+    panel = _build_prs_panel(cohort_csv, path, logger, cache=cache)
     cache.store(path, PRS_PANEL_FILENAME)
     return panel, str(path)
 
@@ -540,22 +810,54 @@ def _load_or_build_ehr_panel(
                 feature_kinds=tuple(json.loads(str(z["feature_kinds_json"].item()))),
             )
 
-    logger.info("[ehr] fetching OMOP long frames and building baseline panel")
-    frames = fetch_omop_long_frames(person_ids=person_ids)
-    visit_long = frames.get("visit_long")
-    if visit_long is None or len(visit_long) == 0:
-        raise RuntimeError("OMOP visit_long returned no rows; cannot define EHR baseline")
-    baseline_dt = resolve_baseline_dt(person_ids, visit_long)
+    logger.info(
+        "[ehr] fetching OMOP frames for n=%d and building baseline panel",
+        len(person_ids),
+    )
+    frames = fetch_omop_long_frames(
+        person_ids=person_ids,
+        cache_dir=Path(DEFAULT_CACHE_DIR) / "omop",
+        workspace_bucket=cache.bucket,
+        workspace_prefix=f"{WORKSPACE_CACHE_PREFIX}/omop",
+        progress=lambda message: logger.info("[ehr] %s", message),
+    )
+    visit_baseline = frames.get("visit_baseline")
+    if visit_baseline is None or len(visit_baseline) == 0:
+        raise RuntimeError(
+            "OMOP visit_baseline returned no rows; cannot define EHR baseline"
+        )
+    baseline_frame = visit_baseline.copy()
+    baseline_frame["person_id"] = baseline_frame["person_id"].astype(str)
+    baseline_frame["baseline_dt"] = pd.to_datetime(
+        baseline_frame["baseline_dt"], errors="coerce"
+    )
+    baseline_dt = baseline_frame.set_index("person_id")["baseline_dt"]
+    baseline_dt = baseline_dt.reindex([str(p) for p in person_ids]).rename(
+        "baseline_dt"
+    )
+    logger.info(
+        "[ehr] baseline dates resolved observed=%d missing=%d",
+        int(baseline_dt.notna().sum()),
+        int(baseline_dt.isna().sum()),
+    )
+    for name, frame in frames.items():
+        logger.info("[ehr] frame %s rows=%d cols=%d", name, len(frame), frame.shape[1])
+    t_build = time.time()
     panel = build_ehr_panel(
         person_ids=person_ids,
         baseline_dt=baseline_dt,
         condition_long=frames.get("condition_long"),
         drug_long=frames.get("drug_long"),
         measurement_long=frames.get("measurement_long"),
-        visit_long=visit_long,
     )
     if panel.m == 0:
         raise RuntimeError("EHR panel has zero features; crosscoder cannot run")
+    logger.info(
+        "[ehr] built matrix n=%d m=%d elapsed=%s",
+        panel.n,
+        panel.m,
+        _format_seconds(time.time() - t_build),
+    )
     _atomic_npz(
         path,
         matrix=panel.matrix,
@@ -564,7 +866,7 @@ def _load_or_build_ehr_panel(
         feature_kinds_json=np.array(json.dumps(list(panel.feature_kinds))),
     )
     cache.store(path)
-    logger.info("[ehr] panel n=%d m=%d", panel.n, panel.m)
+    logger.info("[ehr] cached panel %s n=%d m=%d", path, panel.n, panel.m)
     return panel
 
 
@@ -1245,102 +1547,133 @@ def _causal_pathway_probabilities(
 
 def run_pipeline() -> PipelineResult:
     """Run the single production path."""
-    logger = _setup_logger(PIPELINE_VERBOSE)
+    logger = logging.getLogger("causal_pred.pipeline")
+    if not logger.handlers:
+        logger = _setup_logger(PIPELINE_VERBOSE)
+    _install_signal_handlers(logger)
     cache = _cache()
     timings: dict[str, float] = {}
+    pipeline_started_at = time.time()
 
-    t0 = time.time()
-    csv_path = resolve_cohort_csv(name=COHORT_NAME, cache_dir=DEFAULT_CACHE_DIR)
-    data, person_ids = load_cohort_dataset_with_person_ids(str(csv_path))
-    timings["data"] = time.time() - t0
-    logger.info(
-        "[data] path=%s n=%d p=%d columns=%s",
-        csv_path,
-        data.n,
-        data.p,
-        list(data.columns),
-    )
+    with _phase(logger, "data"):
+        t0 = time.time()
+        logger.info(
+            "[data] resolving cohort CSV name=%s cache_dir=%s",
+            COHORT_NAME,
+            DEFAULT_CACHE_DIR,
+        )
+        csv_path = resolve_cohort_csv(name=COHORT_NAME, cache_dir=DEFAULT_CACHE_DIR)
+        data, person_ids = load_cohort_dataset_with_person_ids(str(csv_path))
+        timings["data"] = time.time() - t0
+        logger.info(
+            "[data] path=%s n=%d p=%d elapsed=%s columns=%s",
+            csv_path,
+            data.n,
+            data.p,
+            _format_seconds(timings["data"]),
+            list(data.columns),
+        )
 
-    t0 = time.time()
-    prs_df, prs_path = _load_or_build_prs_panel(cache, csv_path, person_ids, logger)
-    data, kept_person_ids, prs_meta = _augment_with_prs_nodes(data, person_ids, prs_df)
-    timings["prs"] = time.time() - t0
-    logger.info(
-        "[prs] selected=%d n=%d p=%d nodes=%s",
-        prs_meta["prs_columns_selected"],
-        data.n,
-        data.p,
-        prs_meta["prs_node_names"],
-    )
+    with _phase(logger, "prs"):
+        t0 = time.time()
+        logger.info("[prs] loading or building cohort PRS panel")
+        prs_df, prs_path = _load_or_build_prs_panel(cache, csv_path, person_ids, logger)
+        data, kept_person_ids, prs_meta = _augment_with_prs_nodes(
+            data, person_ids, prs_df
+        )
+        timings["prs"] = time.time() - t0
+        logger.info(
+            "[prs] selected=%d n=%d p=%d dropped_rows=%d elapsed=%s nodes=%s",
+            prs_meta["prs_columns_selected"],
+            data.n,
+            data.p,
+            int(len(person_ids) - data.n),
+            _format_seconds(timings["prs"]),
+            prs_meta["prs_node_names"],
+        )
 
     genscore_meta: dict[str, Any] = {
         "ehr_stream": "not_run",
         "reason": "WORKSPACE_CDR is not set",
     }
     if os.environ.get("WORKSPACE_CDR"):
-        t0 = time.time()
-        ehr_panel = _load_or_build_ehr_panel(cache, kept_person_ids, logger)
-        timings["ehr"] = time.time() - t0
+        with _phase(logger, "ehr"):
+            t0 = time.time()
+            ehr_panel = _load_or_build_ehr_panel(cache, kept_person_ids, logger)
+            timings["ehr"] = time.time() - t0
+            logger.info("[ehr] complete elapsed=%s", _format_seconds(timings["ehr"]))
 
-        t0 = time.time()
-        data, kept_person_ids, genscore_meta = _load_or_run_genscore_features(
-            cache,
-            data,
-            kept_person_ids,
-            prs_df,
-            ehr_panel,
-            logger,
-        )
-        timings["genscore"] = time.time() - t0
+        with _phase(logger, "genscore"):
+            t0 = time.time()
+            data, kept_person_ids, genscore_meta = _load_or_run_genscore_features(
+                cache,
+                data,
+                kept_person_ids,
+                prs_df,
+                ehr_panel,
+                logger,
+            )
+            timings["genscore"] = time.time() - t0
+            logger.info(
+                "[genscore] complete n=%d p=%d elapsed=%s",
+                data.n,
+                data.p,
+                _format_seconds(timings["genscore"]),
+            )
     else:
         timings["ehr"] = 0.0
         timings["genscore"] = 0.0
         logger.info("[ehr] skipped because WORKSPACE_CDR is not set")
 
-    t0 = time.time()
-    mrdag_pi, mrdag_diagnostics = _load_or_run_mrdag(cache, logger)
-    mrdag_prior = _mrdag_prior_for_data(mrdag_pi, data.columns)
-    timings["mrdag"] = time.time() - t0
+    with _phase(logger, "mrdag"):
+        t0 = time.time()
+        mrdag_pi, mrdag_diagnostics = _load_or_run_mrdag(cache, logger)
+        mrdag_prior = _mrdag_prior_for_data(mrdag_pi, data.columns)
+        timings["mrdag"] = time.time() - t0
+        logger.info("[mrdag] complete elapsed=%s", _format_seconds(timings["mrdag"]))
 
-    key = _run_key(data, mrdag_prior)
-    dagslam = _load_or_run_dagslam(cache, key, data, logger)
-    timings["dagslam"] = float(dagslam["runtime_s"])
-    logger.info(
-        "[dagslam] log_score=%.3f n_edges=%d",
-        float(dagslam["log_score"]),
-        int(dagslam["n_edges"]),
-    )
+    with _phase(logger, "dagslam"):
+        key = _run_key(data, mrdag_prior)
+        dagslam = _load_or_run_dagslam(cache, key, data, logger)
+        timings["dagslam"] = float(dagslam["runtime_s"])
+        logger.info(
+            "[dagslam] log_score=%.3f n_edges=%d",
+            float(dagslam["log_score"]),
+            int(dagslam["n_edges"]),
+        )
 
-    edge_probs, mcmc_samples, mcmc_diagnostics, mcmc_runtime = _load_or_run_mcmc(
-        cache,
-        key,
-        data,
-        np.asarray(dagslam["adjacency"], dtype=int),
-        mrdag_prior,
-        logger,
-    )
-    timings["mcmc"] = mcmc_runtime
-    logger.info(
-        "[mcmc] accept_overall=%.3f max_rhat_skel=%.3f min_ess=%.1f",
-        float(mcmc_diagnostics["accept_rate"]["overall"]),
-        float(mcmc_diagnostics.get("max_rhat_skeleton", float("nan"))),
-        float(mcmc_diagnostics.get("min_ess", float("nan"))),
-    )
+    with _phase(logger, "mcmc"):
+        edge_probs, mcmc_samples, mcmc_diagnostics, mcmc_runtime = _load_or_run_mcmc(
+            cache,
+            key,
+            data,
+            np.asarray(dagslam["adjacency"], dtype=int),
+            mrdag_prior,
+            logger,
+        )
+        timings["mcmc"] = mcmc_runtime
+        logger.info(
+            "[mcmc] accept_overall=%.3f max_rhat_skel=%.3f min_ess=%.1f",
+            float(mcmc_diagnostics["accept_rate"]["overall"]),
+            float(mcmc_diagnostics.get("max_rhat_skeleton", float("nan"))),
+            float(mcmc_diagnostics.get("min_ess", float("nan"))),
+        )
 
     thresholded = (edge_probs >= THRESHOLD_DEFAULT).astype(int)
     np.fill_diagonal(thresholded, 0)
 
     if np.any(data.time > 0.0) and np.any(data.event == 1):
-        (
-            survival_time_grid,
-            survival_mean,
-            survival_lower,
-            survival_upper,
-            survival_parent_columns,
-            survival_diagnostics,
-            survival_runtime,
-        ) = _load_or_run_survival_gam(cache, key, data, mcmc_samples, logger)
-        timings["gam"] = survival_runtime
+        with _phase(logger, "gam"):
+            (
+                survival_time_grid,
+                survival_mean,
+                survival_lower,
+                survival_upper,
+                survival_parent_columns,
+                survival_diagnostics,
+                survival_runtime,
+            ) = _load_or_run_survival_gam(cache, key, data, mcmc_samples, logger)
+            timings["gam"] = survival_runtime
     else:
         logger.info("[gam] skipped because cohort CSV has no survival time/event columns")
         survival_time_grid = np.zeros(0, dtype=float)
@@ -1366,6 +1699,12 @@ def run_pipeline() -> PipelineResult:
         rng=np.random.default_rng(PIPELINE_SEED + 4),
     )
     validation["survival"] = survival_diagnostics.get("metrics", {})
+    logger.info(
+        "[pipeline] complete elapsed=%s n=%d p=%d",
+        _format_seconds(time.time() - pipeline_started_at),
+        data.n,
+        data.p,
+    )
 
     return PipelineResult(
         person_ids=tuple(str(p) for p in kept_person_ids),
@@ -1552,20 +1891,59 @@ def save_result(
 
 def _sync_outputs_to_workspace(outdir: Path) -> None:
     bucket = _workspace_bucket()
-    if bucket is not None:
-        subprocess.run(
-            ["gsutil", "-m", "rsync", "-r", str(outdir), f"{bucket}/{WORKSPACE_RESULTS_PREFIX}"],
-            check=True,
+    if bucket is None:
+        return
+    dst = f"{bucket}/{WORKSPACE_RESULTS_PREFIX}"
+    proc = subprocess.run(
+        ["gsutil", "-m", "rsync", "-r", str(outdir), dst],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "gsutil rsync of outputs failed exit_code=%d src=%s dst=%s\n"
+            "stderr (last 4KiB):\n%s"
+            % (proc.returncode, outdir, dst, (proc.stderr or "")[-4096:])
         )
 
 
 def main() -> int:
-    result = run_pipeline()
-    save_result(result)
-    outdir = Path(DEFAULT_OUTPUT_DIR)
-    _sync_outputs_to_workspace(outdir)
-    print(f"\nArtefacts written to {outdir}")
-    return 0
+    logger = _setup_logger(PIPELINE_VERBOSE)
+    _install_signal_handlers(logger)
+    started_at = time.time()
+    try:
+        result = run_pipeline()
+        save_result(result)
+        outdir = Path(DEFAULT_OUTPUT_DIR)
+        _sync_outputs_to_workspace(outdir)
+        logger.info(
+            "[pipeline] artefacts written to %s total_elapsed=%s",
+            outdir,
+            _format_seconds(time.time() - started_at),
+        )
+        print(f"\nArtefacts written to {outdir}")
+        return 0
+    except KeyboardInterrupt:
+        logger.error(
+            "[pipeline] interrupted by user after total_elapsed=%s",
+            _format_seconds(time.time() - started_at),
+        )
+        _flush_log_handlers(logger)
+        return 130
+    except SystemExit:
+        _flush_log_handlers(logger)
+        raise
+    except BaseException as exc:
+        logger.error(
+            "[pipeline] FAILED after total_elapsed=%s with %s: %s\n%s",
+            _format_seconds(time.time() - started_at),
+            type(exc).__name__,
+            exc,
+            traceback.format_exc(),
+        )
+        _flush_log_handlers(logger)
+        raise
 
 
 if __name__ == "__main__":

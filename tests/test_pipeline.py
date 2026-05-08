@@ -235,6 +235,8 @@ def test_build_prs_panel_scores_downloaded_text_files(tmp_path, monkeypatch):
     score_files[0].write_text("score\n")
     bed = tmp_path / "arrays.bed"
     bed.write_bytes(b"")
+    bed.with_suffix(".bim").write_text("")
+    bed.with_suffix(".fam").write_text("")
 
     captured = {}
 
@@ -262,4 +264,91 @@ def test_build_prs_panel_scores_downloaded_text_files(tmp_path, monkeypatch):
     )
 
     assert captured["score_path"] == [str(p) for p in score_files]
+    assert captured["keep_iids"] == [str(pid) for pid in person_ids]
     assert out.shape == (len(person_ids), 2)
+
+
+def test_build_prs_panel_reuses_cached_gnomon_sscore(tmp_path, monkeypatch):
+    from causal_pred import pipeline
+
+    cohort_csv = tmp_path / "t2d_initial_nodes_complete.csv"
+    _make_tiny_cohort_csv(cohort_csv)
+    person_ids = pd.read_csv(cohort_csv, usecols=["person_id"], dtype=str)[
+        "person_id"
+    ].tolist()
+    score_files = [tmp_path / "PGS000001_hmPOS_GRCh38.txt"]
+    score_files[0].write_text("score\n")
+    bed = tmp_path / "arrays.bed"
+    bed.write_bytes(b"")
+    bed.with_suffix(".bim").write_text("")
+    bed.with_suffix(".fam").write_text("")
+
+    cache_root = tmp_path / "cache"
+    monkeypatch.setattr(pipeline, "DEFAULT_CACHE_DIR", str(cache_root))
+    monkeypatch.setattr(pipeline, "PRS_NODES", 2)
+    monkeypatch.setattr(pipeline, "PRS_MIN_COMPLETE_ROWS", 20)
+    monkeypatch.setattr(pipeline, "_resolve_microarray_bed", lambda: bed)
+    monkeypatch.setattr(pipeline, "download_panel", lambda _panel_dir: score_files)
+
+    def fail_score_panel(**_kwargs):
+        raise AssertionError("cached .sscore should avoid gnomon scoring")
+
+    monkeypatch.setattr(pipeline, "score_panel", fail_score_panel)
+
+    sscore_name = pipeline._gnomon_score_cache_filename(bed, score_files)
+    sscore = cache_root / pipeline.GNOMON_OUT_DIRNAME / sscore_name
+    sscore.parent.mkdir(parents=True, exist_ok=True)
+    rows = ["#IID\tPGS_A_AVG\tPGS_A_MISSING_PCT\tPGS_B_AVG\tPGS_B_MISSING_PCT"]
+    for i, pid in enumerate(person_ids):
+        rows.append(f"{pid}\t{i * 0.1}\t0\t{1.0 - i * 0.01}\t0")
+    sscore.write_text("\n".join(rows) + "\n")
+
+    out = pipeline._build_prs_panel(
+        cohort_csv,
+        cache_root / "aou_prs_panel.csv.gz",
+        logging.getLogger("test-cache"),
+        cache=pipeline.WorkspaceCache(cache_root, None),
+    )
+
+    assert out.shape == (len(person_ids), 2)
+    assert list(out.columns) == ["PGS_A", "PGS_B"]
+
+
+def test_ehr_panel_uses_visit_baseline_summary(tmp_path, monkeypatch):
+    from causal_pred import pipeline
+
+    person_ids = [str(10_000 + i) for i in range(60)]
+    baseline = pd.DataFrame(
+        {
+            "person_id": person_ids,
+            "baseline_dt": pd.to_datetime(["2025-01-01"] * len(person_ids)),
+        }
+    )
+    condition = pd.DataFrame(
+        {
+            "person_id": person_ids,
+            "phecode": ["T2D"] * len(person_ids),
+            "datetime": pd.to_datetime(["2024-06-01"] * len(person_ids)),
+        }
+    )
+    progress_messages = []
+
+    def fake_fetch_omop_long_frames(*, person_ids, progress, **_kwargs):
+        progress_messages.append(tuple(person_ids))
+        progress("visit_baseline cache hit rows=60 cols=2")
+        return {"visit_baseline": baseline, "condition_long": condition}
+
+    monkeypatch.setattr(pipeline, "PIPELINE_CONFIG_VERSION", "ehr-baseline-test")
+    monkeypatch.setattr(pipeline, "fetch_omop_long_frames", fake_fetch_omop_long_frames)
+
+    cache = pipeline.WorkspaceCache(tmp_path, None)
+    panel = pipeline._load_or_build_ehr_panel(
+        cache,
+        person_ids,
+        logging.getLogger("test-ehr"),
+    )
+
+    assert panel.n == len(person_ids)
+    assert "cond:T2D" in panel.feature_names
+    assert "utilisation:n_encounters" not in panel.feature_names
+    assert progress_messages == [tuple(person_ids)]

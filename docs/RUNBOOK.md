@@ -44,10 +44,13 @@ edit the constants in `src/causal_pred/pipeline.py` when the production
 configuration changes.
 
 Reusable intermediates live under `data/intermediates/causal-pred/` and are
-mirrored to `$WORKSPACE_BUCKET/intermediates/causal-pred/` when the workspace
-bucket is available. The cache key includes the augmented matrix, MrDAG prior,
-and pipeline constants, so precomputed crosscoder, DAGSLAM, MCMC, and survival
-GAM results are loaded only when they match the current run.
+mirrored to `$WORKSPACE_BUCKET/intermediates/causal-pred/` when the real AoU
+workspace bucket is available. This includes the cohort-aligned PRS panel,
+the raw `gnomon` `.sscore` output under `gnomon_score/`, OMOP long-frame
+parquets under `omop/`, the EHR panel, crosscoder feature matrices, DAGSLAM,
+MCMC, and survival GAM outputs. The PLINK genotype files are intentionally not
+uploaded or mirrored. Cache keys include the inputs and pipeline constants, so
+precomputed results are loaded only when they match the current run.
 
 ```sh
 uv run python scripts/run_full_pipeline.py

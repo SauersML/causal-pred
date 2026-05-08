@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import shutil
+import sys
+import types
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -351,6 +356,158 @@ def test_write_cohort_cache_round_trip(tmp_path):
     # Resolver finds the freshly-cached file without touching the bucket.
     found = resolve_cohort_csv(name="complete", cache_dir=tmp_path, bucket=None)
     assert found == cc
+
+
+def test_fetch_omop_long_frames_restores_workspace_parquets(tmp_path, monkeypatch):
+    from causal_pred.data import cohort as cohort_mod
+
+    class FakeClient:
+        def query(self, *_args, **_kwargs):
+            raise AssertionError("workspace cache should avoid BigQuery")
+
+    fake_bigquery = types.SimpleNamespace(
+        ArrayQueryParameter=lambda *args: args,
+        QueryJobConfig=lambda **kwargs: kwargs,
+        Client=FakeClient,
+    )
+    fake_cloud = types.ModuleType("google.cloud")
+    fake_cloud.bigquery = fake_bigquery
+    fake_google = types.ModuleType("google")
+    fake_google.cloud = fake_cloud
+    monkeypatch.setitem(sys.modules, "google", fake_google)
+    monkeypatch.setitem(sys.modules, "google.cloud", fake_cloud)
+    monkeypatch.setitem(sys.modules, "google.cloud.bigquery", fake_bigquery)
+
+    cdr = "project.dataset"
+    person_ids = ["101", "102"]
+    remote_dir = tmp_path / "remote"
+    remote_dir.mkdir()
+
+    def write_remote(name, payload, df):
+        key = cohort_mod._omop_cache_key(
+            {"cdr": cdr, "person_ids": person_ids, **payload}
+        )
+        path = remote_dir / f"{name}-{key}.parquet"
+        cohort_mod._write_omop_cache(path, key, df)
+
+    write_remote(
+        "visit_baseline",
+        {"table": "visit_occurrence", "aggregation": "baseline"},
+        pd.DataFrame(
+            {
+                "person_id": person_ids,
+                "baseline_dt": pd.to_datetime(["2024-01-01", "2024-02-01"]),
+            }
+        ),
+    )
+    write_remote(
+        "condition_long",
+        {
+            "table": "condition_occurrence",
+            "condition_ids": tuple(),
+            "aggregation": "min_datetime_by_person_condition",
+        },
+        pd.DataFrame(
+            {
+                "person_id": person_ids,
+                "phecode": ["1", "2"],
+                "datetime": pd.to_datetime(["2023-01-01", "2023-02-01"]),
+            }
+        ),
+    )
+
+    restored_uris = []
+
+    def fake_restore(uri, dst):
+        restored_uris.append(uri)
+        src = remote_dir / Path(uri).name
+        if not src.exists():
+            return False
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        return True
+
+    monkeypatch.setattr(cohort_mod, "_restore_bucket_file", fake_restore)
+
+    frames = cohort_mod.fetch_omop_long_frames(
+        person_ids,
+        cdr=cdr,
+        cache_dir=tmp_path / "omop",
+        workspace_bucket="gs://workspace",
+        workspace_prefix="intermediates/causal-pred/omop",
+        condition_concept_ids=[],
+    )
+
+    assert set(frames) == {"visit_baseline", "condition_long"}
+    assert frames["visit_baseline"]["person_id"].tolist() == person_ids
+    assert frames["condition_long"]["phecode"].tolist() == ["1", "2"]
+    assert all("/intermediates/causal-pred/omop/" in uri for uri in restored_uris)
+
+
+def test_fetch_omop_long_frames_aggregates_conditions_before_download(
+    tmp_path, monkeypatch
+):
+    from causal_pred.data import cohort as cohort_mod
+
+    queries = []
+
+    class FakeJob:
+        def __init__(self, df):
+            self.df = df
+
+        def to_dataframe(self, **kwargs):
+            assert kwargs == {"create_bqstorage_client": True}
+            return self.df.copy()
+
+    class FakeClient:
+        def query(self, sql, **_kwargs):
+            queries.append(sql)
+            if "visit_occurrence" in sql:
+                return FakeJob(
+                    pd.DataFrame(
+                        {
+                            "person_id": ["101"],
+                            "baseline_dt": pd.to_datetime(["2024-01-01"]),
+                        }
+                    )
+                )
+            if "condition_occurrence" in sql:
+                return FakeJob(
+                    pd.DataFrame(
+                        {
+                            "person_id": ["101"],
+                            "phecode": ["201820"],
+                            "datetime": pd.to_datetime(["2023-01-01"]),
+                        }
+                    )
+                )
+            raise AssertionError(sql)
+
+    fake_bigquery = types.SimpleNamespace(
+        ArrayQueryParameter=lambda *args: args,
+        QueryJobConfig=lambda **kwargs: kwargs,
+        Client=FakeClient,
+    )
+    fake_cloud = types.ModuleType("google.cloud")
+    fake_cloud.bigquery = fake_bigquery
+    fake_google = types.ModuleType("google")
+    fake_google.cloud = fake_cloud
+    monkeypatch.setitem(sys.modules, "google", fake_google)
+    monkeypatch.setitem(sys.modules, "google.cloud", fake_cloud)
+    monkeypatch.setitem(sys.modules, "google.cloud.bigquery", fake_bigquery)
+
+    frames = cohort_mod.fetch_omop_long_frames(
+        ["101"],
+        cdr="project.dataset",
+        cache_dir=tmp_path / "omop",
+        workspace_bucket=None,
+        condition_concept_ids=[201820],
+    )
+
+    condition_sql = next(q for q in queries if "condition_occurrence" in q)
+    assert "MIN(COALESCE" in condition_sql
+    assert "GROUP BY person_id, condition_concept_id" in condition_sql
+    assert frames["condition_long"]["phecode"].tolist() == ["201820"]
 
 
 # ---------------------------------------------------------------------------

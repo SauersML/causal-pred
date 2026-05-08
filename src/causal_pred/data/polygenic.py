@@ -40,7 +40,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Callable, Collection, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -97,6 +97,51 @@ def gnomon_available() -> bool:
     return True
 
 
+def _format_seconds(seconds: float) -> str:
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes, rem = divmod(seconds, 60.0)
+    if minutes < 60.0:
+        return f"{int(minutes)}m{rem:04.1f}s"
+    hours, rem_minutes = divmod(minutes, 60.0)
+    return f"{int(hours)}h{int(rem_minutes):02d}m{rem:04.1f}s"
+
+
+def _file_size_mib(path: Path) -> float:
+    return path.stat().st_size / (1024.0 * 1024.0)
+
+
+def _fam_iids(genotype_path: Path) -> set[str] | None:
+    fam_path = genotype_path.with_suffix(".fam")
+    if not fam_path.is_file():
+        return None
+    iids: set[str] = set()
+    with fam_path.open("r") as fh:
+        for line in fh:
+            fields = line.split()
+            if len(fields) >= 2:
+                iids.add(fields[1])
+    return iids
+
+
+def _write_keep_file(
+    path: Path,
+    keep_iids: Collection[str],
+    genotype_path: Path,
+) -> tuple[int, int]:
+    requested = {str(iid) for iid in keep_iids}
+    fam_iids = _fam_iids(genotype_path)
+    matched = requested if fam_iids is None else requested & fam_iids
+    if not matched:
+        raise PolygenicRunError(
+            "no requested keep_iids were found in the genotype .fam file"
+        )
+    with path.open("w") as fh:
+        for iid in sorted(matched):
+            fh.write(f"{iid}\n")
+    return len(matched), len(requested)
+
+
 def _run(
     cmd: Sequence[str],
     timeout: int,
@@ -105,7 +150,8 @@ def _run(
     label: str = "gnomon invocation",
 ) -> subprocess.CompletedProcess:
     """Run gnomon with stdout/stderr inherited by the caller's terminal."""
-    print(f"[gnomon] {' '.join(cmd)}", flush=True)
+    print(f"[gnomon] start {' '.join(cmd)}", flush=True)
+    started_at = time.time()
     try:
         proc = subprocess.run(
             list(cmd),
@@ -115,12 +161,29 @@ def _run(
         )
     except subprocess.TimeoutExpired as exc:
         raise PolygenicRunError(
-            f"{label} timed out after {timeout}s: {' '.join(cmd)!s}"
+            f"{label} timed out after {timeout}s "
+            f"(elapsed={_format_seconds(time.time() - started_at)}): "
+            f"{' '.join(cmd)!s}"
+        ) from exc
+    except FileNotFoundError as exc:
+        raise PolygenicRunError(
+            f"{label} could not start (binary not found on PATH): {' '.join(cmd)!s}"
+        ) from exc
+    except OSError as exc:
+        raise PolygenicRunError(
+            f"{label} failed to spawn ({type(exc).__name__}: {exc}): "
+            f"{' '.join(cmd)!s}"
         ) from exc
     if proc.returncode != 0:
         raise PolygenicRunError(
-            f"{label} failed with exit code {proc.returncode}: {' '.join(cmd)!s}"
+            f"{label} failed exit_code={proc.returncode} "
+            f"elapsed={_format_seconds(time.time() - started_at)}: "
+            f"{' '.join(cmd)!s}"
         )
+    print(
+        f"[gnomon] done {label} elapsed={_format_seconds(time.time() - started_at)}",
+        flush=True,
+    )
     return proc
 
 
@@ -192,13 +255,21 @@ def _materialise_genotype(src: str, dst_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def parse_sscore(sscore_path: str | os.PathLike) -> pd.DataFrame:
+def parse_sscore(
+    sscore_path: str | os.PathLike,
+    *,
+    keep_iids: Collection[str] | None = None,
+    chunksize: int = 200_000,
+    progress: Callable[[str], None] | None = None,
+) -> pd.DataFrame:
     """Parse a ``*.sscore`` TSV emitted by ``gnomon score``.
 
     The file may begin with ``#REGION ...`` comment lines.  The actual column
     header is the first line starting with ``#IID``.  The returned frame is
     indexed by string ``IID`` with one ``float64`` column per score (the
-    ``*_AVG`` column; any ``*_MISSING_PCT`` columns are dropped).
+    ``*_AVG`` column; any ``*_MISSING_PCT`` columns are not read). When
+    ``keep_iids`` is provided, rows are filtered while streaming so callers do
+    not materialise the whole scored biobank before cohort alignment.
     """
     path = Path(sscore_path)
     header_line = None
@@ -213,8 +284,18 @@ def parse_sscore(sscore_path: str | os.PathLike) -> pd.DataFrame:
         raise PolygenicRunError(f"no #IID header row in {path}")
 
     columns = header_line.lstrip("#").split("\t")
-    # Stream rows in chunks so we never materialise giant intermediate arrays.
+    avg_cols = [c for c in columns if c.endswith("_AVG")]
+    read_cols = ["IID", *avg_cols]
+    dtype = {"IID": "string", **{c: "float64" for c in avg_cols}}
+    keep_set = {str(iid) for iid in keep_iids} if keep_iids is not None else None
+
+    # Stream rows in chunks so cohort-filtered production runs do not keep the
+    # full scored biobank in memory. Only AVG score columns are read; gnomon's
+    # per-score missingness columns are intentionally skipped.
     frames: list[pd.DataFrame] = []
+    rows_seen = 0
+    rows_kept = 0
+    last_progress_at = time.time()
     for chunk in pd.read_csv(
         path,
         sep="\t",
@@ -222,21 +303,34 @@ def parse_sscore(sscore_path: str | os.PathLike) -> pd.DataFrame:
         names=columns,
         skiprows=skip + 1,
         comment=None,
-        dtype={"IID": "string"},
-        chunksize=50_000,
+        usecols=read_cols,
+        dtype=dtype,
+        chunksize=int(chunksize),
     ):
+        rows_seen += int(chunk.shape[0])
+        if keep_set is not None:
+            chunk = chunk[chunk["IID"].isin(keep_set)]
+            if chunk.empty:
+                now = time.time()
+                if progress is not None and now - last_progress_at >= 10.0:
+                    progress(
+                        f"parse progress rows_seen={rows_seen} rows_kept={rows_kept}"
+                    )
+                    last_progress_at = now
+                continue
+        rows_kept += int(chunk.shape[0])
         frames.append(chunk)
+        now = time.time()
+        if progress is not None and now - last_progress_at >= 10.0:
+            progress(f"parse progress rows_seen={rows_seen} rows_kept={rows_kept}")
+            last_progress_at = now
     df = (
         pd.concat(frames, axis=0, ignore_index=True)
         if frames
-        else pd.DataFrame(columns=columns)
+        else pd.DataFrame(columns=read_cols).astype(dtype)
     )
 
     df["IID"] = df["IID"].astype("string")
-    avg_cols = [c for c in df.columns if c.endswith("_AVG")]
-    for c in avg_cols:
-        df[c] = df[c].astype("float64")
-
     out = df[["IID"] + avg_cols].copy()
     # Strip the ``_AVG`` suffix so the frame is indexed by the user's score
     # label (matches the file stem of the input score file by default).
@@ -419,6 +513,7 @@ def score_panel(
     out_dir: str | None = None,
     n_threads: int | None = None,
     timeout: int = 1800,
+    keep_iids: Collection[str] | None = None,
 ) -> pd.DataFrame:
     """Score a cohort against a *panel* of PGS files in a single gnomon call.
 
@@ -457,6 +552,10 @@ def score_panel(
     timeout : int
         Subprocess timeout (seconds). Defaults to 30 min for biobank-scale
         panels.
+    keep_iids : collection of str, optional
+        If provided, parse only these sample IDs from the produced ``.sscore``.
+        gnomon still scores every sample, but Python parsing, memory use, and
+        downstream CSV writing are limited to the cohort.
 
     Returns
     -------
@@ -507,8 +606,22 @@ def score_panel(
                 score_arg = direct_score_path
 
             genotype_in = _materialise_genotype(genotype_path, work_dir)
+            keep_arg: Path | None = None
+            keep_label: str = "all"
+            if keep_iids is not None:
+                keep_arg = work_dir / "cohort.keep"
+                matched, requested = _write_keep_file(keep_arg, keep_iids, genotype_in)
+                keep_label = f"{matched}/{requested}"
             cmd = [binary, "score", str(score_arg), str(genotype_in)]
+            if keep_arg is not None:
+                cmd = [binary, "score", "--keep", str(keep_arg), str(score_arg), str(genotype_in)]
             started_at = time.time()
+            print(
+                "[gnomon] parse plan "
+                f"score_path={score_arg} genotype={genotype_in} "
+                f"keep_iids={keep_label}",
+                flush=True,
+            )
             _run(cmd, timeout, env=env, label="gnomon score panel")
 
             # gnomon writes <genotype_stem>_<score_basename>.sscore in the dir
@@ -527,7 +640,19 @@ def score_panel(
             preferred = [c for c in candidates if c.stem.startswith(gstem)]
             sscore = preferred[0] if preferred else candidates[0]
 
-            frame = parse_sscore(sscore)
+            parse_started_at = time.time()
+            frame = parse_sscore(
+                sscore,
+                keep_iids=keep_iids,
+                progress=lambda message: print(f"[gnomon] {message}", flush=True),
+            )
+            print(
+                "[gnomon] parsed "
+                f"{sscore} size={_file_size_mib(sscore):.1f}MiB "
+                f"rows={frame.shape[0]} cols={frame.shape[1]} "
+                f"elapsed={_format_seconds(time.time() - parse_started_at)}",
+                flush=True,
+            )
             return frame
         finally:
             if score_tmp is not None:
