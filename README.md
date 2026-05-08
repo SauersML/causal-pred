@@ -66,35 +66,15 @@ docs/          architecture, runbook, mathematical notes
 
 ## Quickstart
 
-Install (requires `uv` and a working Rust toolchain for the `gam` extension):
+On the AoU Researcher Workbench, setup and run with one command:
 
 ```sh
-uv sync --dev
+if [ -d causal-pred/.git ]; then git -C causal-pred stash push -m aou-local-uv-lock -- uv.lock >/dev/null || true; git -C causal-pred pull --ff-only; else git clone https://github.com/SauersML/causal-pred.git causal-pred; fi && bash causal-pred/scripts/bootstrap_aou.sh
 ```
 
-Run the real cohort pipeline. It resolves the cohort CSV locally first, copies
-from `$WORKSPACE_BUCKET/data/` on AoU when needed, prepares or restores the
-gnomon-scored PRS matrix, builds the baseline-censored EHR feature stream,
-promotes shared genome/EHR crosscoder features, then runs
-MrDAG -> DAGSLAM -> structure MCMC -> gamfit survival GAM. Keyed
-intermediates are reused from `data/intermediates/causal-pred/` or the
-workspace bucket:
-
-```sh
-uv run python scripts/run_full_pipeline.py
-```
-
-Run all tests:
-
-```sh
-uv run pytest -q
-```
-
-On the AoU Researcher Workbench, run the one-shot bootstrap:
-
-```sh
-bash causal-pred/scripts/bootstrap_aou.sh
-```
+The bootstrap verifies AoU workspace inputs, installs local tools, syncs locked
+dependencies, prepares or restores PRS/EHR intermediates, and runs the single
+causal pipeline.
 
 See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for full instructions and
 troubleshooting.
