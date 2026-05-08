@@ -7,7 +7,7 @@
 #   1. install `uv` if missing
 #   2. clone (or fast-forward) the causal-pred repo
 #   3. `uv sync --dev` to install Python deps into a private .venv
-#   4. install the `gnomon` CLI (Rust; via cargo + git) if missing
+#   4. install the `gnomon` CLI (via gnomon's install.sh) if missing
 #   5. fetch the AoU v8 microarray PLINK triple into $GENO_DIR
 #      (skipped when FETCH_GENOTYPES=0; resumes individual missing files)
 #   6. run the pipeline (skipped when RUN_PIPELINE=0)
@@ -54,16 +54,10 @@ uv sync --dev
 
 # 4. gnomon ------------------------------------------------------------------
 if ! command -v gnomon >/dev/null 2>&1; then
-    if ! command -v cargo >/dev/null 2>&1; then
-        log "installing rustup (needed to build gnomon)"
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-            sh -s -- -y --default-toolchain stable --profile minimal
-    fi
-    export PATH="$HOME/.cargo/bin:$PATH"
-    log "cargo install gnomon (this can take a few minutes)"
-    cargo install --git https://github.com/SauersML/gnomon
+    log "installing gnomon via install.sh"
+    curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
 fi
-export PATH="$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 
 # 5. genotypes ---------------------------------------------------------------
 if [[ "$FETCH_GENOTYPES" == "1" ]]; then
