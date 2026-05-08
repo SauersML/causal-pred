@@ -181,7 +181,7 @@ def test_curated_ids_match_documented_set():
         "years_smoking": "ieu-b-25",
         "physical_activity": "ukb-b-4710",
         "hypertension": "ukb-b-12493",
-        "T2D": "ebi-a-GCST90018926",
+        "T2D": "ebi-a-GCST006867",
         "cardiovascular_disease": "ebi-a-GCST005195",
     }
     assert opengwas.OPENGWAS_STUDY_IDS == expected

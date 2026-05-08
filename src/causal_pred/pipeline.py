@@ -81,7 +81,7 @@ PGS_PANEL_DIRNAME = "pgs_panel"
 GNOMON_OUT_DIRNAME = "gnomon_score"
 GENOTYPE_CACHE_DIR = str(Path.home() / "causal-pred" / "genomes")
 
-PIPELINE_CONFIG_VERSION = "2026-05-08.single-path.4"
+PIPELINE_CONFIG_VERSION = "2026-05-08.single-path.5"
 PIPELINE_SEED = 20260416
 PIPELINE_VERBOSE = False
 
@@ -1023,6 +1023,7 @@ def _load_or_build_ehr_panel(
         condition_concept_ids=EHR_CONDITION_CONCEPT_IDS,
         fetch_drugs=EHR_FETCH_DRUGS,
         fetch_measurements=EHR_FETCH_MEASUREMENTS,
+        lookback_days=EHR_LOOKBACK_DAYS,
         progress=lambda message: logger.info("[ehr] %s", message),
     )
     visit_baseline = frames.get("visit_baseline")
@@ -1053,6 +1054,7 @@ def _load_or_build_ehr_panel(
         condition_long=frames.get("condition_long"),
         drug_long=frames.get("drug_long"),
         measurement_long=frames.get("measurement_long"),
+        measurement_summary=frames.get("measurement_summary"),
         min_prevalence=EHR_MIN_PREVALENCE,
         min_lab_observations=EHR_MIN_LAB_OBSERVATIONS,
         lookback_days=EHR_LOOKBACK_DAYS,

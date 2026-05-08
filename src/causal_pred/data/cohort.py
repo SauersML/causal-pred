@@ -36,6 +36,7 @@ import os
 import shutil
 import subprocess
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple
@@ -1284,6 +1285,7 @@ def fetch_omop_long_frames(
     fetch_conditions: bool = True,
     fetch_drugs: bool = False,
     fetch_measurements: bool = False,
+    lookback_days: Optional[int] = None,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Fetch cached AoU OMOP long frames for the EHR feature stream.
@@ -1295,7 +1297,10 @@ def fetch_omop_long_frames(
     workspace bucket when available. It never uploads or copies genotype
     files. Visit data is aggregated to each participant's earliest visit
     before it leaves BigQuery; the pipeline only needs that baseline date, and
-    downloading every visit row is the slow path at AoU scale.
+    downloading every visit row is the slow path at AoU scale. Measurement
+    data is labelled, cleaned, baseline-censored, and collapsed inside
+    BigQuery so the Workbench never has to materialise the raw measurement
+    table for the full cohort.
     """
     from google.cloud import bigquery
 
@@ -1365,25 +1370,81 @@ def fetch_omop_long_frames(
         started_at = time.time()
         job_config = bigquery.QueryJobConfig(query_parameters=list(params))
         if client is None:
-            client = bigquery.Client()
+            _emit(f"{name} BigQuery creating client (no cached client)")
+            try:
+                client = bigquery.Client()
+            except Exception as exc:
+                _emit(
+                    f"{name} BigQuery client creation FAILED exc_type="
+                    f"{type(exc).__name__} exc={exc}"
+                )
+                _emit(f"{name} BigQuery client traceback:\n{traceback.format_exc()}")
+                raise
+        stage = "submit"
+        job = None
         try:
             job = client.query(sql, job_config=job_config)
+            job_id = getattr(job, "job_id", "?")
+            location = getattr(job, "location", "?")
+            project = getattr(job, "project", "?")
             _emit(
-                f"{name} BigQuery job submitted job_id={getattr(job, 'job_id', '?')}"
+                f"{name} BigQuery job submitted job_id={job_id} "
+                f"project={project} location={location}"
+            )
+            stage = "wait_result"
+            _emit(f"{name} BigQuery waiting for job to finish job_id={job_id}")
+            job.result()
+            wait_elapsed = time.time() - started_at
+            total_rows = getattr(job, "total_rows", None)
+            bytes_processed = getattr(job, "total_bytes_processed", None)
+            bytes_billed = getattr(job, "total_bytes_billed", None)
+            cache_hit = getattr(job, "cache_hit", None)
+            slot_ms = getattr(job, "slot_millis", None)
+            _emit(
+                f"{name} BigQuery job done job_id={job_id} "
+                f"total_rows={total_rows} bytes_processed={bytes_processed} "
+                f"bytes_billed={bytes_billed} cache_hit={cache_hit} "
+                f"slot_ms={slot_ms} elapsed={wait_elapsed:.1f}s"
+            )
+            stage = "to_dataframe"
+            _emit(
+                f"{name} BigQuery downloading results to dataframe "
+                f"job_id={job_id} (using BQ Storage API)"
             )
             df = job.to_dataframe(create_bqstorage_client=True)
+            _emit(
+                f"{name} BigQuery dataframe materialized job_id={job_id} "
+                f"rows={len(df)} cols={df.shape[1]} "
+                f"elapsed={time.time() - started_at:.1f}s"
+            )
         except Exception as exc:
+            elapsed = time.time() - started_at
+            job_id = getattr(job, "job_id", "?") if job is not None else "?"
+            errors = getattr(job, "errors", None) if job is not None else None
+            state = getattr(job, "state", None) if job is not None else None
+            _emit(
+                f"{name} BigQuery FAILED stage={stage} job_id={job_id} "
+                f"state={state} cdr={cdr} n_persons={len(pid_str)} "
+                f"elapsed={elapsed:.1f}s exc_type={type(exc).__name__} exc={exc}"
+            )
+            if errors:
+                _emit(f"{name} BigQuery job.errors={errors}")
+            _emit(f"{name} BigQuery traceback:\n{traceback.format_exc()}")
             raise RuntimeError(
-                "BigQuery {name} failed cdr={cdr} n_persons={n} "
-                "elapsed={elapsed:.1f}s exc_type={etype} exc={exc}".format(
+                "BigQuery {name} failed stage={stage} job_id={job_id} "
+                "cdr={cdr} n_persons={n} elapsed={elapsed:.1f}s "
+                "exc_type={etype} exc={exc}".format(
                     name=name,
+                    stage=stage,
+                    job_id=job_id,
                     cdr=cdr,
                     n=len(pid_str),
-                    elapsed=time.time() - started_at,
+                    elapsed=elapsed,
                     etype=type(exc).__name__,
                     exc=exc,
                 )
             ) from exc
+        _emit(f"{name} BigQuery writing local cache path={path}")
         _write_omop_cache(path, key, df)
         _mirror_cache_to_workspace(name, path)
         _emit(
@@ -1394,6 +1455,11 @@ def fetch_omop_long_frames(
 
     person_param = _array_param("person_ids", pid_int)
     frames: dict[str, pd.DataFrame] = {}
+    lookback_filter = ""
+    if lookback_days is not None:
+        lookback_filter = (
+            f"AND datetime >= TIMESTAMP_SUB(baseline_dt, INTERVAL {int(lookback_days)} DAY)"
+        )
 
     frames["visit_baseline"] = _query(
         "visit_baseline",
@@ -1527,21 +1593,124 @@ def fetch_omop_long_frames(
             measurement_params.append(
                 _array_param("measurement_concept_ids", measurement_ids)
             )
-        frames["measurement_long"] = _query(
-            "measurement_long",
+        frames["measurement_summary"] = _query(
+            "measurement_summary",
             f"""
+            WITH baseline AS (
+              SELECT
+                person_id,
+                MIN(COALESCE(CAST(visit_start_datetime AS TIMESTAMP), TIMESTAMP(visit_start_date))) AS baseline_dt
+              FROM `{cdr}.visit_occurrence`
+              WHERE person_id IN UNNEST(@person_ids)
+              GROUP BY person_id
+            ),
+            labelled AS (
+              SELECT
+                m.person_id,
+                CASE
+                  WHEN REGEXP_CONTAINS(concept_text, r'body mass index|(^|[^a-z0-9])bmi([^a-z0-9]|$)') THEN 'bmi'
+                  WHEN REGEXP_CONTAINS(concept_text, r'a1c|hba1c|hemoglobin a1c|glycated hemoglobin') THEN 'hba1c'
+                  WHEN REGEXP_CONTAINS(concept_text, r'glucose')
+                       AND REGEXP_CONTAINS(concept_text, r'fasting|fasted') THEN 'fasting_glucose'
+                  WHEN REGEXP_CONTAINS(concept_text, r'hdl|high density lipoprotein') THEN 'hdl_cholesterol'
+                  WHEN REGEXP_CONTAINS(concept_text, r'ldl|low density lipoprotein') THEN 'ldl_cholesterol'
+                  WHEN REGEXP_CONTAINS(concept_text, r'triglyceride') THEN 'triglycerides'
+                  WHEN REGEXP_CONTAINS(concept_text, r'systolic') THEN 'systolic_bp'
+                  ELSE NULL
+                END AS lab,
+                m.value_as_number,
+                unit_text,
+                COALESCE(CAST(m.measurement_datetime AS TIMESTAMP), TIMESTAMP(m.measurement_date)) AS datetime,
+                b.baseline_dt
+              FROM (
+                SELECT
+                  m.*,
+                  LOWER(CONCAT(
+                    COALESCE(mc.concept_name, ''), ' ',
+                    COALESCE(sc.concept_name, ''), ' ',
+                    COALESCE(m.measurement_source_value, '')
+                  )) AS concept_text,
+                  LOWER(CONCAT(
+                    COALESCE(uc.concept_name, ''), ' ',
+                    COALESCE(m.unit_source_value, '')
+                  )) AS unit_text
+                FROM `{cdr}.measurement` AS m
+                LEFT JOIN `{cdr}.concept` AS mc
+                  ON m.measurement_concept_id = mc.concept_id
+                LEFT JOIN `{cdr}.concept` AS sc
+                  ON m.measurement_source_concept_id = sc.concept_id
+                LEFT JOIN `{cdr}.concept` AS uc
+                  ON m.unit_concept_id = uc.concept_id
+                WHERE m.person_id IN UNNEST(@person_ids)
+                  AND m.value_as_number IS NOT NULL
+                  {measurement_filter}
+              ) AS m
+              JOIN baseline AS b
+                ON m.person_id = b.person_id
+            ),
+            cleaned AS (
+              SELECT
+                CAST(person_id AS STRING) AS person_id,
+                lab,
+                CASE
+                  WHEN lab = 'hba1c'
+                       AND REGEXP_CONTAINS(unit_text, r'mmol/mol')
+                    THEN 0.09148 * value_as_number + 2.152
+                  WHEN lab = 'fasting_glucose'
+                       AND REGEXP_CONTAINS(unit_text, r'mmol/l|millimole')
+                    THEN value_as_number * 18.0182
+                  WHEN lab IN ('hdl_cholesterol', 'ldl_cholesterol')
+                       AND REGEXP_CONTAINS(unit_text, r'mmol/l|millimole')
+                    THEN value_as_number * 38.67
+                  WHEN lab = 'triglycerides'
+                       AND REGEXP_CONTAINS(unit_text, r'mmol/l|millimole')
+                    THEN value_as_number * 88.57
+                  ELSE value_as_number
+                END AS value_clean,
+                TIMESTAMP_DIFF(datetime, baseline_dt, SECOND)
+                  / (365.0 * 24.0 * 60.0 * 60.0) AS years_until_baseline
+              FROM labelled
+              WHERE lab IS NOT NULL
+                AND datetime IS NOT NULL
+                AND baseline_dt IS NOT NULL
+                AND datetime < baseline_dt
+                {lookback_filter}
+            ),
+            plausible AS (
+              SELECT *
+              FROM cleaned
+              WHERE
+                (lab = 'bmi' AND value_clean BETWEEN 10.0 AND 100.0)
+                OR (lab = 'hba1c' AND value_clean BETWEEN 3.0 AND 20.0)
+                OR (lab = 'fasting_glucose' AND value_clean BETWEEN 30.0 AND 600.0)
+                OR (lab = 'hdl_cholesterol' AND value_clean BETWEEN 5.0 AND 200.0)
+                OR (lab = 'ldl_cholesterol' AND value_clean BETWEEN 5.0 AND 400.0)
+                OR (lab = 'triglycerides' AND value_clean BETWEEN 10.0 AND 2000.0)
+                OR (lab = 'systolic_bp' AND value_clean BETWEEN 60.0 AND 260.0)
+            )
             SELECT
-              CAST(person_id AS STRING) AS person_id,
-              CAST(measurement_concept_id AS STRING) AS lab,
-              value_as_number AS value,
-              COALESCE(CAST(measurement_datetime AS TIMESTAMP), TIMESTAMP(measurement_date)) AS datetime
-            FROM `{cdr}.measurement`
-            WHERE person_id IN UNNEST(@person_ids)
-              AND value_as_number IS NOT NULL
-              {measurement_filter}
+              person_id,
+              lab,
+              AVG(value_clean) AS value_mean,
+              MIN(value_clean) AS value_min,
+              MAX(value_clean) AS value_max,
+              CASE
+                WHEN COUNT(*) >= 2 AND VAR_POP(years_until_baseline) > 1e-12
+                  THEN COVAR_POP(years_until_baseline, value_clean)
+                       / VAR_POP(years_until_baseline)
+                ELSE NULL
+              END AS value_slope,
+              COUNT(*) AS n_measurements
+            FROM plausible
+            GROUP BY person_id, lab
             """,
             measurement_params,
-            {"table": "measurement", "measurement_ids": measurement_ids},
+            {
+                "table": "measurement",
+                "measurement_ids": measurement_ids,
+                "aggregation": "baseline_lab_summary_by_person",
+                "lookback_days": lookback_days,
+            },
         )
 
     return frames
@@ -1665,6 +1834,27 @@ def _wide_indicator(
     return mat, cols
 
 
+def _impute_col_means(mat: np.ndarray) -> np.ndarray:
+    col_means = np.nanmean(mat, axis=0)
+    col_means = np.where(np.isfinite(col_means), col_means, 0.0)
+    return np.where(np.isnan(mat), col_means[None, :], mat)
+
+
+def _lab_summary_column_names(keep_labs: Sequence[str]) -> tuple[list[str], list[str]]:
+    labs = [str(lab) for lab in keep_labs]
+    m = len(labs)
+    names = (
+        [f"lab_mean:{lab}" for lab in labs]
+        + [f"lab_min:{lab}" for lab in labs]
+        + [f"lab_max:{lab}" for lab in labs]
+        + [f"lab_slope:{lab}" for lab in labs]
+    )
+    kinds = (
+        ["lab_mean"] * m + ["lab_min"] * m + ["lab_max"] * m + ["lab_slope"] * m
+    )
+    return names, kinds
+
+
 def _lab_summary(
     long_df: pd.DataFrame,
     person_col: str,
@@ -1729,27 +1919,74 @@ def _lab_summary(
             if denom > 1e-12:
                 slopes[i, j] = float(np.sum(tc * (v - v.mean())) / denom)
 
-    def _impute_col_means(mat: np.ndarray) -> np.ndarray:
-        col_means = np.nanmean(mat, axis=0)
-        col_means = np.where(np.isfinite(col_means), col_means, 0.0)
-        out = np.where(np.isnan(mat), col_means[None, :], mat)
-        return out
-
     means = _impute_col_means(means)
     mins = _impute_col_means(mins)
     maxs = _impute_col_means(maxs)
     slopes = _impute_col_means(slopes)
 
     block = np.concatenate([means, mins, maxs, slopes], axis=1)
-    names = (
-        [f"lab_mean:{lab}" for lab in keep_labs]
-        + [f"lab_min:{lab}" for lab in keep_labs]
-        + [f"lab_max:{lab}" for lab in keep_labs]
-        + [f"lab_slope:{lab}" for lab in keep_labs]
-    )
-    kinds = (
-        ["lab_mean"] * m + ["lab_min"] * m + ["lab_max"] * m + ["lab_slope"] * m
-    )
+    names, kinds = _lab_summary_column_names(keep_labs)
+    return block, names, kinds
+
+
+def _lab_summary_from_aggregates(
+    summary_df: pd.DataFrame,
+    person_col: str,
+    lab_col: str,
+    person_order: pd.Series,
+    min_observations: int,
+) -> Tuple[np.ndarray, list[str], list[str]]:
+    """Build lab feature columns from BigQuery per-person lab summaries."""
+    if summary_df.empty:
+        return np.zeros((len(person_order), 0), dtype=np.float64), [], []
+    required = {
+        person_col,
+        lab_col,
+        "value_mean",
+        "value_min",
+        "value_max",
+        "value_slope",
+    }
+    missing = sorted(required.difference(summary_df.columns))
+    if missing:
+        raise ValueError(f"measurement summary missing required columns: {missing}")
+
+    df = summary_df.copy()
+    df[person_col] = df[person_col].astype(str)
+    df[lab_col] = df[lab_col].astype(str)
+    for col in ("value_mean", "value_min", "value_max", "value_slope"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=[person_col, lab_col, "value_mean", "value_min", "value_max"])
+
+    lab_counts = df.groupby(lab_col)[person_col].nunique()
+    keep_labs = sorted(lab_counts[lab_counts >= min_observations].index.tolist())
+    if not keep_labs:
+        return np.zeros((len(person_order), 0), dtype=np.float64), [], []
+
+    df = df[df[lab_col].isin(set(keep_labs))]
+    df = df.drop_duplicates([person_col, lab_col], keep="first")
+    n = len(person_order)
+    m = len(keep_labs)
+    row_idx = pd.Categorical(
+        df[person_col],
+        categories=person_order.astype(str).tolist(),
+    ).codes
+    col_idx = pd.Categorical(df[lab_col], categories=keep_labs).codes
+    valid = (row_idx >= 0) & (col_idx >= 0)
+
+    def _fill(stat_col: str) -> np.ndarray:
+        mat = np.full((n, m), np.nan, dtype=np.float64)
+        values = df[stat_col].to_numpy(dtype=float)
+        mat[row_idx[valid], col_idx[valid]] = values[valid]
+        return _impute_col_means(mat)
+
+    means = _fill("value_mean")
+    mins = _fill("value_min")
+    maxs = _fill("value_max")
+    slopes = _fill("value_slope")
+
+    block = np.concatenate([means, mins, maxs, slopes], axis=1)
+    names, kinds = _lab_summary_column_names(keep_labs)
     return block, names, kinds
 
 
@@ -1760,6 +1997,7 @@ def build_ehr_panel(
     condition_long: Optional[pd.DataFrame] = None,
     drug_long: Optional[pd.DataFrame] = None,
     measurement_long: Optional[pd.DataFrame] = None,
+    measurement_summary: Optional[pd.DataFrame] = None,
     visit_long: Optional[pd.DataFrame] = None,
     person_col: str = "person_id",
     condition_group_col: str = "phecode",
@@ -1800,6 +2038,11 @@ def build_ehr_panel(
         ``[person_col, measurement_lab_col, measurement_value_col,
         datetime_col]``. Values must be in canonical units already (use
         :func:`clean_measurements` upstream).
+    measurement_summary : DataFrame, optional
+        BigQuery-collapsed lab summaries with columns
+        ``[person_col, measurement_lab_col, value_mean, value_min,
+        value_max, value_slope]``. This is the production path for AoU-scale
+        cohorts because it avoids downloading raw measurement histories.
     visit_long : DataFrame, optional
         Long frame of healthcare encounters with columns
         ``[person_col, datetime_col]``. Used to add a single ``utilisation``
@@ -1857,7 +2100,20 @@ def build_ehr_panel(
         )
         _push(mat, cols, "drug")
 
-    if measurement_long is not None and len(measurement_long):
+    if measurement_summary is not None and len(measurement_summary):
+        block, lab_names, lab_kinds = _lab_summary_from_aggregates(
+            measurement_summary,
+            person_col,
+            measurement_lab_col,
+            person_order,
+            min_observations=min_lab_observations,
+        )
+        if block.shape[1] > 0:
+            blocks.append(block)
+            names.extend(lab_names)
+            kinds.extend(lab_kinds)
+
+    elif measurement_long is not None and len(measurement_long):
         mf = _filter_pre_baseline(
             measurement_long, datetime_col, bd, lookback_days, person_col
         )

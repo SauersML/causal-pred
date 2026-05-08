@@ -121,6 +121,38 @@ def test_lab_summary_slope_sign_matches_truth():
     assert np.all(panel.matrix[:, j_min] <= panel.matrix[:, j_max] + 1e-9)
 
 
+def test_lab_summary_accepts_bigquery_aggregates():
+    """AoU production lab features arrive as per-person summary rows."""
+    person_ids = [f"p{i:03d}" for i in range(60)]
+    baseline = _baseline_series(person_ids, ["2025-01-01"] * len(person_ids))
+    summary = pd.DataFrame(
+        {
+            "person_id": person_ids[:55] + person_ids[:5],
+            "lab": ["hba1c"] * 55 + ["rare_lab"] * 5,
+            "value_mean": [6.0 + i * 0.01 for i in range(55)] + [1.0] * 5,
+            "value_min": [5.5 + i * 0.01 for i in range(55)] + [0.5] * 5,
+            "value_max": [6.5 + i * 0.01 for i in range(55)] + [1.5] * 5,
+            "value_slope": [0.1] * 10 + [np.nan] * 45 + [0.0] * 5,
+            "n_measurements": [4] * 60,
+        }
+    )
+
+    panel = build_ehr_panel(
+        person_ids,
+        baseline,
+        measurement_summary=summary,
+        min_lab_observations=50,
+    )
+
+    assert "lab_mean:hba1c" in panel.feature_names
+    assert "lab_mean:rare_lab" not in panel.feature_names
+    j_mean = panel.feature_names.index("lab_mean:hba1c")
+    j_slope = panel.feature_names.index("lab_slope:hba1c")
+    assert panel.matrix[0, j_mean] == pytest.approx(6.0)
+    assert np.isfinite(panel.matrix[:, j_slope]).all()
+    assert panel.matrix[20, j_slope] == pytest.approx(0.1)
+
+
 def test_utilisation_counts_pre_baseline_encounters_only():
     """visit_long should yield a single utilisation column with strict counts."""
     person_ids = [f"p{i:03d}" for i in range(40)]

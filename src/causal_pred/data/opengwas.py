@@ -40,9 +40,8 @@ AoU cohort is ~50% non-European):
 * physical_activity -- ``ukb-b-4710``         IEU UKB MET-min/wk vigorous PA.
 * hypertension      -- ``ukb-b-12493``        IEU UKB self-reported HTN,
                                               n=463,010.
-* T2D               -- ``ebi-a-GCST90018926`` Mahajan 2022 DIAMANTE
-                                              multi-ancestry T2D, n_cases=
-                                              180,834 (48.9% non-European).
+* T2D               -- ``ebi-a-GCST006867``   Xue et al. 2018 T2D, n=655,666
+                                              EUR (61,714 cases; PMID 30054458).
 * cardiovascular_disease (CAD)
                     -- ``ebi-a-GCST005195``   van der Harst & Verweij 2018
                                               CARDIoGRAMplusC4D+UKB,
@@ -101,7 +100,7 @@ OPENGWAS_STUDY_IDS: Dict[str, str] = {
     "years_smoking": "ieu-b-25",
     "physical_activity": "ukb-b-4710",
     "hypertension": "ukb-b-12493",
-    "T2D": "ebi-a-GCST90018926",
+    "T2D": "ebi-a-GCST006867",
     "cardiovascular_disease": "ebi-a-GCST005195",
     # diet_quality intentionally omitted -- no consensus single-score GWAS.
 }
@@ -114,8 +113,8 @@ STUDY_CITATIONS: Dict[str, str] = {
     "ieu-b-25": "Wootton et al. 2020 lifetime smoking index (UKB, n=462,690)",
     "ukb-b-4710": "IEU UKB MET-min/wk vigorous activity (n=377,234)",
     "ukb-b-12493": "UKB self-reported hypertension (n=463,010)",
-    "ebi-a-GCST90018926": "Mahajan et al. 2022 DIAMANTE multi-ancestry T2D "
-                          "(180,834 cases, 1,159,055 controls; 48.9% non-EUR)",
+    "ebi-a-GCST006867": "Xue et al. 2018 T2D (n=655,666; 61,714 cases EUR; "
+                        "PMID 30054458; nsnp=5M)",
     "ebi-a-GCST005195": "van der Harst & Verweij 2018 CARDIoGRAMplusC4D+UKB CAD "
                         "(122,733 cases)",
 }
@@ -214,22 +213,34 @@ def fetch_tophits(
     return out
 
 
+ASSOCS_BATCH_SIZE = 50
+
+
 def fetch_associations(
     study_id: str,
     rsids: Sequence[str],
 ) -> list[dict]:
     """Per-SNP outcome associations.
 
-    Empty input returns an empty list without hitting the API.
+    Batches rsids in groups of ``ASSOCS_BATCH_SIZE`` (the OpenGWAS
+    /associations endpoint rejects 400 BAD REQUEST when a single
+    request carries too many variants).  Empty input returns an empty
+    list without hitting the API.
     """
+    rsids = list(rsids)
     if not rsids:
         return []
-    body = {"id": [study_id], "rsid": list(rsids)}
-    out = _post("/associations", body)
-    if not isinstance(out, list):
-        raise RuntimeError(
-            f"OpenGWAS /associations returned non-list for {study_id}: {out!r}"
-        )
+    out: list[dict] = []
+    for start in range(0, len(rsids), ASSOCS_BATCH_SIZE):
+        chunk = rsids[start:start + ASSOCS_BATCH_SIZE]
+        body = {"id": [study_id], "variant": chunk}
+        resp = _post("/associations", body)
+        if not isinstance(resp, list):
+            raise RuntimeError(
+                f"OpenGWAS /associations returned non-list for {study_id} "
+                f"chunk {start}: {resp!r}"
+            )
+        out.extend(resp)
     return out
 
 
