@@ -38,6 +38,7 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Iterable, Mapping, Optional, Sequence
 
@@ -520,6 +521,7 @@ def score_panel(
 
         genotype_in = _materialise_genotype(genotype_path, work_dir)
         cmd = [binary, "score", str(score_arg), str(genotype_in)]
+        started_at = time.time()
         try:
             subprocess.run(
                 cmd,
@@ -542,7 +544,9 @@ def score_panel(
 
         # gnomon writes <genotype_stem>_<score_basename>.sscore in the dir
         # that holds the staged genotype (that's our work_dir).
-        candidates = list(work_dir.glob("*.sscore"))
+        candidates = [
+            p for p in work_dir.glob("*.sscore") if p.stat().st_mtime >= started_at - 1.0
+        ]
         if not candidates:
             raise PolygenicRunError(
                 f"gnomon score produced no .sscore in {work_dir}"

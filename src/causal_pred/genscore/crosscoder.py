@@ -156,177 +156,21 @@ def _topk_per_row(pre: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
     return z, mask
 
 def encode(
-    model: TopKCrosscoder,
-    A: np.ndarray,
-    B: np.ndarray,
-    *,
-    batch_size: Optional[int] = None,
-    device: str | None = None,
-    dtype: str = "float32",
+    model: TopKCrosscoder, A: np.ndarray, B: np.ndarray
 ) -> np.ndarray:
     """Compute the sparse latent ``z`` for each participant.
-
-    Passing ``device="auto"``, ``"cuda"``, or ``"mps"`` runs the dense
-    encoding matmuls on the accelerator in batches. Leaving ``device`` as
-    ``None`` uses the NumPy path, which is useful for small already-trained
-    models and keeps non-training utilities usable on CPU-only hosts.
 
     Returns
     -------
     z : (n, d)
         TopK-sparse activations per participant.
     """
-    if device is not None:
-        return encode_batched(
-            model,
-            A,
-            B,
-            batch_size=batch_size or 65536,
-            device=device,
-            dtype=dtype,
-        )
-
     a_z = (A - model.mean_G) / model.std_G
     b_z = (B - model.mean_E) / model.std_E
     x = np.concatenate([a_z, b_z], axis=1)
     pre = x @ model.W_e + model.b_enc
     z, _ = _topk_per_row(pre, model.k)
     return z
-
-
-def encode_batched(
-    model: TopKCrosscoder,
-    A: np.ndarray,
-    B: np.ndarray,
-    *,
-    batch_size: int = 65536,
-    device: str | None = "auto",
-    dtype: str = "float32",
-) -> np.ndarray:
-    """Encode rows in accelerator batches and return all latent activations."""
-    import torch
-
-    resolved = _resolve_torch_device(device)
-    torch_dtype = _torch_float_dtype(dtype)
-    _configure_torch_matmul(resolved)
-    tensors = _torch_model_tensors(model, resolved, torch_dtype)
-
-    A_np = np.asarray(A)
-    B_np = np.asarray(B)
-    if A_np.shape[0] != B_np.shape[0]:
-        raise ValueError(
-            f"A and B must share rows, got {A_np.shape[0]} vs {B_np.shape[0]}"
-        )
-    n = A_np.shape[0]
-    z_out = np.empty((n, model.d), dtype=np.float32)
-
-    with torch.no_grad():
-        for start in range(0, n, batch_size):
-            stop = min(start + batch_size, n)
-            a = torch.as_tensor(A_np[start:stop], dtype=torch_dtype, device=resolved)
-            b = torch.as_tensor(B_np[start:stop], dtype=torch_dtype, device=resolved)
-            x = torch.cat(
-                (
-                    (a - tensors["mean_G"]) / tensors["std_G"],
-                    (b - tensors["mean_E"]) / tensors["std_E"],
-                ),
-                dim=1,
-            )
-            pre = x @ tensors["W_e"] + tensors["b_enc"]
-            z, _ = _torch_topk_per_row(pre, model.k)
-            z_out[start:stop] = z.float().cpu().numpy()
-    return z_out
-
-
-def encode_selected_batched(
-    model: TopKCrosscoder,
-    A: np.ndarray,
-    B: np.ndarray,
-    feature_indices: Sequence[int] | np.ndarray,
-    *,
-    batch_size: int = 65536,
-    device: str | None = "auto",
-    dtype: str = "float32",
-) -> np.ndarray:
-    """Encode only selected latent columns without materialising full ``z``."""
-    import torch
-
-    resolved = _resolve_torch_device(device)
-    torch_dtype = _torch_float_dtype(dtype)
-    _configure_torch_matmul(resolved)
-    tensors = _torch_model_tensors(model, resolved, torch_dtype)
-
-    A_np = np.asarray(A)
-    B_np = np.asarray(B)
-    if A_np.shape[0] != B_np.shape[0]:
-        raise ValueError(
-            f"A and B must share rows, got {A_np.shape[0]} vs {B_np.shape[0]}"
-        )
-    idx_np = np.asarray(feature_indices, dtype=np.int64)
-    idx = torch.as_tensor(idx_np, dtype=torch.long, device=resolved)
-    n = A_np.shape[0]
-    z_out = np.empty((n, idx_np.size), dtype=np.float32)
-
-    with torch.no_grad():
-        for start in range(0, n, batch_size):
-            stop = min(start + batch_size, n)
-            a = torch.as_tensor(A_np[start:stop], dtype=torch_dtype, device=resolved)
-            b = torch.as_tensor(B_np[start:stop], dtype=torch_dtype, device=resolved)
-            x = torch.cat(
-                (
-                    (a - tensors["mean_G"]) / tensors["std_G"],
-                    (b - tensors["mean_E"]) / tensors["std_E"],
-                ),
-                dim=1,
-            )
-            pre = x @ tensors["W_e"] + tensors["b_enc"]
-            z, _ = _torch_topk_per_row(pre, model.k)
-            z_out[start:stop] = z.index_select(1, idx).float().cpu().numpy()
-    return z_out
-
-
-def activation_rate_batched(
-    model: TopKCrosscoder,
-    A: np.ndarray,
-    B: np.ndarray,
-    *,
-    batch_size: int = 65536,
-    device: str | None = "auto",
-    dtype: str = "float32",
-) -> np.ndarray:
-    """Compute per-feature activation rates on the accelerator in batches."""
-    import torch
-
-    resolved = _resolve_torch_device(device)
-    torch_dtype = _torch_float_dtype(dtype)
-    _configure_torch_matmul(resolved)
-    tensors = _torch_model_tensors(model, resolved, torch_dtype)
-
-    A_np = np.asarray(A)
-    B_np = np.asarray(B)
-    if A_np.shape[0] != B_np.shape[0]:
-        raise ValueError(
-            f"A and B must share rows, got {A_np.shape[0]} vs {B_np.shape[0]}"
-        )
-    n = A_np.shape[0]
-    counts = torch.zeros(model.d, dtype=torch.float32, device=resolved)
-
-    with torch.no_grad():
-        for start in range(0, n, batch_size):
-            stop = min(start + batch_size, n)
-            a = torch.as_tensor(A_np[start:stop], dtype=torch_dtype, device=resolved)
-            b = torch.as_tensor(B_np[start:stop], dtype=torch_dtype, device=resolved)
-            x = torch.cat(
-                (
-                    (a - tensors["mean_G"]) / tensors["std_G"],
-                    (b - tensors["mean_E"]) / tensors["std_E"],
-                ),
-                dim=1,
-            )
-            pre = x @ tensors["W_e"] + tensors["b_enc"]
-            _, mask = _torch_topk_per_row(pre, model.k)
-            counts += mask.sum(dim=0, dtype=torch.float32)
-    return (counts / float(n)).cpu().numpy()
 
 
 def reconstruct(
