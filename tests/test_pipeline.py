@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import numpy as np
 import pandas as pd
@@ -220,3 +221,45 @@ def test_pipeline_raises_when_no_csv(tmp_path, monkeypatch):
 
     with pytest.raises(FileNotFoundError):
         pipeline.run_pipeline()
+
+
+def test_build_prs_panel_scores_downloaded_text_files(tmp_path, monkeypatch):
+    from causal_pred import pipeline
+
+    cohort_csv = tmp_path / "t2d_initial_nodes_complete.csv"
+    _make_tiny_cohort_csv(cohort_csv)
+    person_ids = pd.read_csv(cohort_csv, usecols=["person_id"], dtype=str)[
+        "person_id"
+    ].tolist()
+    score_files = [tmp_path / "PGS000001_hmPOS_GRCh38.txt"]
+    score_files[0].write_text("score\n")
+    bed = tmp_path / "arrays.bed"
+    bed.write_bytes(b"")
+
+    captured = {}
+
+    def fake_score_panel(**kwargs):
+        captured.update(kwargs)
+        return pd.DataFrame(
+            {
+                "PGS_A": np.linspace(-1.0, 1.0, len(person_ids)),
+                "PGS_B": np.linspace(1.0, -1.0, len(person_ids)),
+            },
+            index=person_ids,
+        )
+
+    monkeypatch.setattr(pipeline, "DEFAULT_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(pipeline, "PRS_NODES", 2)
+    monkeypatch.setattr(pipeline, "PRS_MIN_COMPLETE_ROWS", 20)
+    monkeypatch.setattr(pipeline, "_resolve_microarray_bed", lambda: bed)
+    monkeypatch.setattr(pipeline, "download_panel", lambda _panel_dir: score_files)
+    monkeypatch.setattr(pipeline, "score_panel", fake_score_panel)
+
+    out = pipeline._build_prs_panel(
+        cohort_csv,
+        tmp_path / "cache" / "aou_prs_panel.csv.gz",
+        logging.getLogger("test"),
+    )
+
+    assert captured["score_path"] == [str(p) for p in score_files]
+    assert out.shape == (len(person_ids), 2)

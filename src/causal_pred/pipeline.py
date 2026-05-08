@@ -449,11 +449,11 @@ def _build_prs_panel(cohort_csv: Path, path: Path, logger: logging.Logger) -> pd
     out_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("[prs] downloading PGS scoring panel into %s", panel_dir)
-    download_panel(panel_dir)
+    score_files = download_panel(panel_dir)
     logger.info("[prs] scoring AoU microarray genotypes at %s", bed)
     scores = score_panel(
         genotype_path=str(bed),
-        score_path=str(panel_dir),
+        score_path=[str(p) for p in score_files],
         out_dir=str(out_dir),
         n_threads=os.cpu_count(),
         timeout=GNOMON_TIMEOUT_SECONDS,
