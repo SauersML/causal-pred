@@ -611,11 +611,7 @@ def _gibbs_resample_parents(
     base = adj.copy()
     base[:, j] = 0
     reach = _ancestors_matrix(base)
-    candidates = [
-        int(i)
-        for i in range(p)
-        if i != j and not bool(reach[j, i])
-    ]
+    candidates = [int(i) for i in range(p) if i != j and not bool(reach[j, i])]
     cap = min(cap, len(candidates))
 
     old_parents = tuple(int(i) for i in np.flatnonzero(old_col))
@@ -684,9 +680,8 @@ def _gibbs_resample_edge_pair(
     old_j_parents = tuple(int(k) for k in np.flatnonzero(adj[:, j]))
     old_score = score_node(i, old_i_parents, data, node_types, cache=cache, **hyper)
     old_score += score_node(j, old_j_parents, data, node_types, cache=cache, **hyper)
-    old_prior = (
-        float(log_pi[i, j] if adj[i, j] else log_1m[i, j])
-        + float(log_pi[j, i] if adj[j, i] else log_1m[j, i])
+    old_prior = float(log_pi[i, j] if adj[i, j] else log_1m[i, j]) + float(
+        log_pi[j, i] if adj[j, i] else log_1m[j, i]
     )
 
     base = adj.copy()
@@ -700,12 +695,13 @@ def _gibbs_resample_edge_pair(
 
     states: List[Tuple[int, float, float, Tuple[int, ...], Tuple[int, ...]]] = []
     none_prior = float(log_1m[i, j] + log_1m[j, i])
-    states.append((0, base_i_score + base_j_score, none_prior, base_i_parents, base_j_parents))
+    states.append(
+        (0, base_i_score + base_j_score, none_prior, base_i_parents, base_j_parents)
+    )
 
     j_parent_count = len(base_j_parents)
-    if (
-        not bool(reach[j, i])
-        and (max_parents is None or j_parent_count < int(max_parents))
+    if not bool(reach[j, i]) and (
+        max_parents is None or j_parent_count < int(max_parents)
     ):
         parents_j = tuple(sorted(base_j_parents + (int(i),)))
         score_j = score_node(j, parents_j, data, node_types, cache=cache, **hyper)
@@ -713,9 +709,8 @@ def _gibbs_resample_edge_pair(
         states.append((1, base_i_score + score_j, prior, base_i_parents, parents_j))
 
     i_parent_count = len(base_i_parents)
-    if (
-        not bool(reach[i, j])
-        and (max_parents is None or i_parent_count < int(max_parents))
+    if not bool(reach[i, j]) and (
+        max_parents is None or i_parent_count < int(max_parents)
     ):
         parents_i = tuple(sorted(base_i_parents + (int(j),)))
         score_i = score_node(i, parents_i, data, node_types, cache=cache, **hyper)
@@ -863,9 +858,7 @@ def _run_chain(
     # Anchor current log score and prior.
     cur_score = float(score_dag(adj, data, node_types, cache=cache, **hyper))
     cur_prior = _log_prior(adj, log_pi, log_1m)
-    n_add, n_rem, n_rev, _reach = _count_neighbourhood(
-        adj, max_parents=max_parents
-    )
+    n_add, n_rem, n_rev, _reach = _count_neighbourhood(adj, max_parents=max_parents)
     cur_nmoves = n_add + n_rem + n_rev
 
     total_iters = burn_in + n_samples * thin
@@ -1025,9 +1018,7 @@ def _run_chain(
             i, j = _sample_remove_target(adj, rng)
         else:
             mtype = "reverse"
-            sel = _sample_reverse_target(
-                adj, _reach, rng, max_parents=max_parents
-            )
+            sel = _sample_reverse_target(adj, _reach, rng, max_parents=max_parents)
             # Should always succeed because n_rev > 0 here.
             assert sel is not None, "sampler state inconsistent"
             i, j = sel

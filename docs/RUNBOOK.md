@@ -58,6 +58,25 @@ precomputed results are loaded only when they match the current run.
 uv run python scripts/run_full_pipeline.py
 ```
 
+## MR prior source (OpenGWAS)
+
+The MrDAG prior is built from two-sample IVW estimates over a curated
+trait set (BMI, LDL, HbA1c, SBP, lifetime smoking, physical activity,
+hypertension, T2D, CAD). Source selection is controlled by:
+
+- `OPENGWAS_JWT` -- if set, the pipeline runs **live** two-sample IVW
+  via the OpenGWAS REST API (study IDs in
+  `src/causal_pred/data/opengwas.py::OPENGWAS_STUDY_IDS`). Get a token
+  at <https://opengwas.io/profile/>.
+- `MR_GWAS_SOURCE=literature` -- forces the offline fallback table in
+  `src/causal_pred/data/real_gwas.py`.
+- Default: live when a JWT is present, literature otherwise.
+
+Live IVW results are cached per `(exposure, outcome, p, r2, kb, pop)`
+combination under `data/mr_cache/`, so repeat runs do not re-hit the
+API. The MrDAG cache key includes the source label so live and
+literature runs do not collide.
+
 ## Paper rebuild
 
 The paper is a LaTeX document under `paper/`. `build_paper.py` stamps
