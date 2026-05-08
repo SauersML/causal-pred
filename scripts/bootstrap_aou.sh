@@ -22,8 +22,9 @@
 #   4. locate this checkout, or clone it into $HOME/causal-pred on a fresh workbench
 #   5. `uv sync --dev` into the repo-local .venv
 #   6. install `gnomon` if missing
-#   7. run the single real pipeline; it prepares/loads cached PRS, runs
-#      MrDAG -> DAGSLAM -> MCMC, and mirrors small artefacts to WORKSPACE_BUCKET
+#   7. run the single real pipeline; it prepares/loads cached PRS, builds
+#      EHR crosscoder features, runs MrDAG -> DAGSLAM -> MCMC -> GAM, and
+#      mirrors small artefacts to WORKSPACE_BUCKET
 
 set -euo pipefail
 
@@ -102,7 +103,7 @@ fi
 export PATH="$HOME/.local/bin:$PATH"
 
 # 6. pipeline ----------------------------------------------------------------
-log "running real AoU microarray-PRS pipeline"
+log "running real AoU causal pipeline"
 uv run python scripts/run_full_pipeline.py
 
 log "done. artefacts in $REPO_DIR/outputs"

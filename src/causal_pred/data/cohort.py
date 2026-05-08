@@ -121,6 +121,12 @@ SURVIVAL_EVENT_COLUMNS: Tuple[str, ...] = (
 #   triglycerides    mg/dL
 #   systolic_bp      mmHg
 PLAUSIBILITY_BOUNDS: dict = {
+    "age": (18.0, 120.0),
+    "ancestry_pc1": (-20.0, 20.0),
+    "years_smoking": (0.0, 90.0),
+    "physical_activity": (0.0, 250.0),
+    "diet_quality": (-10.0, 10.0),
+    "healthcare_access": (-10.0, 10.0),
     "bmi": (10.0, 100.0),
     "hba1c": (3.0, 20.0),
     "fasting_glucose": (30.0, 600.0),
@@ -667,10 +673,7 @@ def _gsutil_exists(uri: str) -> bool:
     gs = _gsutil()
     if gs is None:
         return False
-    try:
-        r = subprocess.run([gs, "-q", "stat", uri], capture_output=True, check=False)
-    except OSError:
-        return False
+    r = subprocess.run([gs, "-q", "stat", uri], capture_output=True, check=False)
     return r.returncode == 0
 
 
@@ -903,13 +906,12 @@ def discover_genotype_dir(extra: Sequence[str | os.PathLike] = ()) -> Optional[P
 
 
 def _normalise_person_ids(person_ids: Sequence[str]) -> tuple[list[str], list[int]]:
-    ids = [str(pid) for pid in person_ids]
+    ids = [str(pid).strip() for pid in person_ids]
     if not ids:
         raise ValueError("person_ids must be non-empty")
-    try:
-        return ids, [int(pid) for pid in ids]
-    except ValueError as exc:
-        raise ValueError("AoU OMOP person_id values must be integer-like") from exc
+    if any(pid == "" or not pid.lstrip("+-").isdigit() for pid in ids):
+        raise ValueError("AoU OMOP person_id values must be integer-like")
+    return ids, [int(pid) for pid in ids]
 
 
 def _omop_cache_key(payload: dict) -> str:

@@ -73,12 +73,21 @@ normalises units (mmol/L -> mg/dL, mmol/mol -> NGSP %), drops
 physiologically impossible values, removes extreme outliers per-node
 via a conservative IQR rule, collapses repeated measures by median,
 and merges with a binary T2D node from the condition frame to produce
-a 7-node wide CSV. The production cache is `data/t2d_initial_nodes_complete.csv`;
+a participant-level wide CSV with core clinical, demographic, lifestyle,
+and follow-up time/event columns. The production cache is
+`data/t2d_initial_nodes_complete.csv`;
 `resolve_cohort_csv` checks that local file first, then copies the same
 canonical filename from `$WORKSPACE_BUCKET/data/` via `gsutil cp`.
 `load_cohort_dataset_with_person_ids` is the production loader because the
-single pipeline always aligns microarray-derived PRS back to participant IDs
-before DAGSLAM -> MCMC.
+single pipeline aligns microarray-derived PRS and baseline-censored EHR
+features back to participant IDs before DAGSLAM -> MCMC -> GAM.
+
+### `genscore/`
+Mechanistic-interpretability-style feature discovery. `crosscoder.py` learns
+TopK sparse features shared between the PRS stream and the EHR stream.
+`integrate.py` promotes cross-modal, active features into the DAG as
+continuous nodes so the causal stack can estimate where those learned
+mechanisms sit and how much they affect survival.
 
 ### `mrdag/`
 Produces an edge-inclusion posterior matrix `pi` of shape `(p, p)` from
@@ -101,10 +110,10 @@ MrDAG edge prior, and BGe/Laplace marginal likelihood. Emits samples that
 are read downstream for parent-set posterior estimates.
 
 ### `gam/`
-Distributional survival GAM wrappers around the `SauersML/gam` Rust engine.
-`splines.py` builds the P-spline bases (Eilers-Marx 1996), `nuts.py`
-produces NUTS samples from the posterior, `survival.py` composes the
-distributional parameterisation (RigbyStasinopoulos 2005) on survival time.
+Distributional survival GAM wrappers around the `gamfit` Python bindings for
+the `SauersML/gam` Rust engine. The production pipeline fits gamfit survival
+models on posterior parent sets sampled by structure MCMC, then averages
+per-person survival curves by parent-set posterior probability.
 
 ### `validation/`
 Known-edge recall/AUROC, Nagelkerke R-squared, Brier decomposition
@@ -116,9 +125,10 @@ Matplotlib figure helpers for edge heatmaps, calibration curves, and
 survival fans.
 
 ### `pipeline.py`
-Stage orchestrator. Takes an RNG, invokes each stage with a child RNG,
-writes `outputs/summary.json` through `_json_sanitise` and an analogous
-plots directory.
+Single production stage orchestrator. It resolves cohort/PRS/EHR inputs,
+promotes crosscoder features, runs MrDAG, DAGSLAM, structure MCMC, survival
+GAM parent-set averaging, validation, and causal-pathway extraction, then
+writes `outputs/summary.json` through `_json_sanitise`.
 
 ### `benchmarks.py`
 Throughput / scaling sweep runner used by `scripts/benchmark.py`.
@@ -131,7 +141,7 @@ Throughput / scaling sweep runner used by `scripts/benchmark.py`.
 | `mrdag`    | `betas (p, p)`, `ses (p, p)`                 | `pi (p, p)` edge-inclusion probs             |
 | `dagslam`  | `X, pi, score_fn`                            | `G0` adjacency `(p, p)` in {0,1}             |
 | `mcmc`     | `X, pi, G0, node_types`                      | `samples (S, p, p)`, `accept`, `rhat`        |
-| `gam`      | `X, parent_sets, time, event`                | per-subject survival curves, posterior draws |
+| `gam`      | `X, parent_sets, time, event`                | per-person survival/risk curves + uncertainty |
 | `validation` | ground-truth DAG + per-subject risks        | metrics dict                                 |
 
 Time is in years since cohort baseline (age 40 in the synthetic generator).

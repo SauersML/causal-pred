@@ -1,9 +1,4 @@
-"""Tests for the single-path pipeline (``causal_pred.pipeline``).
-
-The pipeline runs cohort CSV -> DAGSLAM -> structure MCMC -> save. These
-tests build a tiny cohort CSV in a temp directory, point the resolver at
-it via ``cache_dir``, and verify the artefacts are produced.
-"""
+"""Tests for the single no-argument production pipeline."""
 
 from __future__ import annotations
 
@@ -11,6 +6,7 @@ import json
 
 import numpy as np
 import pandas as pd
+import pytest
 
 
 def _make_tiny_cohort_csv(path):
@@ -21,14 +17,17 @@ def _make_tiny_cohort_csv(path):
     hdl = rng.normal(50.0, 10.0, size=n)
     ldl = rng.normal(100.0, 25.0, size=n)
     trig = rng.normal(120.0, 50.0, size=n)
-    # T2D follows a logistic of BMI + HbA1c so MCMC has a real signal.
     logits = -3.0 + 0.06 * (bmi - 25.0) + 0.8 * (hba1c - 5.5)
     p = 1.0 / (1.0 + np.exp(-logits))
     t2d = (rng.random(n) < p).astype(int)
+    followup = rng.uniform(2.0, 20.0, size=n)
+    followup[t2d == 1] = rng.uniform(1.0, 12.0, size=int(t2d.sum()))
     pd.DataFrame(
         {
             "person_id": [str(1000 + i) for i in range(n)],
             "type2_diabetes": t2d,
+            "followup_years": followup,
+            "event": t2d,
             "bmi": bmi,
             "hba1c": hba1c,
             "hdl_cholesterol": hdl,
@@ -48,62 +47,146 @@ def _make_tiny_prs_csv(path):
             "PGS_BMI": rng.normal(size=n),
             "PGS_LDL": rng.normal(size=n),
         }
-    ).to_csv(path, index=False)
+    ).to_csv(path, index=False, compression="gzip")
 
 
-def test_pipeline_runs_end_to_end(tmp_path):
-    """``run_pipeline`` finishes and ``save_result`` writes every artefact."""
+def _configure_tiny_pipeline(monkeypatch, tmp_path):
+    from causal_pred import pipeline
+    from causal_pred.data.cohort import EhrPanel
+    from causal_pred.data.nodes import NODE_INDEX
+    from causal_pred.data.synthetic import SyntheticDataset
+
+    monkeypatch.delenv("WORKSPACE_BUCKET", raising=False)
+    monkeypatch.setenv("WORKSPACE_CDR", "project.dataset")
+    monkeypatch.setattr(pipeline, "DEFAULT_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(pipeline, "DEFAULT_OUTPUT_DIR", str(tmp_path / "outputs"))
+    monkeypatch.setattr(pipeline, "PIPELINE_CONFIG_VERSION", "test-single-path")
+    monkeypatch.setattr(pipeline, "PRS_NODES", 2)
+    monkeypatch.setattr(pipeline, "PRS_MIN_COMPLETE_ROWS", 20)
+    monkeypatch.setattr(pipeline, "DAGSLAM_MAX_ITER", 60)
+    monkeypatch.setattr(pipeline, "DAGSLAM_RESTARTS", 1)
+    monkeypatch.setattr(pipeline, "MCMC_SAMPLES", 50)
+    monkeypatch.setattr(pipeline, "MCMC_BURN_IN", 20)
+    monkeypatch.setattr(pipeline, "MCMC_THIN", 5)
+    monkeypatch.setattr(pipeline, "MCMC_CHAINS", 2)
+    monkeypatch.setattr(pipeline, "VALIDATION_N_PERMUTE", 10)
+    monkeypatch.setattr(pipeline, "SURVIVAL_TIME_GRID_POINTS", 6)
+
+    def _fake_mrdag(_cache, _logger):
+        p = len(NODE_INDEX)
+        pi = np.full((p, p), 0.5, dtype=float)
+        np.fill_diagonal(pi, np.nan)
+        return pi, {"source": "test"}
+
+    def _fake_ehr(_cache, person_ids, _logger):
+        pid = np.asarray([str(p) for p in person_ids])
+        x = np.linspace(-1.0, 1.0, pid.size).reshape(-1, 1)
+        return EhrPanel(
+            matrix=x,
+            person_id=pid,
+            feature_names=("ehr_shared_signal",),
+            feature_kinds=("condition",),
+        )
+
+    def _fake_genscore(_cache, data, person_ids, _prs_df, _ehr_panel, _logger):
+        feat = np.mean(data.X[:, 1:3], axis=1, keepdims=True)
+        X = np.concatenate([data.X, feat], axis=1)
+        p_old = data.p
+        p_new = X.shape[1]
+        gt = np.zeros((p_new, p_new), dtype=int)
+        gt[:p_old, :p_old] = data.ground_truth_adj
+        dataset = SyntheticDataset(
+            X=X,
+            time=data.time.copy(),
+            event=data.event.copy(),
+            columns=tuple(data.columns) + ("feat_0000",),
+            node_types=tuple(data.node_types) + ("continuous",),
+            ground_truth_adj=gt,
+        )
+        return dataset, np.asarray(person_ids).astype(str), {
+            "crosscoder_d": 4,
+            "crosscoder_k": 1,
+            "promoted_names": ["feat_0000"],
+            "promoted_indices": [0],
+            "promoted_genome_share": [0.5],
+            "promoted_activation_rate": [1.0],
+            "base_n": int(data.n),
+            "augmented_n": int(data.n),
+            "ehr_feature_count": int(_ehr_panel.m),
+        }
+
+    def _fake_survival(_cache, _key, data, _samples, _logger):
+        t_grid = np.linspace(1.0, 12.0, 6)
+        baseline = np.exp(-t_grid / 20.0)
+        risk_shift = 0.05 * data.X[:, data.columns.index("bmi")]
+        survival = np.clip(baseline[None, :] - risk_shift[:, None], 0.01, 0.99)
+        diag = {
+            "backend": "gamfit",
+            "n_parent_sets": 1,
+            "metrics": {"nagelkerke_r2_at_10y": 0.1},
+        }
+        return (
+            t_grid,
+            survival,
+            np.clip(survival - 0.02, 0.0, 1.0),
+            np.clip(survival + 0.02, 0.0, 1.0),
+            ("bmi",),
+            diag,
+            0.01,
+        )
+
+    monkeypatch.setattr(pipeline, "_load_or_run_mrdag", _fake_mrdag)
+    monkeypatch.setattr(pipeline, "_load_or_build_ehr_panel", _fake_ehr)
+    monkeypatch.setattr(pipeline, "_load_or_run_genscore_features", _fake_genscore)
+    monkeypatch.setattr(pipeline, "_load_or_run_survival_gam", _fake_survival)
+    return pipeline
+
+
+def test_pipeline_runs_end_to_end(tmp_path, monkeypatch):
     _make_tiny_cohort_csv(tmp_path / "t2d_initial_nodes_complete.csv")
     _make_tiny_prs_csv(tmp_path / "aou_prs_panel.csv.gz")
 
-    from causal_pred.pipeline import (
-        PipelineResult,
-        run_pipeline,
-        save_result,
-    )
+    pipeline = _configure_tiny_pipeline(monkeypatch, tmp_path)
+    result = pipeline.run_pipeline()
 
-    result = run_pipeline(
-        seed=0,
-        max_parents=3,
-        max_iter=100,
-        restarts=1,
-        mcmc_samples=80,
-        mcmc_burn_in=40,
-        mcmc_thin=5,
-        mcmc_chains=2,
-        cache_dir=str(tmp_path),
-        prs_path=str(tmp_path / "aou_prs_panel.csv.gz"),
-        n_prs_nodes=2,
-    )
-
-    assert isinstance(result, PipelineResult)
-
-    expected_columns = (
+    assert isinstance(result, pipeline.PipelineResult)
+    assert tuple(result.columns[:6]) == (
         "type2_diabetes",
         "bmi",
         "hba1c",
         "hdl_cholesterol",
         "ldl_cholesterol",
         "triglycerides",
-        "pgs_t2d",
-        "pgs_bmi",
     )
-    assert tuple(result.columns) == expected_columns
+    assert len(result.columns) == 9
+    assert all(col.startswith("pgs_") for col in result.columns[6:8])
+    assert result.columns[-1] == "feat_0000"
     p = len(result.columns)
     assert result.dagslam_adjacency.shape == (p, p)
     assert result.mcmc_edge_probs.shape == (p, p)
     assert result.thresholded_adjacency.shape == (p, p)
+    assert result.survival_mean.shape == (result.data_summary["n"], 6)
+    assert result.survival_diagnostics["backend"] == "gamfit"
 
     out_dir = tmp_path / "outputs"
-    save_result(result, outdir=str(out_dir), run_config={"seed": 0})
+    pipeline.save_result(result, outdir=str(out_dir), run_config={"seed": 0})
 
     for fname in (
         "dagslam_adjacency.npy",
         "mcmc_edge_probs.npy",
+        "mcmc_samples.npy",
         "thresholded_adjacency.npy",
+        "survival_time_grid.npy",
+        "survival_mean.npy",
+        "survival_lower.npy",
+        "survival_upper.npy",
+        "disease_risk_mean.npy",
         "greedy_edges.csv",
         "mcmc_thresholded_edges.csv",
         "mcmc_edge_probabilities_long.csv",
+        "survival_curves_long.csv",
+        "causal_pathway_probabilities.csv",
+        "crosscoder_features.json",
         "summary.json",
         "run_config.json",
     ):
@@ -111,56 +194,29 @@ def test_pipeline_runs_end_to_end(tmp_path):
 
     with open(out_dir / "summary.json") as fh:
         summary = json.load(fh)
-    assert summary["columns"] == list(expected_columns)
+    assert summary["columns"] == list(result.columns)
     assert summary["dagslam_n_edges"] == result.dagslam_n_edges
     assert summary["threshold"] == 0.5
-    assert "mcmc_diagnostics" in summary
     assert "accept_rate" in summary["mcmc_diagnostics"]
+    assert summary["genscore_features"]["prs_columns_selected"] == 2
+    assert summary["genscore_features"]["promoted_names"] == ["feat_0000"]
+    assert summary["survival_diagnostics"]["backend"] == "gamfit"
+    assert "survival" in summary["validation"]
 
 
-def test_pipeline_determinism(tmp_path):
-    """Two runs with the same seed produce identical edge_probs."""
+def test_pipeline_determinism(tmp_path, monkeypatch):
     _make_tiny_cohort_csv(tmp_path / "t2d_initial_nodes_complete.csv")
     _make_tiny_prs_csv(tmp_path / "aou_prs_panel.csv.gz")
 
-    from causal_pred.pipeline import run_pipeline
-
-    r1 = run_pipeline(
-        seed=7,
-        max_parents=3,
-        max_iter=80,
-        restarts=1,
-        mcmc_samples=60,
-        mcmc_burn_in=30,
-        mcmc_thin=5,
-        mcmc_chains=2,
-        cache_dir=str(tmp_path),
-        prs_path=str(tmp_path / "aou_prs_panel.csv.gz"),
-        n_prs_nodes=2,
-    )
-    r2 = run_pipeline(
-        seed=7,
-        max_parents=3,
-        max_iter=80,
-        restarts=1,
-        mcmc_samples=60,
-        mcmc_burn_in=30,
-        mcmc_thin=5,
-        mcmc_chains=2,
-        cache_dir=str(tmp_path),
-        prs_path=str(tmp_path / "aou_prs_panel.csv.gz"),
-        n_prs_nodes=2,
-    )
+    pipeline = _configure_tiny_pipeline(monkeypatch, tmp_path)
+    r1 = pipeline.run_pipeline()
+    r2 = pipeline.run_pipeline()
     np.testing.assert_allclose(r1.mcmc_edge_probs, r2.mcmc_edge_probs, atol=1e-12)
     np.testing.assert_array_equal(r1.dagslam_adjacency, r2.dagslam_adjacency)
 
 
-def test_pipeline_raises_when_no_csv(tmp_path):
-    """No fallback: missing CSV raises FileNotFoundError up to the caller."""
-    from causal_pred.pipeline import run_pipeline
+def test_pipeline_raises_when_no_csv(tmp_path, monkeypatch):
+    pipeline = _configure_tiny_pipeline(monkeypatch, tmp_path)
 
-    try:
-        run_pipeline(seed=0, cache_dir=str(tmp_path), bucket=None)
-    except FileNotFoundError:
-        return
-    raise AssertionError("expected FileNotFoundError when no cohort CSV is available")
+    with pytest.raises(FileNotFoundError):
+        pipeline.run_pipeline()
