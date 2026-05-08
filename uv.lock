@@ -15,7 +15,7 @@ name = "causal-pred"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "gam" },
+    { name = "gamfit" },
     { name = "matplotlib" },
     { name = "networkx" },
     { name = "numpy" },
@@ -41,7 +41,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "gam", directory = "../gam" },
+    { name = "gamfit" },
     { name = "matplotlib", specifier = ">=3.8" },
     { name = "networkx", specifier = ">=3.0" },
     { name = "numpy", specifier = ">=1.26" },
@@ -221,44 +221,10 @@ wheels = [
 ]
 
 [[package]]
-name = "gam"
+name = "gamfit"
 version = "0.1.15"
-source = { directory = "../gam" }
-
-[package.metadata]
-requires-dist = [
-    { name = "matplotlib", marker = "extra == 'all'", specifier = ">=3.8" },
-    { name = "matplotlib", marker = "extra == 'plot'", specifier = ">=3.8" },
-    { name = "matplotlib", marker = "extra == 'test'", specifier = ">=3.8" },
-    { name = "matplotlib", marker = "extra == 'type'", specifier = ">=3.8" },
-    { name = "mypy", marker = "extra == 'type'", specifier = ">=1.18" },
-    { name = "numpy", marker = "extra == 'all'", specifier = ">=1.26" },
-    { name = "numpy", marker = "extra == 'numpy'", specifier = ">=1.26" },
-    { name = "numpy", marker = "extra == 'sklearn'", specifier = ">=1.26" },
-    { name = "numpy", marker = "extra == 'test'", specifier = ">=1.26" },
-    { name = "numpy", marker = "extra == 'type'", specifier = ">=1.26" },
-    { name = "pandas", marker = "extra == 'all'", specifier = ">=2.0" },
-    { name = "pandas", marker = "extra == 'pandas'", specifier = ">=2.0" },
-    { name = "pandas", marker = "extra == 'test'", specifier = ">=2.0" },
-    { name = "pandas", marker = "extra == 'type'", specifier = ">=2.0" },
-    { name = "pandas-stubs", marker = "extra == 'type'" },
-    { name = "polars", marker = "extra == 'type'", specifier = ">=1" },
-    { name = "pyarrow", marker = "extra == 'all'", specifier = ">=14" },
-    { name = "pyarrow", marker = "extra == 'pandas'", specifier = ">=14" },
-    { name = "pyarrow", marker = "extra == 'test'", specifier = ">=14" },
-    { name = "pyarrow", marker = "extra == 'type'", specifier = ">=14" },
-    { name = "pytest", marker = "extra == 'test'", specifier = ">=8" },
-    { name = "pytest", marker = "extra == 'type'", specifier = ">=8" },
-    { name = "scikit-learn", marker = "extra == 'all'", specifier = ">=1.4" },
-    { name = "scikit-learn", marker = "extra == 'sklearn'", specifier = ">=1.4" },
-    { name = "scikit-learn", marker = "extra == 'test'", specifier = ">=1.4" },
-    { name = "scikit-learn", marker = "extra == 'type'", specifier = ">=1.4" },
-    { name = "scikit-learn-stubs", marker = "extra == 'type'" },
-    { name = "scipy-stubs", marker = "extra == 'type'" },
-    { name = "types-requests", marker = "extra == 'type'" },
-    { name = "vulture", marker = "extra == 'type'", specifier = ">=2.16" },
-]
-provides-extras = ["test", "numpy", "pandas", "plot", "sklearn", "type", "all"]
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9f/3a/79a577bb74bbc5e23081fa4eb7e7a8ebb32728d949cd74b3a428e2597fee/gamfit-0.1.15.tar.gz", hash = "sha256:95c1bf5210fad41d20d3fe2d4a1abd9b8e6e57766e5554b0e4a5bdad3b725cae", size = 3857195, upload-time = "2026-05-08T00:21:24.289Z" }
 
 [[package]]
 name = "iniconfig"

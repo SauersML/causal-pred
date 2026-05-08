@@ -15,10 +15,9 @@ dependencies = [
     "networkx>=3.0",
     "statsmodels>=0.14",
     "matplotlib>=3.8",
-    # GAM backend -- Python bindings for SauersML's Rust GAM engine.
-    # Uses the local checkout if /Users/user/gam exists, otherwise falls
-    # back to the public git repo.  Flip tool.uv.sources below to switch.
-    "gam",
+    # GAM backend -- Python bindings for SauersML/gam's Rust engine,
+    # published on PyPI as ``gamfit``.
+    "gamfit",
 ]
 
 [project.optional-dependencies]
@@ -36,9 +35,6 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/causal_pred"]
-
-[tool.uv.sources]
-gam = { path = "/Users/user/gam", editable = false }
 
 [tool.pytest.ini_options]
 addopts = "-q"

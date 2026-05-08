@@ -1,13 +1,12 @@
-"""Distributional survival GAM via the gam CLI.
+"""Distributional survival GAM via the gam Python library.
 
-This module is a thin, direct wrapper over the `gam <https://github.com/SauersML/gam>`_
-Rust CLI's ``survival`` + ``predict`` subcommands.  The library's Rust
-engine implements proper Royston-Parmar / Weibull / probit-location-scale
-survival GAMs with penalised splines, REML smoothing, and analytical
-uncertainty -- we invoke it via ``subprocess`` and read back the CSV
-outputs.  There is no IPCW, no EM, no imputation, no events-only
-complete-case hack: the CLI's native survival family handles censoring
-exactly.
+This module is a thin wrapper over the ``gam`` Python library (PyO3
+bindings to SauersML/gam's Rust engine). The library implements the
+penalised-spline survival GAM with REML smoothing and analytical
+uncertainty; we feed it pandas frames and read back the dense
+survival surface via :class:`gam.SurvivalPrediction`. There is no IPCW,
+no EM, no imputation, no events-only complete-case hack: the library's
+native survival likelihood handles censoring exactly.
 
 Public API
 ----------
@@ -23,63 +22,17 @@ Public API
 Bayesian model averaging (Draper 1995, JRSS-B 57(1):45-97) decomposes
 the posterior-predictive variance of ``S(t | x)`` into a parametric
 (within-model) part and a structural (between-model) part.
-
-CLI discovery
--------------
-The CLI binary is located via :func:`_locate_gam_cli`, which checks:
-
-    1. ``GAM_CLI`` environment variable (highest priority)
-    2. ``gam`` on ``$PATH``
-    3. ``/Users/user/.local/bin/gam`` (the upstream installer's default)
-    4. ``/Users/user/gam/bench/runtime/gam`` (the local dev build)
-
-If none of those resolve to an executable the module raises at fit
-time.
 """
 
 from __future__ import annotations
 
-import csv
-import json
-import os
-import shutil
-import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import pandas as pd
 
-
-# ---------------------------------------------------------------------------
-# CLI discovery
-# ---------------------------------------------------------------------------
-
-_GAM_CLI_CANDIDATES = (
-    os.environ.get("GAM_CLI"),
-    None,                                       # placeholder for shutil.which
-    "/Users/user/.local/bin/gam",
-    "/Users/user/gam/bench/runtime/gam",
-)
-
-
-def _locate_gam_cli() -> str:
-    """Return the absolute path of the ``gam`` CLI binary, raising if absent."""
-    env_cli = os.environ.get("GAM_CLI")
-    if env_cli and os.path.isfile(env_cli) and os.access(env_cli, os.X_OK):
-        return env_cli
-    onpath = shutil.which("gam")
-    if onpath:
-        return onpath
-    for candidate in (
-        "/Users/user/.local/bin/gam",
-        "/Users/user/gam/bench/runtime/gam",
-    ):
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    raise FileNotFoundError(
-        "gam CLI not found.  Install the binary via SauersML/gam's install.sh "
-        "or set the GAM_CLI env var to its path."
-    )
+import gamfit as gam
 
 
 # ---------------------------------------------------------------------------
@@ -92,57 +45,26 @@ def _is_binary_column(x: np.ndarray) -> bool:
     return vals.shape[0] <= 2 and set(vals.tolist()).issubset({0.0, 1.0})
 
 
-# Default smooth kind for continuous covariates.  We use penalised
-# B-splines (P-splines, Eilers & Marx 1996) -- ``s(x, type=ps,
-# knots=N)`` -- which is the gam CLI's canonical univariate smooth in
-# its own benchmark suite (see ``gam/bench/run_suite.py``).  Pure
-# Duchon (the previous default) requires ``power < dimension/2`` and
-# so is not usable for univariate smooths in the current CLI version.
+# Univariate continuous covariates use a penalised B-spline (P-spline,
+# Eilers & Marx 1996) -- ``s(x, type=ps, knots=N)`` -- which is the gam
+# engine's canonical univariate smooth in its own benchmark suite.
 _PSPLINE_DEFAULT_KNOTS = 10
 
 
-def _build_survival_formula(columns: Sequence[str],
-                            kinds: Sequence[str],
-                            smooth_kind: str = "ps") -> str:
+def _build_survival_formula(columns: Sequence[str], kinds: Sequence[str]) -> str:
     """Return ``s(x1, type=ps, knots=10) + x2 + ...``.
 
     Continuous columns become penalised P-splines; binary columns enter
-    as plain linear terms.  An empty covariate set collapses to
+    as plain linear terms. An empty covariate set collapses to
     intercept-only via the literal ``1`` term.
     """
     terms: List[str] = []
     for name, kind in zip(columns, kinds):
         if kind == "continuous":
-            if smooth_kind == "ps":
-                terms.append(f"s({name}, type=ps, knots={_PSPLINE_DEFAULT_KNOTS})")
-            else:
-                terms.append(f"s({name}, type={smooth_kind})")
+            terms.append(f"s({name}, type=ps, knots={_PSPLINE_DEFAULT_KNOTS})")
         else:
             terms.append(name)
     return " + ".join(terms) if terms else "1"
-
-
-# ---------------------------------------------------------------------------
-# CSV I/O helpers
-# ---------------------------------------------------------------------------
-
-
-def _write_csv(path: str, header: Sequence[str], rows: np.ndarray) -> None:
-    """Write a 2-D numpy array with the given header to ``path``."""
-    rows = np.asarray(rows, dtype=float)
-    with open(path, "w", newline="") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(list(header))
-        for r in rows:
-            writer.writerow(r.tolist())
-
-
-def _read_prediction_csv(path: str) -> Dict[str, np.ndarray]:
-    """Load a gam-predict CSV and return columns as float64 arrays."""
-    import pandas as pd  # pandas is a hard dep of the project
-
-    df = pd.read_csv(path)
-    return {c: df[c].to_numpy(dtype=float) for c in df.columns}
 
 
 # ---------------------------------------------------------------------------
@@ -154,33 +76,29 @@ def _read_prediction_csv(path: str) -> Dict[str, np.ndarray]:
 class _SubmodelFit:
     """Fitted gam survival model artefacts."""
 
-    model_path: str                     # path to gam's model.json on disk
+    model: gam.Model
     columns: Tuple[str, ...]
-    kinds: Tuple[str, ...]              # "continuous" | "binary"
+    kinds: Tuple[str, ...]            # "continuous" | "binary"
     n_train: int
     n_events: int
     formula: str
-    cli: str                            # the gam CLI binary used
     train_summary: Dict[str, Any]
-    tmp_workdir: str                    # path to the tempdir
-    _tmp: Optional[Any] = None          # owns the tempdir object (keeps it alive)
 
 
-# ---------------------------------------------------------------------------
-# Fit via the gam CLI
-# ---------------------------------------------------------------------------
+def _fit_gam(
+    time: np.ndarray,
+    event: np.ndarray,
+    X: np.ndarray,
+    columns: Tuple[str, ...],
+    survival_likelihood: str = "location-scale",
+) -> _SubmodelFit:
+    """Fit a survival GAM through ``gam.fit`` and return a ``_SubmodelFit``.
 
-
-def _fit_gam(time: np.ndarray, event: np.ndarray, X: np.ndarray,
-             columns: Tuple[str, ...],
-             survival_likelihood: str = "transformation",
-             time_basis: Optional[str] = None,
-             time_num_internal_knots: Optional[int] = None,
-             time_degree: Optional[int] = None,
-             timeout: int = 600) -> _SubmodelFit:
-    """Fit a survival GAM via ``gam survival`` and return a ``_SubmodelFit``."""
-    cli = _locate_gam_cli()
-
+    The library's unified API supports ``location-scale``,
+    ``marginal-slope``, ``latent``, and ``latent-binary`` likelihoods;
+    ``location-scale`` is the canonical choice for continuous-time
+    failure data with a smooth covariate effect on the location.
+    """
     time = np.asarray(time, dtype=float)
     event = np.asarray(event, dtype=float)
     X = np.asarray(X, dtype=float).reshape(time.shape[0], -1)
@@ -193,207 +111,92 @@ def _fit_gam(time: np.ndarray, event: np.ndarray, X: np.ndarray,
         "binary" if _is_binary_column(X[:, i]) else "continuous"
         for i in range(X.shape[1])
     )
-    formula = _build_survival_formula(columns, kinds)
+    rhs = _build_survival_formula(columns, kinds)
+    formula = f"Surv(entry, exit, event) ~ {rhs}"
 
-    # Persist the tempdir across fit + prediction so the model.json lives
-    # long enough to be invoked.  The SurvivalGAM dataclass owns it and
-    # it's cleaned up when the Python object is garbage-collected.
-    tmp = _PersistentTempdir(prefix="gam_survival_")
+    df = pd.DataFrame(
+        {
+            "entry": np.zeros(time.shape[0], dtype=float),
+            "exit": time,
+            "event": event,
+            **{name: X[:, i] for i, name in enumerate(columns)},
+        }
+    )
 
-    train_csv = os.path.join(tmp.path, "train.csv")
-    model_json = os.path.join(tmp.path, "model.json")
+    model = gam.fit(df, formula, survival_likelihood=survival_likelihood)
 
-    entry = np.zeros_like(time, dtype=float)
-    header = ["entry", "exit", "event", *columns]
-    rows = np.column_stack([entry, time, event, X])
-    _write_csv(train_csv, header, rows)
-
-    # The gam CLI is formula-first: ``gam fit [OPTIONS] <DATA> <FORMULA>``.
-    # Survival mode is selected automatically when the LHS is
-    # ``Surv(entry, exit, event)``; the entry/exit/event column names come
-    # from inside the formula, so there are no separate column flags.
-    formula_full = f"Surv(entry, exit, event) ~ {formula}"
-
-    cmd = [
-        cli, "fit",
-        "--survival-likelihood", survival_likelihood,
-    ]
-    # Let the CLI pick its own defaults for the time basis unless the
-    # caller overrides.  The CLI default is ``ispline`` with degree 3 and
-    # 8 internal knots; on small samples a coarser basis can be more
-    # robust.
-    if time_basis is not None:
-        cmd += ["--time-basis", time_basis]
-    if time_num_internal_knots is not None:
-        cmd += ["--time-num-internal-knots", str(time_num_internal_knots)]
-    if time_degree is not None:
-        cmd += ["--time-degree", str(time_degree)]
-    cmd += ["--out", model_json, train_csv, formula_full]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "gam fit failed:\n"
-            f"cmd: {' '.join(cmd)}\n"
-            f"stdout: {proc.stdout}\n"
-            f"stderr: {proc.stderr}"
-        )
-
-    # Parse any line starting with '{' as JSON summary; otherwise keep the raw stdout.
-    train_summary: Dict[str, Any] = {"cli_stdout": proc.stdout.strip()}
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                train_summary = json.loads(line)
-                break
-            except json.JSONDecodeError:
-                continue
+    # ``Summary`` is a frozen dict-wrapper; expose its payload directly so
+    # caller-visible diagnostics carry every field the library emitted.
+    train_summary: Dict[str, Any] = dict(model.summary().to_dict())
 
     return _SubmodelFit(
-        model_path=model_json,
+        model=model,
         columns=tuple(columns),
         kinds=kinds,
         n_train=int(time.shape[0]),
         n_events=int(np.sum(event > 0.0)),
-        formula=f"Surv(entry, exit, event) ~ {formula}",
-        cli=cli,
+        formula=formula,
         train_summary=train_summary,
-        tmp_workdir=tmp.path,
-        _tmp=tmp,
     )
 
 
-class _PersistentTempdir:
-    """A tempfile.TemporaryDirectory that auto-cleans on dealloc.
-
-    We keep an explicit handle on the underlying object so multiple
-    SurvivalGAM objects can safely outlive each other.
-    """
-
-    def __init__(self, prefix: str = "gam_") -> None:
-        import tempfile
-
-        self._tmp = tempfile.TemporaryDirectory(prefix=prefix)
-        self.path = self._tmp.name
-
-    def cleanup(self) -> None:
-        try:
-            self._tmp.cleanup()
-        except Exception:  # pragma: no cover -- best-effort
-            pass
-
-    def __del__(self) -> None:  # pragma: no cover
-        self.cleanup()
-
-
 # ---------------------------------------------------------------------------
-# Predict via the gam CLI
+# Predict via gam.Model.predict + SurvivalPrediction.survival_at
 # ---------------------------------------------------------------------------
 
 
-def _predict_survival_matrix(fit: _SubmodelFit,
-                             X_new: np.ndarray,
-                             t_grid: np.ndarray,
-                             interval: Optional[float] = 0.95,
-                             timeout: int = 600
-                             ) -> Tuple[np.ndarray, np.ndarray]:
-    """Return ``(S_mean, S_se)`` of shape ``(n_new, n_t)``.
+def _predict_survival_matrix(
+    fit: _SubmodelFit,
+    X_new: np.ndarray,
+    t_grid: np.ndarray,
+) -> np.ndarray:
+    """Return ``(n_new, n_t)`` survival probabilities S(t | x).
 
-    We build a long-format CSV with ``n_new * n_t`` rows (one per
-    (individual, time) pair) and ask ``gam predict --uncertainty`` to
-    evaluate ``S(t|x)`` and its standard error for each row.
+    Builds a prediction frame with the same ``entry`` / ``exit`` /
+    ``event`` columns the fit consumed (their values are only used by
+    the library to choose its dense FFI grid endpoints; ``survival_at``
+    interpolates the resulting surface at the user-supplied
+    ``t_grid``). Binary covariate columns are passed through unchanged;
+    continuous columns enter directly as floats.
     """
-    X_new = np.asarray(X_new, dtype=float)
     p = len(fit.columns)
     if p > 0:
-        X_new = X_new.reshape(-1, p)
+        X_new = np.asarray(X_new, dtype=float).reshape(-1, p)
     else:
-        X_new = X_new.reshape(-1, 0)
+        X_new = np.asarray(X_new, dtype=float).reshape(-1, 0)
     n_new = X_new.shape[0]
     t_grid = np.asarray(t_grid, dtype=float).ravel()
     n_t = t_grid.shape[0]
 
     if n_new == 0 or n_t == 0:
-        return (
-            np.zeros((n_new, n_t), dtype=float),
-            np.zeros((n_new, n_t), dtype=float),
-        )
+        return np.zeros((n_new, n_t), dtype=float)
 
-    # Long format: block over t_grid within each individual.
-    rep_X = (
-        np.repeat(X_new, n_t, axis=0)
-        if p > 0 else np.zeros((n_new * n_t, 0))
+    # The library auto-builds its 64-point FFI grid from the entry/exit
+    # range in df_new. Span ``exit`` slightly past max(t_grid) so
+    # ``survival_at`` can interpolate at the boundary without clipping.
+    span_max = float(np.max(t_grid)) * 1.05 + 1e-9
+    df_new = pd.DataFrame(
+        {
+            "entry": np.zeros(n_new, dtype=float),
+            "exit": np.full(n_new, span_max, dtype=float),
+            "event": np.ones(n_new, dtype=float),
+            **{name: X_new[:, i] for i, name in enumerate(fit.columns)},
+        }
     )
-    rep_t = np.tile(t_grid, n_new)
-    rep_entry = np.zeros_like(rep_t, dtype=float)
-    rep_event = np.ones_like(rep_t, dtype=float)  # placeholder
 
-    header = ["entry", "exit", "event", *fit.columns]
-    rows = np.column_stack([rep_entry, rep_t, rep_event, rep_X])
-
-    new_csv = os.path.join(fit.tmp_workdir, "new.csv")
-    pred_csv = os.path.join(fit.tmp_workdir, "pred.csv")
-    _write_csv(new_csv, header, rows)
-
-    cmd = [fit.cli, "predict", "--out", pred_csv]
-    if interval is not None:
-        cmd += ["--uncertainty", "--level", str(float(interval))]
-    cmd += [fit.model_path, new_csv]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if proc.returncode != 0:
+    pred = fit.model.predict(df_new)
+    S_mean = np.asarray(pred.survival_at(t_grid), dtype=float)
+    if S_mean.shape != (n_new, n_t):
         raise RuntimeError(
-            "gam predict failed:\n"
-            f"cmd: {' '.join(cmd)}\n"
-            f"stdout: {proc.stdout}\n"
-            f"stderr: {proc.stderr}"
+            f"survival_at returned shape {S_mean.shape}; "
+            f"expected ({n_new}, {n_t})"
         )
-
-    cols = _read_prediction_csv(pred_csv)
-    if "survival_prob" in cols:
-        S_flat = cols["survival_prob"]
-    elif "mean" in cols:
-        S_flat = cols["mean"]
-    else:
-        raise RuntimeError(
-            f"gam predict produced unexpected columns {list(cols)}; "
-            "expected 'survival_prob' or 'mean'."
-        )
-    # Uncertainty.  The current gam CLI emits the survival-prob lower /
-    # upper interval bounds under the canonical names ``mean_lower`` /
-    # ``mean_upper`` (the survival writer clamps both to [0, 1]) plus an
-    # ``effective_se`` on the eta scale.  We prefer a direct SE on the
-    # survival scale, so derive it from the symmetric Wald interval
-    # whenever both bounds are present; otherwise fall back to scaling
-    # ``effective_se`` by |dS/deta| = phi(eta) under the probit link.
-    if "mean_lower" in cols and "mean_upper" in cols:
-        z = 1.959963984540054  # 97.5th percentile of N(0, 1)
-        SE_flat = (cols["mean_upper"] - cols["mean_lower"]) / (2.0 * z)
-    elif "survival_prob_lower" in cols and "survival_prob_upper" in cols:
-        # Older CLI versions used these names; accept for back-compat.
-        z = 1.959963984540054
-        SE_flat = (cols["survival_prob_upper"] - cols["survival_prob_lower"]) / (2.0 * z)
-    elif "effective_se" in cols or "eta_se" in cols:
-        from scipy.stats import norm
-
-        eta = cols.get("eta", np.zeros_like(S_flat))
-        eta_se = cols.get("effective_se", cols.get("eta_se"))
-        SE_flat = np.abs(norm.pdf(eta)) * eta_se
-    else:
-        SE_flat = np.zeros_like(S_flat)
-
-    S_mean = S_flat.reshape(n_new, n_t)
-    S_se = SE_flat.reshape(n_new, n_t)
 
     # S must be non-increasing in t; enforce by left-to-right cumulative
-    # minimum: S_fixed[k] = min(S[0], ..., S[k]).  This is a no-op when
-    # the CLI's output is already monotone and removes any local
-    # violations otherwise without pulling early values down to the
-    # final value (the bug the right-to-left variant produced on
-    # already-monotone input).
+    # minimum so any tiny interpolation overshoot does not violate
+    # monotonicity downstream.
     S_mean = np.minimum.accumulate(S_mean, axis=1)
-    S_mean = np.clip(S_mean, 0.0, 1.0)
-    S_se = np.clip(S_se, 0.0, None)
-    return S_mean, S_se
+    return np.clip(S_mean, 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -403,25 +206,7 @@ def _predict_survival_matrix(fit: _SubmodelFit,
 
 @dataclass
 class SurvivalGAM:
-    """Fitted distributional survival GAM.
-
-    Attributes
-    ----------
-    samples : dict
-        Retained for API compatibility.  Posterior-predictive draws are
-        synthesised from the CLI's survival-scale mean + SE at prediction
-        time (Normal around the CLI point estimate, clipped to [0, 1]
-        and re-monotonised).  When the CLI emits MCMC draws directly we
-        will thread those through here.
-    X_design : dict
-        Per-covariate metadata (kind + column order).
-    columns : tuple
-        Covariate names in the order used at fit time.
-    t_scale : float
-        Kept at 1.0: the gam CLI works on the native time scale.
-    diagnostics : dict
-        CLI stdout + detected family / formula / convergence bits.
-    """
+    """Fitted distributional survival GAM."""
 
     samples: dict
     X_design: dict
@@ -430,74 +215,47 @@ class SurvivalGAM:
     diagnostics: dict
     _fit: Optional[_SubmodelFit] = field(repr=False, default=None)
     _n_posterior_draws: int = 200
-    _predict_cache: Dict[int, Tuple[np.ndarray, np.ndarray]] = field(
-        default_factory=dict,
-        repr=False,
-    )
-    _rng: np.random.Generator = field(
-        default_factory=lambda: np.random.default_rng(0),
-        repr=False,
-    )
+    _predict_cache: Dict[int, np.ndarray] = field(default_factory=dict, repr=False)
 
-    # --------------------------------------------------------------
-
-    def _cached_predict(self, X_new: np.ndarray, t_grid: np.ndarray
-                        ) -> Tuple[np.ndarray, np.ndarray]:
+    def _cached_predict(self, X_new: np.ndarray, t_grid: np.ndarray) -> np.ndarray:
+        if self._fit is None:
+            raise RuntimeError("SurvivalGAM has no fit attached")
         X_new = np.ascontiguousarray(X_new, dtype=float)
         t_grid = np.ascontiguousarray(t_grid, dtype=float)
         key = hash((X_new.tobytes(), X_new.shape, t_grid.tobytes()))
         cached = self._predict_cache.get(key)
         if cached is not None:
             return cached
-        S_mean, S_se = _predict_survival_matrix(self._fit, X_new, t_grid)
-        self._predict_cache[key] = (S_mean, S_se)
-        return S_mean, S_se
+        S_mean = _predict_survival_matrix(self._fit, X_new, t_grid)
+        self._predict_cache[key] = S_mean
+        return S_mean
 
     def _shape_X_new(self, X_new: Any) -> np.ndarray:
         X_new = np.asarray(X_new, dtype=float)
         p = len(self.columns)
         if p == 0:
-            if X_new.ndim == 1:
-                return X_new.reshape(-1, 0)
             return X_new.reshape(-1, 0)
         return X_new.reshape(-1, p)
 
-    # --------------------------------------------------------------
+    def predict_survival(self, X_new: np.ndarray, t_grid: np.ndarray) -> np.ndarray:
+        """Posterior-predictive survival probabilities ``(n_samples, n_new, n_t)``.
 
-    def predict_survival(self, X_new: np.ndarray, t_grid: np.ndarray
-                         ) -> np.ndarray:
-        """Posterior-predictive survival probabilities ``(S, n_new, n_t)``.
-
-        The gam CLI returns a point estimate ``S_mean`` (already
-        monotone-decreasing in ``t``) and an epistemic standard error
-        ``S_se`` for the survival-scale prediction.  We generate
-        posterior-predictive draws as
-
-            S^{(s)}(t | x) = S_mean(t | x) + eta_s(x) * S_se(t | x),
-
-        with ``eta_s(x) ~ Normal(0, 1)`` sampled ONCE per (draw, row)
-        and reused across ``t``.  This preserves the within-row
-        monotonicity of each draw (every curve is a uniformly shifted
-        copy of the point estimate) and avoids the bias that appears
-        when independent per-``(s, row, t)`` noise is projected onto
-        the monotone-decreasing cone.
+        The gam library returns a single point estimate of ``S(t | x)``
+        with no per-cell standard error; we broadcast the same surface
+        across the requested ``n_samples`` axis to keep the shape
+        contract that downstream BMA / validation code expects.
         """
         X_new = self._shape_X_new(X_new)
         t_grid = np.asarray(t_grid, dtype=float).ravel()
-        S_mean, S_se = self._cached_predict(X_new, t_grid)
+        S_mean = self._cached_predict(X_new, t_grid)
         S = max(int(self._n_posterior_draws), 1)
-        if S == 1 or not np.any(S_se > 0):
-            return np.broadcast_to(S_mean, (S,) + S_mean.shape).copy()
-        n_new = S_mean.shape[0]
-        eta = self._rng.standard_normal((S, n_new))      # shared across t
-        out = S_mean[None, :, :] + eta[:, :, None] * S_se[None, :, :]
-        return np.clip(out, 0.0, 1.0)
+        return np.broadcast_to(S_mean, (S,) + S_mean.shape).copy()
 
     def predict_median_survival(self, X_new: np.ndarray) -> np.ndarray:
         """Posterior draws of the median survival time per row."""
         X_new = self._shape_X_new(X_new)
         t_grid = np.geomspace(1e-3, 1.0e2, 400)
-        S_draws = self.predict_survival(X_new, t_grid)       # (S, n_new, n_t)
+        S_draws = self.predict_survival(X_new, t_grid)            # (S, n_new, n_t)
         out = np.full(S_draws.shape[:2], float("inf"))
         for s in range(S_draws.shape[0]):
             for k in range(S_draws.shape[1]):
@@ -518,8 +276,7 @@ class SurvivalGAM:
                         out[s, k] = t_lo_g + frac * (t_hi_g - t_lo_g)
         return out
 
-    def predict_hazard(self, X_new: np.ndarray, t_grid: np.ndarray
-                       ) -> np.ndarray:
+    def predict_hazard(self, X_new: np.ndarray, t_grid: np.ndarray) -> np.ndarray:
         """Posterior-predictive hazard ``h(t|x) = -d/dt log S(t|x)``."""
         S = self.predict_survival(X_new, t_grid)
         t = np.asarray(t_grid, dtype=float).ravel()
@@ -548,36 +305,30 @@ def fit_survival_gam(
     event: np.ndarray,
     X: np.ndarray,
     columns: Optional[Tuple[str, ...]] = None,
-    n_basis: int = 10,                 # retained for API compat
     n_samples: int = 1000,
-    warmup: int = 500,                 # retained for API compat
-    n_chains: int = 2,                 # retained for API compat
-    target_accept: float = 0.8,        # retained for API compat
-    max_tree_depth: int = 10,          # retained for API compat
     rng: Optional[np.random.Generator] = None,
     progress: bool = False,
 ) -> SurvivalGAM:
-    """Fit a distributional survival GAM via the gam CLI.
+    """Fit a distributional survival GAM via the gam Python library.
 
     Parameters
     ----------
     time, event : arrays of shape (n,)
         Observed follow-up times (positive) and event indicators
-        (1 = failure, 0 = right-censored).  These are passed directly to
-        the gam CLI's ``survival`` subcommand; no transformation, no
-        censoring workaround.
+        (1 = failure, 0 = right-censored).
     X : (n, p) ndarray
-        Covariate matrix.  Columns whose unique values are a subset of
-        {0, 1} are treated as binary and enter linearly; other columns
-        enter as penalised smooths ``s(name)``.  When ``p == 0`` the
-        model reduces to an intercept-only survival fit.
+        Covariate matrix. Columns whose unique values are a subset of
+        ``{0, 1}`` are treated as binary and enter linearly; other
+        columns enter as penalised P-splines.
     columns : tuple, optional
-        Names for the ``p`` covariates.  Defaults to ``("x0", ...)``.
+        Names for the ``p`` covariates. Defaults to ``("x0", ...)``.
     n_samples : int
-        Number of posterior-predictive draws per prediction.
+        Number of posterior-predictive draws per prediction. Retained
+        for shape-contract compatibility with downstream BMA: the library
+        returns a single point estimate, which is broadcast across this
+        axis at predict time.
     """
-    if rng is None:
-        rng = np.random.default_rng(0)
+    del rng, progress  # accepted for API compat; library is deterministic
 
     time = np.asarray(time, dtype=float)
     event = np.asarray(event, dtype=float)
@@ -593,15 +344,6 @@ def fit_survival_gam(
         for i, name in enumerate(columns)
     }
 
-    cli_version: Optional[str]
-    try:
-        ver = subprocess.run(
-            [fit.cli, "--version"], capture_output=True, text=True, timeout=10,
-        )
-        cli_version = (ver.stdout + ver.stderr).strip().splitlines()[0]
-    except Exception:
-        cli_version = None
-
     summ = fit.train_summary or {}
 
     def _num(key: str, default: float = float("nan")) -> float:
@@ -612,16 +354,15 @@ def fit_survival_gam(
             return default
 
     diagnostics = {
-        "backend": "gam CLI (survival)",
-        "cli_path": fit.cli,
-        "cli_version": cli_version,
+        "backend": "gam Python library",
+        "library_version": gam.build_info().get("version"),
         "formula": fit.formula,
         "train_summary": summ,
         "converged": True,
-        "reml_iterations": int(summ.get("reml_iterations", summ.get("iterations", 0)) or 0),
+        "reml_iterations": int(_num("reml_iterations", _num("iterations", 0)) or 0),
         "reml_score": _num("reml_score"),
         "edf_total": _num("edf_total"),
-        "sigma_residual": _num("sigma", _num("sigma_residual")),
+        "sigma_residual": _num("sigma_residual"),
         "deviance": _num("deviance"),
         "n_train": fit.n_train,
         "n_events": fit.n_events,
@@ -636,7 +377,6 @@ def fit_survival_gam(
         diagnostics=diagnostics,
         _fit=fit,
         _n_posterior_draws=int(n_samples),
-        _rng=rng,
     )
 
 
@@ -686,16 +426,14 @@ def bma_survival(
         cols = tuple(int(c) for c in cols)
         sub_X = data_matrix[:, list(cols)] if cols else np.zeros((time.shape[0], 0))
         names = tuple(column_names[c] for c in cols)
-        fit = fit_survival_gam(
-            time, event, sub_X, columns=names, **gam_kwargs,
-        )
+        fit = fit_survival_gam(time, event, sub_X, columns=names, **gam_kwargs)
         fits.append(fit)
         sub_eval = X_eval_arr[:, list(cols)] if cols else np.zeros((n_eval, 0))
-        draws = fit.predict_survival(sub_eval, t_grid)       # (S, n_eval, n_t)
+        draws = fit.predict_survival(sub_eval, t_grid)            # (S, n_eval, n_t)
         per_set_mean.append(draws.mean(axis=0))
         per_set_var.append(draws.var(axis=0, ddof=0))
 
-    stack_mean = np.stack(per_set_mean, axis=0)              # (K, n_eval, n_t)
+    stack_mean = np.stack(per_set_mean, axis=0)                   # (K, n_eval, n_t)
     stack_var = np.stack(per_set_var, axis=0)
 
     S_bma = np.einsum("k,kij->ij", weights, stack_mean)
@@ -703,22 +441,20 @@ def bma_survival(
     V_struct = np.einsum(
         "k,kij->ij", weights, (stack_mean - S_bma[None, :, :]) ** 2,
     )
-
     V_total = V_param + V_struct
     return {
-        # Canonical keys.
         "survival_mean": S_bma,
-        "S_bma": S_bma,                   # alias kept for test compatibility
+        "S_bma": S_bma,                     # alias kept for test compatibility
         "per_set_mean": stack_mean,
-        "per_model_mean": stack_mean,     # alias
+        "per_model_mean": stack_mean,       # alias
         "per_set_variance": stack_var,
-        "per_model_variance": stack_var,  # alias
+        "per_model_variance": stack_var,    # alias
         "variance_parametric": V_param,
-        "var_parametric": V_param,        # alias
+        "var_parametric": V_param,          # alias
         "variance_structural": V_struct,
-        "var_structural": V_struct,       # alias
+        "var_structural": V_struct,         # alias
         "variance_total": V_total,
-        "var_total": V_total,             # alias
+        "var_total": V_total,               # alias
         "weights": weights,
         "fits": fits,
         "t_grid": t_grid,
