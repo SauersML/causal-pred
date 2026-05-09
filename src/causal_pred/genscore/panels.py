@@ -104,14 +104,20 @@ def _download_one(
     dst: Path,
     timeout: int,
     stale_paths: Sequence[Path] = (),
-) -> Path:
+) -> tuple[Path, str, int, float]:
+    """Return ``(path, status, bytes_written, elapsed_seconds)``.
+
+    ``status`` is ``"cached"`` if the existing file validated, otherwise
+    ``"downloaded"``.
+    """
+    t0 = time.time()
     for stale in stale_paths:
         if stale != dst and stale.exists():
             stale.unlink()
     if dst.is_file() and dst.stat().st_size > 0:
         try:
             _validate_score_file(dst)
-            return dst
+            return dst, "cached", dst.stat().st_size, time.time() - t0
         except _InvalidScoreFile:
             dst.unlink()
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -120,6 +126,7 @@ def _download_one(
     for tmp in (compressed_tmp, text_tmp):
         if tmp.exists():
             tmp.unlink()
+    bytes_written = 0
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         with open(compressed_tmp, "wb") as fh:
             while True:
@@ -127,13 +134,14 @@ def _download_one(
                 if not chunk:
                     break
                 fh.write(chunk)
+                bytes_written += len(chunk)
     try:
         _decompress_score_file(compressed_tmp, text_tmp)
     finally:
         if compressed_tmp.exists():
             compressed_tmp.unlink()
     os.replace(text_tmp, dst)
-    return dst
+    return dst, "downloaded", bytes_written, time.time() - t0
 
 
 def download_panel(
@@ -142,6 +150,7 @@ def download_panel(
     build: str = "GRCh38",
     n_workers: int = 8,
     timeout: int = 600,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> List[Path]:
     """Download every PGS scoring file in ``ids`` into ``out_dir`` in parallel.
 
@@ -149,28 +158,49 @@ def download_panel(
     cached as decompressed ``<pgs_id>_hmPOS_<build>.txt`` files, because
     gnomon 0.1.2 rejects the catalog gzip streams as non-UTF-8. Existing text
     files are reused only after strict UTF-8 validation.
+
+    If ``progress`` is given, it is called with human-readable status strings
+    as each scoring file is resolved (cached or downloaded), plus a final
+    summary line.
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     text_suffix = f"_hmPOS_{build}.txt"
     gzip_suffix = f"{text_suffix}.gz"
+    total = len(ids)
 
-    def _job(pgs_id: str) -> Path:
-        return _download_one(
+    def _emit(msg: str) -> None:
+        if progress is not None:
+            progress(msg)
+
+    _emit(
+        f"download_panel: {total} PGS scoring files into {out} "
+        f"(workers={n_workers}, timeout={timeout}s, build={build})"
+    )
+
+    def _job(pgs_id: str) -> tuple[str, Path, str, int, float]:
+        path, status, nbytes, elapsed = _download_one(
             pgs_catalog_url(pgs_id, build=build),
             out / f"{pgs_id}{text_suffix}",
             timeout=timeout,
             stale_paths=(out / f"{pgs_id}{gzip_suffix}",),
         )
+        return pgs_id, path, status, nbytes, elapsed
 
     paths: List[Path] = []
     errors: list[BaseException] = []
+    cached_n = 0
+    downloaded_n = 0
+    bytes_downloaded = 0
+    started = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex:
-        for fut in concurrent.futures.as_completed(
-            {ex.submit(_job, pid): pid for pid in ids}
+        future_to_id = {ex.submit(_job, pid): pid for pid in ids}
+        for completed, fut in enumerate(
+            concurrent.futures.as_completed(future_to_id), start=1
         ):
+            pgs_id = future_to_id[fut]
             try:
-                paths.append(fut.result())
+                pid, path, status, nbytes, elapsed = fut.result()
             except (
                 urllib.error.URLError,
                 OSError,
@@ -178,6 +208,28 @@ def download_panel(
                 _InvalidScoreFile,
             ) as exc:
                 errors.append(exc)
+                _emit(
+                    f"[{completed}/{total}] FAILED {pgs_id}: {exc!r}"
+                )
+                continue
+            paths.append(path)
+            if status == "cached":
+                cached_n += 1
+            else:
+                downloaded_n += 1
+                bytes_downloaded += nbytes
+            _emit(
+                f"[{completed}/{total}] {status} {pid} "
+                f"({nbytes / (1 << 20):.2f} MiB in {elapsed:.1f}s) "
+                f"[cached={cached_n} downloaded={downloaded_n} failed={len(errors)}]"
+            )
+
+    _emit(
+        f"download_panel: done {len(paths)}/{total} files "
+        f"(cached={cached_n} downloaded={downloaded_n} failed={len(errors)} "
+        f"bytes_downloaded={bytes_downloaded / (1 << 20):.1f} MiB "
+        f"elapsed={time.time() - started:.1f}s)"
+    )
 
     if errors:
         raise RuntimeError(

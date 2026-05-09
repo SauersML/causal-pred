@@ -874,12 +874,43 @@ def _build_prs_panel(
 
     if score_files is None:
         logger.info("[prs] resolving PGS scoring panel into %s", panel_dir)
-        score_files = [Path(p) for p in download_panel(panel_dir)]
+        t_panel = time.time()
+        score_files = [
+            Path(p)
+            for p in download_panel(
+                panel_dir,
+                progress=lambda msg: logger.info("[prs] %s", msg),
+            )
+        ]
+        logger.info(
+            "[prs] PGS scoring panel ready: %d files in %s (dir=%s)",
+            len(score_files),
+            _format_seconds(time.time() - t_panel),
+            panel_dir,
+        )
     else:
         score_files = [Path(p) for p in score_files]
+        logger.info(
+            "[prs] using %d caller-provided PGS score files", len(score_files)
+        )
+    logger.info(
+        "[prs] computing gnomon score cache filename for bed=%s with %d score files",
+        bed,
+        len(score_files),
+    )
     sscore_name = _gnomon_score_cache_filename(bed, score_files)
     local_sscore = out_dir / sscore_name
     remote_sscore = f"{GNOMON_OUT_DIRNAME}/{sscore_name}"
+    logger.info(
+        "[prs] sscore cache target: local=%s remote=%s (exists_local=%s)",
+        local_sscore,
+        remote_sscore,
+        local_sscore.is_file(),
+    )
+    logger.info(
+        "[prs] checking for cached gnomon scores (cache=%s)",
+        "workspace" if cache is not None else "local-only",
+    )
     scores = _restore_gnomon_scores(
         cache,
         local_sscore,
@@ -959,18 +990,47 @@ def _load_or_build_prs_panel(
     panel_dir = Path(DEFAULT_CACHE_DIR) / PGS_PANEL_DIRNAME
     panel_dir.mkdir(parents=True, exist_ok=True)
     logger.info("[prs] resolving PGS scoring panel into %s", panel_dir)
-    score_files = [Path(p) for p in download_panel(panel_dir)]
+    t_panel = time.time()
+    score_files = [
+        Path(p)
+        for p in download_panel(
+            panel_dir,
+            progress=lambda msg: logger.info("[prs] %s", msg),
+        )
+    ]
+    logger.info(
+        "[prs] PGS scoring panel ready: %d files in %s (dir=%s)",
+        len(score_files),
+        _format_seconds(time.time() - t_panel),
+        panel_dir,
+    )
+    logger.info(
+        "[prs] computing PRS panel cache filename (bed=%s, score_files=%d, n_person=%d)",
+        bed,
+        len(score_files),
+        len(person_ids),
+    )
     filename = _prs_panel_cache_filename(bed, score_files, person_ids)
     path = Path(DEFAULT_CACHE_DIR) / PRS_PANEL_CACHE_DIRNAME / filename
+    logger.info("[prs] PRS panel cache target: %s", path)
     if _prs_cache_usable(path, person_ids):
         logger.info("[prs] using local cache %s", path)
         return _read_prs_panel(path), str(path)
 
     remote_name = f"{PRS_PANEL_CACHE_DIRNAME}/{filename}"
+    logger.info(
+        "[prs] local cache unusable; attempting workspace fetch %s -> %s",
+        remote_name,
+        path,
+    )
     cache.fetch(remote_name, path, overwrite=True)
     if _prs_cache_usable(path, person_ids):
         logger.info("[prs] restored workspace cache %s", path)
         return _read_prs_panel(path), str(path)
+    logger.info(
+        "[prs] no usable cache; building PRS panel from gnomon scoring -> %s",
+        path,
+    )
 
     panel = _build_prs_panel(
         cohort_csv,
