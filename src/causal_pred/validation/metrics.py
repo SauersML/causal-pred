@@ -125,8 +125,8 @@ def calibration_metrics(
     -------
     dict with keys
         ``brier``: Brier (1950) mean squared error.
-        ``brier_decomposition``: reliability / resolution / uncertainty a la
-            Murphy (1973): ``brier = reliability - resolution + uncertainty``.
+        ``brier_decomposition``: binned Murphy (1973) reliability, resolution,
+            and uncertainty terms.
         ``ece``: expected calibration error (Naeini et al. 2015), a weighted
             average of per-bin |mean(p) - mean(y)|.
         ``mce``: max over bins of |mean(p) - mean(y)|.
@@ -163,19 +163,16 @@ def calibration_metrics(
 
     ybar = float(np.mean(y))
 
-    # Murphy (1973) decomposition, generalised (Broecker 2009) so that the
-    # identity  BS = REL - RES + UNC  holds exactly for continuous forecasts:
+    # Binned Murphy (1973) terms matching the reliability diagram:
+    #     reliability = (1/n) sum_k n_k (mean_p_k - mean_y_k)^2
     #     resolution  = (1/n) sum_k n_k (mean_y_k - ybar)^2
     #     uncertainty = ybar (1 - ybar)
-    #     reliability = BS - UNC + RES
-    # For discrete forecasts (all forecasts within a bin share one value),
-    # this is equivalent to the textbook Murphy 1973 formula
-    # (1/n) sum_k n_k (mean_p_k - mean_y_k)^2; for continuous forecasts it
-    # additionally absorbs the within-bin forecast variance (Broecker 2009
-    # "Reliability, sufficiency, and the decomposition of proper scores").
+    # The exact identity BS = REL - RES + UNC holds only when forecasts are
+    # constant inside bins; with continuous forecasts this is the textbook
+    # binned reliability quantity, not the Broecker generalized identity term.
+    reliability = float(np.sum(bin_n * (mean_p - mean_y) ** 2) / n)
     resolution = float(np.sum(bin_n * (mean_y - ybar) ** 2) / n)
     uncertainty = float(ybar * (1.0 - ybar))
-    reliability = float(brier - uncertainty + resolution)
 
     # ECE / MCE (Naeini et al. 2015).
     gaps = np.abs(mean_p - mean_y)
@@ -412,7 +409,8 @@ def brier_score(time, event, survival_pred, eval_times) -> dict:
 
     where ``G`` is the Kaplan-Meier estimate of the censoring distribution.
     The Integrated Brier Score (IBS) is the trapezoidal integral of
-    BS(t*) over ``[0, max(eval_times)]`` normalised by the interval width.
+    BS(t*) over the finite evaluation grid interval
+    ``[min(eval_times), max(eval_times)]`` normalised by that interval width.
     The Scaled Brier Score ``IBS / IBS_KM`` compares the model to a
     Kaplan-Meier marginal survival baseline (Graf et al. 1999).
 

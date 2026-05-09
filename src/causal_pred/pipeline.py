@@ -56,7 +56,6 @@ from .data.cohort import (
 from .data.nodes import CANONICAL_EDGES, NODES, NODE_INDEX, NODE_NAMES
 from .data.polygenic import parse_sscore, score_panel
 from .data.opengwas import load_live_gwas
-from .data.real_gwas import load_real_gwas
 from .data.synthetic import SyntheticDataset
 from .dagslam import run_dagslam
 from .genscore.integrate import run_genscore
@@ -1896,21 +1895,6 @@ def _load_or_run_genscore_features(
     return dataset, aug_result.kept_person_id.astype(str), meta, model_bundle
 
 
-def _mr_gwas_source() -> str:
-    """Pick the MR-prior source.
-
-    Default is ``live`` -- the OpenGWAS two-sample IVW path, which
-    serves committed-to-repo cache files under ``data/mr_cache/`` and
-    only hits the network when (a) a cell is uncached AND (b)
-    ``OPENGWAS_JWT`` is set.  ``MR_GWAS_SOURCE=literature`` forces the
-    hand-coded fallback table in ``data/real_gwas.py``.
-    """
-    explicit = os.environ.get("MR_GWAS_SOURCE", "").strip().lower()
-    if explicit in {"live", "literature"}:
-        return explicit
-    return "live"
-
-
 def _gwas_fingerprint(gwas: Any, source: str) -> dict[str, Any]:
     per_pair = []
     for row in getattr(gwas, "per_pair", []) or []:
@@ -1998,50 +1982,39 @@ def _log_gwas_per_pair(logger: logging.Logger, summary: Any, source: str) -> Non
         )
 
 
-def _load_gwas_for_mrdag(logger: logging.Logger) -> tuple[Any, str]:
-    """Load the MR summary statistics for the MrDAG prior.
+def _load_gwas_for_mrdag(logger: logging.Logger) -> Any:
+    """Load real two-sample MR summary statistics for the MrDAG prior.
 
-    Tries ``live`` (OpenGWAS two-sample IVW) when configured; falls
-    back to the curated literature table when no JWT is set or when
-    the fetch yields zero usable cells.  Logs which source was used
-    and a per-pair (beta, SE, n_snps) breakdown.
+    Runs the OpenGWAS IVW path against the on-disk ``data/mr_cache/`` and
+    only hits the network when (a) a cell is uncached AND (b)
+    ``OPENGWAS_JWT`` is set.  Raises if no usable cells are produced --
+    there is no fabricated fallback.
     """
-    source = _mr_gwas_source()
-    if source == "live":
-        try:
-            cache_dir = Path(DEFAULT_CACHE_DIR) / "mr_cache"
-            summary = load_live_gwas(cache_dir=cache_dir)
-            usable = int(np.sum(np.isfinite(summary.betas) & np.isfinite(summary.ses)))
-            if usable > 0:
-                _log_gwas_per_pair(logger, summary, "live")
-                return summary, "live"
-            logger.warning(
-                "[mrdag] live OpenGWAS fetch produced 0 usable cells; "
-                "falling back to literature table"
-            )
-        except Exception as exc:
-            logger.warning(
-                "[mrdag] live OpenGWAS fetch failed (%s); falling back to literature",
-                exc,
-            )
-    summary = load_real_gwas()
-    _log_gwas_per_pair(logger, summary, "literature")
-    return summary, "literature"
+    cache_dir = Path(DEFAULT_CACHE_DIR) / "mr_cache"
+    summary = load_live_gwas(cache_dir=cache_dir)
+    usable = int(np.sum(np.isfinite(summary.betas) & np.isfinite(summary.ses)))
+    if usable == 0:
+        raise RuntimeError(
+            "MrDAG: no usable OpenGWAS IVW cells. Populate the cache under "
+            f"{cache_dir} or set OPENGWAS_JWT to refresh from the API."
+        )
+    _log_gwas_per_pair(logger, summary, "opengwas")
+    return summary
 
 
 def _load_or_run_mrdag(
     cache: WorkspaceCache, logger: logging.Logger
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    gwas, source_used = _load_gwas_for_mrdag(logger)
-    key = _mrdag_cache_key(gwas, source_used)
-    filename = f"mrdag-real-{key}.npz"
+    gwas = _load_gwas_for_mrdag(logger)
+    key = _mrdag_cache_key(gwas, "opengwas")
+    filename = f"mrdag-{key}.npz"
     path = cache.fetch(filename)
     if path.is_file():
         with np.load(path, allow_pickle=False) as z:
             logger.info("[mrdag] using cache %s", path)
             return z["pi"], json.loads(str(z["diagnostics_json"].item()))
 
-    logger.info("[mrdag] running MR prior sampler (source=%s)", source_used)
+    logger.info("[mrdag] running MR prior sampler (source=opengwas)")
     t0 = time.time()
     result = run_mrdag(
         gwas,
@@ -2053,7 +2026,7 @@ def _load_or_run_mrdag(
     )
     diagnostics = dict(result.diagnostics)
     diagnostics["runtime_s"] = time.time() - t0
-    diagnostics["gwas_source"] = source_used
+    diagnostics["gwas_source"] = "opengwas"
     diagnostics["gwas_cache_key"] = key
     _atomic_npz(
         path,
@@ -3268,12 +3241,12 @@ def run_pipeline() -> PipelineResult:
         del mcmc_runtime
         timings["mcmc"] = time.time() - t0
         logger.info(
-            "[mcmc] accept_overall=%.3f accept_mh=%.3f max_rhat_skel=%.3f min_ess=%.1f",
+            "[mcmc] accept_overall=%.3f accept_mh=%.3f max_rhat_directed=%.3f min_ess=%.1f",
             float(mcmc_diagnostics["accept_rate"].get("overall", float("nan"))),
             float(
                 mcmc_diagnostics["accept_rate"].get("metropolis_hastings", float("nan"))
             ),
-            float(mcmc_diagnostics.get("max_rhat_skeleton", float("nan"))),
+            float(mcmc_diagnostics.get("max_rhat_directed", float("nan"))),
             float(mcmc_diagnostics.get("min_ess", float("nan"))),
         )
         _log_mcmc_diagnostics(
@@ -3357,11 +3330,11 @@ def run_pipeline() -> PipelineResult:
     )
     n_scored = int(allowed_edges.sum())
     logger.info(
-        "[summary] mcmc: accept=%.3f accept_mh=%.3f max_rhat_skel=%.3f min_ess=%.1f "
+        "[summary] mcmc: accept=%.3f accept_mh=%.3f max_rhat_directed=%.3f min_ess=%.1f "
         "edges_above_%.2f=%d/%d",
         float(mcmc_diagnostics["accept_rate"].get("overall", float("nan"))),
         float(mcmc_diagnostics["accept_rate"].get("metropolis_hastings", float("nan"))),
-        float(mcmc_diagnostics.get("max_rhat_skeleton", float("nan"))),
+        float(mcmc_diagnostics.get("max_rhat_directed", float("nan"))),
         float(mcmc_diagnostics.get("min_ess", float("nan"))),
         float(THRESHOLD_DEFAULT),
         int(np.sum(thresholded)),

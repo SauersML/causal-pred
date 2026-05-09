@@ -57,23 +57,38 @@ Bayesian structure learning*. Pearl (2009).
 
 ## 3. BGe score (Gaussian marginal likelihood)
 
-For a Gaussian node `j` with parent set `Pa(j)` and `n` observations, the
-BGe marginal log-likelihood (Kuipers-Moffa-Heckerman 2014, derived from
-Geiger-Heckerman 2002) is
+For a Gaussian node `j` with parent set `Pa(j)` and `N` observations, the
+BGe local score is the difference of two Normal-Wishart subset marginals:
 
 ```
-log p(X_j | X_{Pa(j)})
-  = c(n, |Pa(j)|, alpha_w)
-    + (alpha_w + n - |Pa(j)| - 1)/2 * log det(T_0 + S_{N,Pa(j)})
-    - (alpha_w + n - |Pa(j)|)/2 * log det(T_0 + S_{N, Pa(j) U {j}})
+log_score(j | Pa(j)) = log p(X_{j U Pa(j)}) - log p(X_{Pa(j)}).
 ```
 
-where `T_0` is the prior scale matrix, `S_N` is the empirical scatter
-matrix, `alpha_w` is the Wishart hyperparameter, and `c(...)` is a
-normalisation term involving multivariate gamma functions. Our
-implementation follows the numerically stable form in section 3 of
-Kuipers-Moffa-Heckerman 2014, using Cholesky updates when a parent is
-added to avoid recomputing `det` from scratch.
+For a subset `Y` of size `l`, the marginal induced by the full
+`p`-dimensional prior uses
+
+```
+nu_l = alpha_w - p + l,
+
+log p(X_Y)
+  = -N l/2 * log(pi)
+    + l/2 * log(alpha_mu / (alpha_mu + N))
+    + nu_l/2 * log det(T_Y)
+    - (nu_l + N)/2 * log det(R_Y)
+    + log Gamma_l((nu_l + N)/2)
+    - log Gamma_l(nu_l/2),
+```
+
+where `R = T + S + alpha_mu N/(alpha_mu + N) x_bar x_bar^T`. Expanding the
+multivariate gamma gives terms
+
+```
+sum_{i=1}^l log Gamma((nu_l + N + 1 - i)/2)
+  - sum_{i=1}^l log Gamma((nu_l + 1 - i)/2).
+```
+
+Our implementation follows this numerically stable subset form with Cholesky
+log-determinants.
 
 Citations: Kuipers J, Moffa G, Heckerman D. (2014). *Addendum on the
 scoring of Gaussian directed acyclic graphical models*. Annals of
@@ -94,9 +109,9 @@ log p(X_j | X_{Pa(j)})
 
 where `H(beta_hat) = -grad^2 log p(X_j | X_{Pa(j)}, beta) |_{beta_hat}` is
 the observed information and `d = |Pa(j)| + 1` including the intercept.
-We use a Ridge prior `beta ~ N(0, lambda^{-1} I)` with `lambda = 1` so that
-the Laplace approximation is well-defined even when `X_{Pa(j)}` is
-rank-deficient.
+The intercept has an improper flat prior; the non-intercept coefficients use
+`beta_k ~ N(0, tau^2)`. The Gaussian prior normaliser is therefore included
+only for the penalised non-intercept coefficients.
 
 Citations: Bishop (2006) *Pattern Recognition and Machine Learning*,
 chapter 4.4. Murphy (2012) chapter 8.4.
@@ -188,8 +203,7 @@ For a probability forecast `p_i` of a binary event `y_i`, the mean Brier
 score decomposes as
 
 ```
-BS = (1/n) sum_i (p_i - y_i)^2
-   = reliability - resolution + uncertainty.
+BS = (1/n) sum_i (p_i - y_i)^2.
 ```
 
 With predictions binned into `K` groups of size `n_k`, mean forecast
@@ -202,7 +216,10 @@ uncertainty = o_bar * (1 - o_bar).
 ```
 
 We report reliability and resolution alongside the integrated Brier score
-(Graf 1999) in `validation/metrics.py`.
+(Graf 1999) in `validation/metrics.py`. For continuous forecasts the binned
+terms above do not generally satisfy `BS = reliability - resolution +
+uncertainty` exactly because forecasts vary within bins; the reported
+`reliability` is the textbook binned reliability term shown here.
 
 Citations: Murphy AH. (1973). *A new vector partition of the probability
 score*. J Appl Meteorol 12(4). Brier GW. (1950). Graf E. (1999).
@@ -223,13 +240,16 @@ an IPCW estimator that is consistent under random censoring:
 
 ```
 AUC_hat(t)
-  = sum_{i,j} I(T_i \le t) I(T_j > t) I(risk_i > risk_j) * w_i w_j
-    / sum_{i,j} I(T_i \le t) I(T_j > t) * w_i w_j,
+  = sum_{i,j} I(T_i \le t, delta_i = 1) I(T_j > t)
+      I(risk_i > risk_j) * w_i
+    / sum_{i,j} I(T_i \le t, delta_i = 1) I(T_j > t) * w_i,
 ```
 
-with `w_i = delta_i / G_hat(T_i-)`, `G_hat` the Kaplan-Meier of the
-censoring time. We report Uno's estimator at horizons 5, 10 and 15 years
-and the integrated time-dependent AUC.
+with case weight `w_i = 1 / G_hat(T_i-)`, where `G_hat` is the Kaplan-Meier
+of the censoring time. Controls satisfy `T_j > t` and are known uncensored at
+the evaluation horizon, so the implemented cumulative/dynamic estimator does
+not apply an additional control weight. We report this estimator at horizons
+5, 10 and 15 years and the integrated time-dependent AUC.
 
 Citations: Heagerty PJ, Lumley T, Pepe MS. (2000). *Time-dependent ROC
 curves for censored survival data and a diagnostic marker*. Biometrics

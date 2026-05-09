@@ -9,10 +9,10 @@ report and bar chart.  The baselines are:
     except the T2D indicator.
   * ``run_naive_logistic``: sklearn logistic regression predicting an
     IPCW fixed-horizon 10-year endpoint.
-  * ``run_mr_ivw``: causal-edge classifier using the published MR-IVW
-    estimates in :mod:`causal_pred.data.real_gwas` with a Bonferroni
-    cut-off.
-  * ``run_causal_pred``: synthetic-data run of the causal-pred stack:
+  * ``run_mr_ivw``: causal-edge classifier using the live OpenGWAS two-sample
+    IVW estimates from :func:`causal_pred.data.opengwas.load_live_gwas` with
+    a Bonferroni cut-off.
+  * ``run_causal_pred``: full causal-pred stack:
     MrDAG priors -> DAGSLAM -> structure MCMC -> gamfit survival GAM.
 
 Metrics computed (where defined):
@@ -594,7 +594,7 @@ def run_causal_pred(
     X_test = np.asarray(data.X[test_idx], dtype=float)
     allowed_edges = _benchmark_allowed_edges(data.columns, data.node_types)
 
-    gwas = load_real_gwas() if use_real_gwas else simulate_gwas(rng=rng)
+    gwas = load_real_gwas() if use_real_gwas else simulate_gwas()
     mrdag_iter = max(80, min(1000, int(mcmc_iter) * 4))
     mrdag_burn = max(20, min(mrdag_iter // 2, mrdag_iter // 5))
     mrdag_thin = max(1, (mrdag_iter - mrdag_burn) // max(20, int(mcmc_iter)))
@@ -723,7 +723,7 @@ def run_causal_pred(
             "n_test": int(test_idx.size),
             "runtime_s": float(time.perf_counter() - t0),
             "gam_runtime_s": float(time.perf_counter() - gam_t0),
-            "gwas_source": "literature" if use_real_gwas else "simulated",
+            "gwas_source": "literature" if use_real_gwas else "opengwas_cache",
             "mrdag_n_candidate_edges": int(
                 mrdag.diagnostics.get("n_candidate_edges", 0)
             ),
@@ -731,6 +731,9 @@ def run_causal_pred(
             "dagslam_log_score": float(dagslam.log_score),
             "mcmc_n_samples": int(samples.shape[0]),
             "mcmc_accept_rate": dict(mcmc.diagnostics.get("accept_rate", {})),
+            "mcmc_max_rhat_directed": float(
+                mcmc.diagnostics.get("max_rhat_directed", float("nan"))
+            ),
             "mcmc_max_rhat_skeleton": float(
                 mcmc.diagnostics.get("max_rhat_skeleton", float("nan"))
             ),

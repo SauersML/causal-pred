@@ -455,7 +455,7 @@ def test_rhat_ok(medium_data):
         rng=np.random.default_rng(11),
         **_survival_hyper(medium_data),
     )
-    if res.diagnostics["n_infinite_rhat_skeleton"]:
+    if res.diagnostics["n_infinite_rhat_directed"]:
         assert np.isposinf(res.diagnostics["max_rhat"])
     else:
         assert res.diagnostics["max_rhat"] < 1.3, (

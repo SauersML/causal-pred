@@ -50,7 +50,8 @@ Score forms (peer-review quality)
 
 * **Binary node** with parent set Pa is scored with a **Laplace
   approximation** to the logistic-regression log marginal likelihood
-  under a Gaussian prior on the coefficients, N(0, tau^2 I):
+  under a flat intercept prior and Gaussian prior
+  N(0, tau^2 I) on the non-intercept coefficients:
 
       log p(y | X) ~= log p(y | X, beta_MAP)
                      + log N(beta_MAP | 0, tau^2 I)
@@ -58,9 +59,10 @@ Score forms (peer-review quality)
                      - 1/2 * log det(H)
 
   where H is the negative Hessian of the joint log-posterior at
-  beta_MAP, i.e. H = X^T diag(p (1-p)) X + (1/tau^2) I,
-  and k = dim(beta) = |Pa| + 1 (intercept is included).  The intercept
-  is *not* penalised (its ridge coefficient is 0).
+  beta_MAP, i.e. H = X^T diag(p (1-p)) X + diag(0, 1/tau^2, ...),
+  and k = dim(beta) = |Pa| + 1.  The intercept is *not* penalised, and
+  the Gaussian prior normaliser includes only the k-1 penalised
+  coefficients.
 
   beta_MAP is found by Newton-IRLS iteration to machine precision.  A
   numerically stable log-sigmoid ``- logaddexp(0, -z)`` is used, and

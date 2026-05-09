@@ -31,4 +31,4 @@ def medium_data():
 def small_gwas():
     from causal_pred.data.gwas import simulate_gwas
 
-    return simulate_gwas(rng=np.random.default_rng(7))
+    return simulate_gwas()

@@ -1,7 +1,7 @@
 """Live two-sample MR via the OpenGWAS (MR-Base) REST API.
 
-Replaces the hand-coded ``real_gwas.PUBLISHED_MR`` table with a
-programmatic fetch + IVW pipeline:
+Provides the programmatic fetch + IVW pipeline used by MrDAG to obtain
+per-pair causal-effect estimates with full per-SNP provenance:
 
 1. For each exposure trait, fetch genome-wide-significant, LD-clumped
    tophits via OpenGWAS ``/tophits``.
@@ -77,11 +77,11 @@ from typing import Any, Dict, Iterable, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 
-from .real_gwas import (
+from .gwas import (
     CIRCULAR_PAIRS,
+    GWASSummary,
     MR_EXPOSURES,
     MR_OUTCOMES,
-    RealGWASSummary,
 )
 
 
@@ -478,13 +478,12 @@ def load_live_gwas(
     kb: int = DEFAULT_KB,
     drop_circular: bool = True,
     raise_on_error: bool = False,
-) -> RealGWASSummary:
+) -> GWASSummary:
     """Run two-sample IVW for every (exposure, outcome) pair in the trait set.
 
-    Returns a ``RealGWASSummary`` (NaN for unavailable cells) so the
-    MrDAG pipeline can consume it interchangeably with the hand-coded
-    table.  When the client has no token, uncached cells end up NaN and
-    the function logs warnings rather than raising.
+    Returns a ``GWASSummary`` (NaN for unavailable cells).  When the client
+    has no token, uncached cells end up NaN and the function logs warnings
+    rather than raising.
     """
     from scipy.stats import norm
 
@@ -698,7 +697,7 @@ def load_live_gwas(
         z = betas / ses
         pvals = 2.0 * (1.0 - norm.cdf(np.abs(z)))
 
-    summary = RealGWASSummary(
+    summary = GWASSummary(
         exposures=exposures,
         outcomes=outcomes,
         betas=betas,

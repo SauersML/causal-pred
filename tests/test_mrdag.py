@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 
 from causal_pred.data.nodes import NODE_INDEX, NODE_NAMES, N_NODES
-from causal_pred.data.gwas import MR_EXPOSURES, MR_OUTCOMES, _true_mr_effect
+from causal_pred.data.gwas import MR_EXPOSURES, MR_OUTCOMES
 from causal_pred.mrdag.pipeline import (
     run_mrdag,
     MrDAGResult,
@@ -37,7 +37,7 @@ from causal_pred.mrdag.pipeline import (
 def mrdag_result():
     from causal_pred.data.gwas import simulate_gwas
 
-    gwas = simulate_gwas(rng=np.random.default_rng(7))
+    gwas = simulate_gwas()
     return run_mrdag(
         gwas,
         rng=np.random.default_rng(2024),
@@ -239,10 +239,24 @@ def test_path_effect_zero_when_no_path():
 
 
 def test_synthetic_gwas_effects_are_total_effects():
-    pa_t2d = _true_mr_effect("physical_activity", "T2D")
-    expected = (-0.22 * 0.55) + (-0.22 * 0.25 * 0.45)
+    from pathlib import Path
 
-    assert pa_t2d == pytest.approx(expected)
+    from causal_pred.data import opengwas
+    from causal_pred.data.gwas import simulate_gwas
+
+    cache_dir = Path(__file__).resolve().parents[1] / "data" / "mr_cache"
+    gwas = simulate_gwas()
+    live = opengwas.load_live_gwas(
+        client=opengwas.OpenGWASClient(token=None),
+        cache_dir=cache_dir,
+    )
+    i = gwas.exposure_index("physical_activity")
+    j = gwas.outcome_index("T2D")
+    live_i = live.exposures.index("physical_activity")
+    live_j = live.outcomes.index("T2D")
+
+    assert np.isfinite(gwas.betas[i, j])
+    assert gwas.betas[i, j] == pytest.approx(live.betas[live_i, live_j])
 
 
 # ---------------------------------------------------------------------------

@@ -94,11 +94,9 @@ RNG stream spawned from the user-supplied generator.  Diagnostics:
     directed-edge indicators (``rhat_per_edge``, ``max_rhat_directed``)
     and the undirected skeleton ``adj | adj.T``
     (``rhat_per_skeleton_edge``, ``max_rhat_skeleton``).  The primary
-    ``max_rhat`` statistic is the skeleton R-hat: DAGs that are Markov-
-    equivalent (share a CPDAG) differ on directed-edge indicators but
-    agree on the skeleton, so the skeleton R-hat is the appropriate
-    convergence diagnostic for observational DAG inference, which can
-    only identify the equivalence class.
+    ``max_rhat`` statistic is the directed-edge R-hat because this pipeline
+    reports directed causal edge and path probabilities and uses directed
+    MR priors.  Skeleton R-hat is still reported as a secondary diagnostic.
   * effective sample size per edge via Geyer's initial-positive-
     sequence estimator (min ESS across edges is reported).
 
@@ -1776,15 +1774,11 @@ def run_structure_mcmc(
 
     # R-hat and ESS diagnostics.
     # We compute R-hat both on the directed-edge indicators and on the
-    # undirected skeleton (adj | adj.T).  The skeleton R-hat is the
-    # primary convergence diagnostic reported as ``max_rhat``, because it
-    # is invariant under Markov equivalence: two DAGs with the same
-    # CPDAG differ on directed-edge indicators (which inflates the
-    # directed R-hat) but agree on the skeleton.  When the skeleton has
-    # converged but the directed edges have not, the chain has found
-    # the right Markov class even if it has not resolved all edge
-    # orientations, which is a well-known fundamental non-identifiability
-    # of DAG inference from observational data.
+    # undirected skeleton (adj | adj.T).  Directed R-hat is the primary
+    # ``max_rhat`` diagnostic because downstream summaries are directed
+    # causal edge/path probabilities and the prior carries directed MR
+    # evidence.  Skeleton R-hat remains useful for separating orientation
+    # mixing problems from skeleton mixing problems.
     if n_chains > 1 and all(a.shape[0] > 1 for a in all_chain_samples):
         rhat_mat = _rhat_edgewise(all_chain_samples)
         skel_chains = [
@@ -1818,7 +1812,7 @@ def run_structure_mcmc(
             else float("nan")
         )
         n_infinite_rhat_dir = int(np.sum(np.isposinf(rhat_dir_scored)))
-        max_rhat = max_rhat_skel
+        max_rhat = max_rhat_dir
     else:
         rhat_mat = np.ones((p, p), dtype=float)
         rhat_skel = np.ones((p, p), dtype=float)

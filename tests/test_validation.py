@@ -122,7 +122,7 @@ def test_nagelkerke_r2_perfect():
 # 5: Brier decomposition sums.
 # ---------------------------------------------------------------------------
 
-def test_brier_decomposition_sums():
+def test_brier_decomposition_uses_binned_reliability():
     rng = np.random.default_rng(1)
     n = 2000
     # Somewhat miscalibrated predictions so that reliability > 0.
@@ -130,12 +130,15 @@ def test_brier_decomposition_sums():
     y = rng.binomial(1, p_true).astype(float)
     p_pred = np.clip(p_true + rng.normal(0, 0.05, size=n), 0.01, 0.99)
     out = calibration_metrics(y, p_pred, n_bins=10, strategy="quantile")
-    lhs = (
-        out["brier_decomposition"]["reliability"]
-        - out["brier_decomposition"]["resolution"]
-        + out["brier_decomposition"]["uncertainty"]
+    bins = out["reliability"]
+    expected = (
+        np.sum(
+            bins["bin_counts"]
+            * (bins["mean_predicted"] - bins["mean_observed"]) ** 2
+        )
+        / n
     )
-    assert abs(lhs - out["brier"]) < 1e-10
+    assert out["brier_decomposition"]["reliability"] == pytest.approx(expected)
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +243,18 @@ def test_brier_ipcw_sanity():
                np.where(ctrl, (1.0 - S_km[:, j]) ** 2, 0.0)
         unweighted[j] = float(np.mean(term))
     np.testing.assert_allclose(out["brier"], unweighted, atol=1e-10)
+
+
+def test_integrated_brier_uses_eval_grid_interval():
+    time = np.array([1.0, 3.0, 5.0])
+    event = np.array([1, 1, 1])
+    eval_times = np.array([1.0, 3.0])
+    survival_pred = np.full((3, 2), 0.5)
+
+    out = brier_score(time, event, survival_pred, eval_times)
+
+    np.testing.assert_allclose(out["brier"], np.array([0.25, 0.25]))
+    assert out["ibs"] == pytest.approx(0.25)
 
 
 # ---------------------------------------------------------------------------

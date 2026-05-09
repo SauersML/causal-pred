@@ -3,7 +3,7 @@ name = "causal-pred"
 version = "0.1.0"
 description = "Causal disease modelling with uncertainty (MrDAG + DAGSLAM + MCMC + survival GAM)"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 license = { text = "Apache-2.0" }
 authors = [{ name = "causal-pred authors" }]
 
@@ -25,9 +25,6 @@ dependencies = [
 
 [dependency-groups]
 dev = ["pytest>=8", "pytest-xdist>=3", "ruff>=0.6"]
-
-[tool.uv.sources]
-gamfit = { path = "/tmp/gamfit-wheels/gamfit-0.1.19-cp310-abi3-macosx_11_0_arm64.whl" }
 
 [build-system]
 requires = ["hatchling"]
