@@ -40,3 +40,18 @@ packages = ["src/causal_pred"]
 addopts = "-q"
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+# AoU notebook VMs ship NVIDIA driver 535.x which only supports CUDA <=12.2.
+# The default PyPI torch wheel is built against newer CUDA and refuses to
+# initialize ("driver too old"), forcing crosscoder training to fall back
+# off the GPU. Pin the cu121 wheel on Linux so torch.cuda.is_available()
+# is True on Tesla T4 boxes. macOS dev still uses the PyPI wheel (MPS).
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu121", marker = "sys_platform == 'linux'" },
+]

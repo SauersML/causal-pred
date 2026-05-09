@@ -99,13 +99,10 @@ def _locate_gnomon() -> str:
     path = shutil.which("gnomon")
     if path:
         return path
-    fallback = "/Users/user/.local/bin/gnomon"
-    if os.path.isfile(fallback) and os.access(fallback, os.X_OK):
-        return fallback
     raise PolygenicToolMissing(
-        "Could not find the `gnomon` CLI on $PATH. Install it from "
-        "https://github.com/SauersML/gnomon or set PATH to include the "
-        "binary before calling causal_pred.data.polygenic.*"
+        "Could not find the `gnomon` CLI on $PATH. Install it via "
+        "`curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash` "
+        "(scripts/bootstrap_aou.sh runs this automatically on AoU)."
     )
 
 

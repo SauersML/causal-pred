@@ -96,10 +96,8 @@ log "uv sync --locked --dev"
 uv sync --locked --dev
 
 # 5. gnomon ------------------------------------------------------------------
-if ! command -v gnomon >/dev/null 2>&1; then
-    log "installing gnomon via install.sh"
-    curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
-fi
+log "installing gnomon via install.sh"
+curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
 export PATH="$HOME/.local/bin:$PATH"
 
 # 6. pipeline ----------------------------------------------------------------

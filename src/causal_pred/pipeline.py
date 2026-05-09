@@ -518,21 +518,16 @@ def _dataframe_values_hash(df: pd.DataFrame) -> str:
     return _array_hash(values)
 
 
-_SHA256_PROGRESS_BYTES = 512 * 1024 * 1024  # log every 512 MiB
-_SHA256_PROGRESS_FLOOR_BYTES = 256 * 1024 * 1024  # only log progress for files >256 MiB
-_HUGE_FILE_THRESHOLD_BYTES = 2 * (1 << 30)  # 2 GiB: switch to sampled fingerprint
-_SAMPLE_CHUNK_BYTES = 4 * (1 << 20)  # 4 MiB head + 4 MiB tail
-_SAMPLE_INTERIOR_CHUNKS = 6  # plus a handful of interior probes
-_SAMPLED_DIGEST_TAG = "sampled-v1"
+_SAMPLE_CHUNK_BYTES = 4 * (1 << 20)  # 4 MiB per probe
+_SAMPLE_INTERIOR_CHUNKS = 6  # head + 6 interior probes + tail
+_DIGEST_TAG = "content-v1"
 
 
 def _sha256_sidecar_path(path: Path) -> Path:
     return path.with_suffix(path.suffix + ".sha256")
 
 
-def _read_sha256_sidecar(
-    path: Path, size: int, mtime_ns: int, *, kind: str
-) -> Optional[str]:
+def _read_sha256_sidecar(path: Path, size: int, mtime_ns: int) -> Optional[str]:
     sidecar = _sha256_sidecar_path(path)
     try:
         text = sidecar.read_text()
@@ -548,7 +543,7 @@ def _read_sha256_sidecar(
         return None
     if int(record.get("mtime_ns", -1)) != int(mtime_ns):
         return None
-    if str(record.get("kind", "full")) != kind:
+    if str(record.get("tag", "")) != _DIGEST_TAG:
         return None
     digest = record.get("sha256")
     if not isinstance(digest, str) or len(digest) != 64:
@@ -557,14 +552,14 @@ def _read_sha256_sidecar(
 
 
 def _write_sha256_sidecar(
-    path: Path, size: int, mtime_ns: int, digest: str, *, kind: str
+    path: Path, size: int, mtime_ns: int, digest: str
 ) -> None:
     sidecar = _sha256_sidecar_path(path)
     payload = json.dumps(
         {
             "size": int(size),
             "mtime_ns": int(mtime_ns),
-            "kind": kind,
+            "tag": _DIGEST_TAG,
             "sha256": digest,
         }
     )
@@ -576,110 +571,6 @@ def _write_sha256_sidecar(
         pass
 
 
-def _sampled_file_digest(
-    path: Path,
-    size: int,
-    mtime_ns: int,
-    *,
-    logger: Optional[logging.Logger] = None,
-    label: Optional[str] = None,
-) -> str:
-    h = hashlib.sha256()
-    h.update(_SAMPLED_DIGEST_TAG.encode("utf-8"))
-    h.update(str(size).encode("utf-8"))
-    h.update(b"|")
-    h.update(str(mtime_ns).encode("utf-8"))
-    h.update(b"|")
-    chunk = _SAMPLE_CHUNK_BYTES
-    if logger is not None:
-        logger.info(
-            "[prs]   sampled-digest %s start size=%.1f MiB "
-            "(head/tail %.1f MiB, %d interior probes)",
-            label or path.name,
-            size / (1 << 20),
-            chunk / (1 << 20),
-            _SAMPLE_INTERIOR_CHUNKS,
-        )
-    started = time.time()
-    offsets: list[int] = [0]
-    if size > 2 * chunk:
-        for i in range(1, _SAMPLE_INTERIOR_CHUNKS + 1):
-            off = (size * i) // (_SAMPLE_INTERIOR_CHUNKS + 1)
-            off = max(chunk, min(size - chunk, off))
-            offsets.append(off)
-        offsets.append(max(0, size - chunk))
-    else:
-        offsets = [0]
-    seen: set[int] = set()
-    with path.open("rb") as fh:
-        for off in offsets:
-            if off in seen:
-                continue
-            seen.add(off)
-            fh.seek(off)
-            data = fh.read(min(chunk, max(0, size - off)))
-            h.update(off.to_bytes(8, "big"))
-            h.update(len(data).to_bytes(8, "big"))
-            h.update(data)
-    if logger is not None:
-        logger.info(
-            "[prs]   sampled-digest %s done in %s",
-            label or path.name,
-            _format_seconds(time.time() - started),
-        )
-    return h.hexdigest()
-
-
-def _full_file_sha256(
-    path: Path,
-    size: int,
-    *,
-    logger: Optional[logging.Logger] = None,
-    label: Optional[str] = None,
-) -> str:
-    h = hashlib.sha256()
-    log_progress = (
-        logger is not None and size >= _SHA256_PROGRESS_FLOOR_BYTES
-    )
-    if log_progress:
-        assert logger is not None
-        logger.info(
-            "[prs]   sha256 %s start size=%.1f MiB",
-            label or path.name,
-            size / (1 << 20),
-        )
-    started = time.time()
-    read_so_far = 0
-    next_progress = _SHA256_PROGRESS_BYTES
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            h.update(chunk)
-            read_so_far += len(chunk)
-            if log_progress and read_so_far >= next_progress:
-                assert logger is not None
-                elapsed = max(time.time() - started, 1e-6)
-                pct = 100.0 * read_so_far / size if size else 100.0
-                logger.info(
-                    "[prs]   sha256 %s progress %.1f%% (%.1f / %.1f MiB) "
-                    "rate=%.1f MiB/s elapsed=%s",
-                    label or path.name,
-                    pct,
-                    read_so_far / (1 << 20),
-                    size / (1 << 20),
-                    (read_so_far / (1 << 20)) / elapsed,
-                    _format_seconds(elapsed),
-                )
-                next_progress += _SHA256_PROGRESS_BYTES
-    if log_progress:
-        assert logger is not None
-        logger.info(
-            "[prs]   sha256 %s done in %s",
-            label or path.name,
-            _format_seconds(time.time() - started),
-        )
-    return h.hexdigest()
-
-
 def _file_sha256(
     path: Path,
     *,
@@ -687,26 +578,59 @@ def _file_sha256(
     label: Optional[str] = None,
 ) -> str:
     st = path.stat()
-    size = st.st_size
+    size = int(st.st_size)
     mtime_ns = int(st.st_mtime_ns)
-    kind = "sampled" if size >= _HUGE_FILE_THRESHOLD_BYTES else "full"
-    cached = _read_sha256_sidecar(path, size, mtime_ns, kind=kind)
+    cached = _read_sha256_sidecar(path, size, mtime_ns)
     if cached is not None:
-        if logger is not None and size >= _SHA256_PROGRESS_FLOOR_BYTES:
+        if logger is not None:
             logger.info(
-                "[prs]   %s %s reused cached digest from sidecar (%.1f MiB)",
-                "sampled-digest" if kind == "sampled" else "sha256",
+                "[prs]   digest %s reused from sidecar (%.1f MiB)",
                 label or path.name,
                 size / (1 << 20),
             )
         return cached
-    if kind == "sampled":
-        digest = _sampled_file_digest(
-            path, size, mtime_ns, logger=logger, label=label
+    chunk = _SAMPLE_CHUNK_BYTES
+    n_interior = _SAMPLE_INTERIOR_CHUNKS
+    if logger is not None:
+        logger.info(
+            "[prs]   digest %s start size=%.1f MiB "
+            "(probe=%.1f MiB, %d interior + head + tail)",
+            label or path.name,
+            size / (1 << 20),
+            chunk / (1 << 20),
+            n_interior,
         )
-    else:
-        digest = _full_file_sha256(path, size, logger=logger, label=label)
-    _write_sha256_sidecar(path, size, mtime_ns, digest, kind=kind)
+    started = time.time()
+    h = hashlib.sha256()
+    h.update(_DIGEST_TAG.encode("utf-8"))
+    h.update(str(size).encode("utf-8"))
+    h.update(b"|")
+    raw_offsets = [0]
+    for i in range(1, n_interior + 1):
+        raw_offsets.append((size * i) // (n_interior + 1))
+    raw_offsets.append(max(0, size - chunk))
+    seen: set[tuple[int, int]] = set()
+    with path.open("rb") as fh:
+        for raw in raw_offsets:
+            off = max(0, min(raw, max(0, size - chunk)))
+            length = max(0, min(chunk, size - off))
+            key = (off, length)
+            if key in seen:
+                continue
+            seen.add(key)
+            fh.seek(off)
+            data = fh.read(length)
+            h.update(off.to_bytes(8, "big"))
+            h.update(len(data).to_bytes(8, "big"))
+            h.update(data)
+    digest = h.hexdigest()
+    if logger is not None:
+        logger.info(
+            "[prs]   digest %s done in %s",
+            label or path.name,
+            _format_seconds(time.time() - started),
+        )
+    _write_sha256_sidecar(path, size, mtime_ns, digest)
     return digest
 
 
@@ -720,7 +644,6 @@ def _file_stat_fingerprint(
     return {
         "name": path.name,
         "size": int(st.st_size),
-        "mtime_ns": int(st.st_mtime_ns),
         "sha256": _file_sha256(path, logger=logger, label=label),
     }
 
@@ -777,27 +700,7 @@ def _gnomon_score_cache_filename(
             _format_seconds(time.time() - t_scorer),
             len(score_files),
         )
-    t_scores = time.time()
-    sorted_files = sorted(score_files, key=lambda x: x.name)
-    score_fp = []
-    total = len(sorted_files)
-    log_every = max(1, total // 10) if logger is not None else total + 1
-    for idx, p in enumerate(sorted_files, start=1):
-        score_fp.append(
-            {
-                "name": p.name,
-                "size": int(p.stat().st_size),
-                "mtime_ns": int(p.stat().st_mtime_ns),
-                "sha256": _file_sha256(p, logger=logger, label=p.name),
-            }
-        )
-        if logger is not None and (idx % log_every == 0 or idx == total):
-            logger.info(
-                "[prs]  fingerprinted %d/%d score files (elapsed=%s)",
-                idx,
-                total,
-                _format_seconds(time.time() - t_scores),
-            )
+    score_fp = _score_files_fingerprint(score_files, logger=logger)
     if logger is not None:
         logger.info(
             "[prs] hashing gnomon score cache key",
@@ -824,13 +727,10 @@ def _gnomon_scorer_fingerprint(
     *, logger: Optional[logging.Logger] = None
 ) -> dict[str, Any]:
     binary = shutil.which("gnomon")
-    fallback = Path("/Users/user/.local/bin/gnomon")
-    if binary is None and fallback.is_file() and os.access(fallback, os.X_OK):
-        binary = str(fallback)
     if binary is None:
-        if logger is not None:
-            logger.info("[prs]  gnomon binary not found; fingerprint=unavailable")
-        return {"available": False, "path": None}
+        raise RuntimeError(
+            "gnomon binary not found on PATH; install gnomon before running the pipeline"
+        )
     path = Path(binary).resolve()
     if logger is not None:
         logger.info(
@@ -839,29 +739,10 @@ def _gnomon_scorer_fingerprint(
             path.stat().st_size / (1 << 20),
         )
     st = path.stat()
-    version = None
-    try:
-        proc = subprocess.run(
-            [str(path), "--version"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        version = (proc.stdout or proc.stderr).strip() or None
-    except Exception:
-        version = None
     sha = _file_sha256(path, logger=logger, label=f"gnomon:{path.name}")
     if logger is not None:
-        logger.info("[prs]  gnomon version=%s sha256=%s", version, sha[:12])
-    return {
-        "available": True,
-        "path": str(path),
-        "size": int(st.st_size),
-        "mtime_ns": int(st.st_mtime_ns),
-        "sha256": sha,
-        "version": version,
-    }
+        logger.info("[prs]  gnomon sha256=%s", sha[:12])
+    return {"size": int(st.st_size), "sha256": sha}
 
 
 def _score_files_fingerprint(
