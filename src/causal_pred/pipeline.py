@@ -674,12 +674,12 @@ def _plink_stat_fingerprint(
     return {"prefix": prefix.name, "files": files}
 
 
-def _gnomon_score_cache_filename(
+def _gnomon_score_fingerprint(
     bed: Path,
     score_files: Sequence[Path],
     *,
     logger: Optional[logging.Logger] = None,
-) -> str:
+) -> dict[str, Any]:
     if logger is not None:
         logger.info(
             "[prs] fingerprinting genotype PLINK fileset prefix=%s",
@@ -701,26 +701,22 @@ def _gnomon_score_cache_filename(
             len(score_files),
         )
     score_fp = _score_files_fingerprint(score_files, logger=logger)
-    if logger is not None:
-        logger.info(
-            "[prs] hashing gnomon score cache key",
-        )
-    t_hash = time.time()
-    digest = _short_hash(
-        {
-            "version": PIPELINE_CONFIG_VERSION,
-            "genotype": genotype_fp,
-            "scorer": scorer_fp,
-            "score_files": score_fp,
-        }
-    )
-    if logger is not None:
-        logger.info(
-            "[prs] gnomon score cache-key hash computed in %s -> digest=%s",
-            _format_seconds(time.time() - t_hash),
-            digest,
-        )
-    return "gnomon-scores-" + digest + ".sscore"
+    return {
+        "version": PIPELINE_CONFIG_VERSION,
+        "genotype": genotype_fp,
+        "scorer": scorer_fp,
+        "score_files": score_fp,
+    }
+
+
+def _gnomon_score_cache_filename(
+    bed: Path,
+    score_files: Sequence[Path],
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> str:
+    fp = _gnomon_score_fingerprint(bed, score_files, logger=logger)
+    return "gnomon-scores-" + _short_hash(fp) + ".sscore"
 
 
 def _gnomon_scorer_fingerprint(
@@ -802,23 +798,41 @@ def _prs_panel_cache_filename(
             _format_seconds(time.time() - t_scorer),
         )
         logger.info("[prs] hashing %d person IDs into cache key", len(person_ids))
-    t_hash = time.time()
-    digest = _short_hash(
-        {
-            "version": PIPELINE_CONFIG_VERSION,
-            "genotype": genotype_fp,
-            "score_files": score_fp,
-            "scorer": scorer_fp,
-            "person_ids": [str(p) for p in person_ids],
-        }
-    )
-    if logger is not None:
-        logger.info(
-            "[prs] cache-key hash computed in %s -> digest=%s",
-            _format_seconds(time.time() - t_hash),
-            digest,
+    return "aou-prs-panel-" + _short_hash(
+        _prs_panel_fingerprint_from_parts(
+            genotype_fp, score_fp, scorer_fp, person_ids
         )
-    return "aou-prs-panel-" + digest + ".csv.gz"
+    ) + ".csv.gz"
+
+
+def _prs_panel_fingerprint_from_parts(
+    genotype_fp: dict[str, Any],
+    score_fp: list[dict[str, Any]],
+    scorer_fp: dict[str, Any],
+    person_ids: Sequence[str],
+) -> dict[str, Any]:
+    return {
+        "version": PIPELINE_CONFIG_VERSION,
+        "genotype": genotype_fp,
+        "score_files": score_fp,
+        "scorer": scorer_fp,
+        "person_ids": [str(p) for p in person_ids],
+    }
+
+
+def _prs_panel_fingerprint(
+    bed: Path,
+    score_files: Sequence[Path],
+    person_ids: Sequence[str],
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> dict[str, Any]:
+    return _prs_panel_fingerprint_from_parts(
+        _plink_stat_fingerprint(bed, logger=logger),
+        _score_files_fingerprint(score_files, logger=logger),
+        _gnomon_scorer_fingerprint(logger=logger),
+        person_ids,
+    )
 
 
 def _pipeline_config() -> dict[str, Any]:
@@ -1065,17 +1079,22 @@ def _cohort_scores_from_gnomon_scores(
     return cohort_scores, n_overlap
 
 
-def _list_workspace_cache_files(
-    cache: WorkspaceCache, dirname: str, pattern: str
+def _list_cache_basenames(
+    *,
+    cache: WorkspaceCache,
+    local_dir: Path,
+    remote_dir: str,
+    pattern: str,
 ) -> list[str]:
+    """Return basenames of cache files matching ``pattern`` in ``local_dir``
+    (on disk) and ``remote_dir`` (in the bucket if configured), merged."""
     seen: set[str] = set()
-    local_dir = cache.local_dir / dirname
     if local_dir.is_dir():
         for p in local_dir.glob(pattern):
             if p.is_file() and p.stat().st_size > 0:
-                seen.add(f"{dirname}/{p.name}")
+                seen.add(p.name)
     if cache.bucket is not None:
-        uri = f"{cache.bucket}/{WORKSPACE_CACHE_PREFIX}/{dirname}/{pattern}"
+        uri = f"{cache.bucket}/{WORKSPACE_CACHE_PREFIX}/{remote_dir}/{pattern}"
         try:
             out = subprocess.run(
                 ["gsutil", "ls", uri],
@@ -1089,13 +1108,47 @@ def _list_workspace_cache_files(
         if out is not None and out.returncode == 0:
             for line in out.stdout.splitlines():
                 line = line.strip()
-                if not line:
-                    continue
-                seen.add(f"{dirname}/{line.rsplit('/', 1)[-1]}")
+                if line:
+                    seen.add(line.rsplit("/", 1)[-1])
     return sorted(seen)
 
 
-def _try_parse_sscore_for_cohort(
+_SIDECAR_SUFFIX = ".key.json"
+
+
+def _canonical_json(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+def _read_workspace_sidecar(
+    cache: WorkspaceCache, local_path: Path, remote_name: str
+) -> Optional[dict[str, Any]]:
+    sidecar_remote = remote_name + _SIDECAR_SUFFIX
+    sidecar_local = local_path.with_name(local_path.name + _SIDECAR_SUFFIX)
+    fetched = cache.fetch(sidecar_remote, sidecar_local)
+    if not fetched.is_file() or fetched.stat().st_size == 0:
+        return None
+    try:
+        record = json.loads(fetched.read_text())
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _write_workspace_sidecar(
+    cache: WorkspaceCache,
+    local_path: Path,
+    remote_name: str,
+    fingerprint: dict[str, Any],
+) -> None:
+    sidecar_remote = remote_name + _SIDECAR_SUFFIX
+    sidecar_local = local_path.with_name(local_path.name + _SIDECAR_SUFFIX)
+    sidecar_local.parent.mkdir(parents=True, exist_ok=True)
+    sidecar_local.write_text(_canonical_json(fingerprint))
+    cache.store(sidecar_local, sidecar_remote)
+
+
+def _validate_cached_sscore(
     path: Path, person_ids: pd.Series, logger: logging.Logger
 ) -> Optional[pd.DataFrame]:
     try:
@@ -1105,18 +1158,12 @@ def _try_parse_sscore_for_cohort(
         return None
     min_rows = min(PRS_MIN_COMPLETE_ROWS, int(person_ids.size))
     overlap = int(person_ids.astype(str).isin(scores.index.astype(str)).sum())
-    if overlap < min_rows:
+    if overlap < min_rows or scores.shape[1] < PRS_NODES:
         logger.info(
-            "[prs] sscore %s rejected: cohort overlap %d < required %d",
+            "[prs] sscore %s rejected (overlap=%d/%d cols=%d/min=%d)",
             path,
             overlap,
             min_rows,
-        )
-        return None
-    if scores.shape[1] < PRS_NODES:
-        logger.info(
-            "[prs] sscore %s rejected: %d cols < required %d",
-            path,
             scores.shape[1],
             PRS_NODES,
         )
@@ -1124,123 +1171,118 @@ def _try_parse_sscore_for_cohort(
     return scores
 
 
-def _adopt_orphan_prs_panel(
-    cache: WorkspaceCache,
-    local_path: Path,
-    remote_name: str,
+def _restore_prs_panel(
+    cache: Optional[WorkspaceCache],
+    local_dir: Path,
+    fingerprint: dict[str, Any],
     person_ids: Sequence[str],
     logger: logging.Logger,
-) -> Optional[pd.DataFrame]:
-    dirname, target_basename = remote_name.rsplit("/", 1)
-    candidates = [
-        c
-        for c in _list_workspace_cache_files(cache, dirname, "aou-prs-panel-*.csv.gz")
-        if c.rsplit("/", 1)[-1] != target_basename
-    ]
+) -> Optional[tuple[pd.DataFrame, Path]]:
+    if cache is None:
+        return None
+    target = _canonical_json(fingerprint)
+    candidates = _list_cache_basenames(
+        cache=cache,
+        local_dir=local_dir,
+        remote_dir=PRS_PANEL_CACHE_DIRNAME,
+        pattern="aou-prs-panel-*.csv.gz",
+    )
     if not candidates:
         return None
     logger.info(
-        "[prs] direct PRS panel cache miss for %s; scanning %d orphan candidate(s)",
-        target_basename,
-        len(candidates),
+        "[prs] scanning %d cached PRS panel candidate(s)", len(candidates)
     )
-    for orphan_remote in candidates:
-        orphan_local = cache.path(orphan_remote)
-        fetched = cache.fetch(orphan_remote, orphan_local, overwrite=True)
-        if not _prs_cache_usable(fetched, person_ids, logger=logger):
-            continue
-        logger.warning(
-            "[prs] adopting orphan PRS panel %s -> %s; re-keying to current digest",
-            orphan_remote,
-            remote_name,
-        )
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        if fetched.resolve() != local_path.resolve():
-            shutil.copy2(fetched, local_path)
-        cache.store(local_path, remote_name)
-        return _read_prs_panel(local_path, logger=logger)
-    return None
-
-
-def _adopt_orphan_gnomon_sscore(
-    cache: WorkspaceCache,
-    local_sscore: Path,
-    remote_name: str,
-    person_ids: pd.Series,
-    logger: logging.Logger,
-) -> Optional[pd.DataFrame]:
-    dirname, target_basename = remote_name.rsplit("/", 1)
-    candidates = [
-        c
-        for c in _list_workspace_cache_files(cache, dirname, "gnomon-scores-*.sscore")
-        if c.rsplit("/", 1)[-1] != target_basename
-    ]
-    if not candidates:
-        return None
-    logger.info(
-        "[prs] direct cache miss for %s; scanning %d orphan sscore candidate(s)",
-        target_basename,
-        len(candidates),
-    )
-    for orphan_remote in candidates:
-        orphan_local = cache.path(orphan_remote)
-        fetched = cache.fetch(orphan_remote, orphan_local)
+    for basename in candidates:
+        local = local_dir / basename
+        remote = f"{PRS_PANEL_CACHE_DIRNAME}/{basename}"
+        fetched = cache.fetch(remote, local, overwrite=True)
         if not fetched.is_file() or fetched.stat().st_size == 0:
             continue
-        logger.info(
-            "[prs] evaluating orphan %s size=%.1fMiB",
-            fetched,
-            _path_size_mib(fetched),
-        )
-        t_parse = time.time()
-        scores = _try_parse_sscore_for_cohort(fetched, person_ids, logger)
-        if scores is None:
+        sidecar = _read_workspace_sidecar(cache, fetched, remote)
+        if sidecar is not None:
+            if _canonical_json(sidecar) != target:
+                logger.info(
+                    "[prs] panel sidecar mismatch for %s; skipping", remote
+                )
+                continue
+            logger.info("[prs] panel sidecar match %s", remote)
+            return _read_prs_panel(fetched, logger=logger), fetched
+        if not _prs_cache_usable(fetched, person_ids, logger=logger):
             continue
-        logger.warning(
-            "[prs] adopting orphan gnomon sscore %s -> %s "
-            "(rows=%d cols=%d parse=%s); re-keying to current digest",
-            orphan_remote,
-            remote_name,
-            scores.shape[0],
-            scores.shape[1],
-            _format_seconds(time.time() - t_parse),
+        logger.info(
+            "[prs] adopted legacy panel %s; writing sidecar", remote
         )
-        local_sscore.parent.mkdir(parents=True, exist_ok=True)
-        if fetched.resolve() != local_sscore.resolve():
-            shutil.copy2(fetched, local_sscore)
-        cache.store(local_sscore, remote_name)
-        return scores
+        _write_workspace_sidecar(cache, fetched, remote, fingerprint)
+        return _read_prs_panel(fetched, logger=logger), fetched
     return None
 
 
 def _restore_gnomon_scores(
     cache: Optional[WorkspaceCache],
-    local_sscore: Path,
-    remote_name: str,
+    local_dir: Path,
+    fingerprint: dict[str, Any],
     person_ids: pd.Series,
     logger: logging.Logger,
 ) -> Optional[pd.DataFrame]:
+    """Single-path lookup. Scan local + bucket candidates, prefer sidecar
+    match (O(1)), fall back to parse-validation for legacy entries and
+    write a sidecar on first reuse so subsequent runs are O(1)."""
     if cache is None:
         return None
-    restored = cache.fetch(remote_name, local_sscore)
-    if restored.is_file() and restored.stat().st_size > 0:
-        logger.info(
-            "[prs] parsing cached gnomon scores %s size=%.1fMiB",
-            restored,
-            _path_size_mib(restored),
-        )
+    target = _canonical_json(fingerprint)
+    candidates = _list_cache_basenames(
+        cache=cache,
+        local_dir=local_dir,
+        remote_dir=GNOMON_OUT_DIRNAME,
+        pattern="gnomon-scores-*.sscore",
+    )
+    if not candidates:
+        return None
+    logger.info(
+        "[prs] scanning %d cached gnomon score candidate(s)", len(candidates)
+    )
+    for basename in candidates:
+        local = local_dir / basename
+        remote = f"{GNOMON_OUT_DIRNAME}/{basename}"
+        fetched = cache.fetch(remote, local)
+        if not fetched.is_file() or fetched.stat().st_size == 0:
+            continue
+        sidecar = _read_workspace_sidecar(cache, fetched, remote)
+        if sidecar is not None:
+            if _canonical_json(sidecar) != target:
+                logger.info("[prs] sidecar mismatch for %s; skipping", remote)
+                continue
+            logger.info(
+                "[prs] sidecar match %s size=%.1fMiB",
+                remote,
+                _path_size_mib(fetched),
+            )
+            t_parse = time.time()
+            scores = parse_sscore(
+                fetched, keep_iids=person_ids.astype(str).tolist()
+            )
+            logger.info(
+                "[prs] parsed cached gnomon scores rows=%d cols=%d elapsed=%s",
+                scores.shape[0],
+                scores.shape[1],
+                _format_seconds(time.time() - t_parse),
+            )
+            return scores
+        logger.info("[prs] no sidecar for %s; validating by parse", remote)
         t_parse = time.time()
-        scores = parse_sscore(restored, keep_iids=person_ids.astype(str).tolist())
+        scores = _validate_cached_sscore(fetched, person_ids, logger)
+        if scores is None:
+            continue
         logger.info(
-            "[prs] parsed cached gnomon scores rows=%d cols=%d elapsed=%s",
+            "[prs] adopted legacy %s rows=%d cols=%d parse=%s; writing sidecar",
+            remote,
             scores.shape[0],
             scores.shape[1],
             _format_seconds(time.time() - t_parse),
         )
+        _write_workspace_sidecar(cache, fetched, remote, fingerprint)
         return scores
-    return _adopt_orphan_gnomon_sscore(
-        cache, local_sscore, remote_name, person_ids, logger
-    )
+    return None
 
 
 def _latest_sscore(out_dir: Path, started_at: float) -> Optional[Path]:
@@ -1291,35 +1333,23 @@ def _build_prs_panel(
             "[prs] using %d caller-provided PGS score files", len(score_files)
         )
     logger.info(
-        "[prs] computing gnomon score cache filename for bed=%s with %d score files",
+        "[prs] computing gnomon score fingerprint for bed=%s with %d score files",
         bed,
         len(score_files),
     )
-    t_sscore_name = time.time()
-    sscore_name = _gnomon_score_cache_filename(bed, score_files, logger=logger)
-    logger.info(
-        "[prs] gnomon score cache filename ready in %s -> %s",
-        _format_seconds(time.time() - t_sscore_name),
-        sscore_name,
-    )
+    t_fp = time.time()
+    fingerprint = _gnomon_score_fingerprint(bed, score_files, logger=logger)
+    sscore_name = "gnomon-scores-" + _short_hash(fingerprint) + ".sscore"
     local_sscore = out_dir / sscore_name
     remote_sscore = f"{GNOMON_OUT_DIRNAME}/{sscore_name}"
     logger.info(
-        "[prs] sscore cache target: local=%s remote=%s (exists_local=%s)",
-        local_sscore,
+        "[prs] fingerprint ready in %s -> %s (target=%s)",
+        _format_seconds(time.time() - t_fp),
+        _short_hash(fingerprint),
         remote_sscore,
-        local_sscore.is_file(),
-    )
-    logger.info(
-        "[prs] checking for cached gnomon scores (cache=%s)",
-        "workspace" if cache is not None else "local-only",
     )
     scores = _restore_gnomon_scores(
-        cache,
-        local_sscore,
-        remote_sscore,
-        person_ids,
-        logger,
+        cache, out_dir, fingerprint, person_ids, logger
     )
     if scores is None:
         logger.info(
@@ -1350,6 +1380,9 @@ def _build_prs_panel(
                 shutil.copy2(raw_sscore, local_sscore)
             if cache is not None:
                 cache.store(local_sscore, remote_sscore)
+                _write_workspace_sidecar(
+                    cache, local_sscore, remote_sscore, fingerprint
+                )
 
     cohort_scores, n_overlap = _cohort_scores_from_gnomon_scores(
         scores, person_ids, logger
@@ -1408,53 +1441,34 @@ def _load_or_build_prs_panel(
         panel_dir,
     )
     logger.info(
-        "[prs] computing PRS panel cache filename (bed=%s, score_files=%d, n_person=%d)",
+        "[prs] computing PRS panel fingerprint (bed=%s, score_files=%d, n_person=%d)",
         bed,
         len(score_files),
         len(person_ids),
     )
-    t_filename = time.time()
-    filename = _prs_panel_cache_filename(
+    t_fp = time.time()
+    fingerprint = _prs_panel_fingerprint(
         bed, score_files, person_ids, logger=logger
     )
+    filename = "aou-prs-panel-" + _short_hash(fingerprint) + ".csv.gz"
     path = Path(DEFAULT_CACHE_DIR) / PRS_PANEL_CACHE_DIRNAME / filename
-    logger.info(
-        "[prs] PRS panel cache target: %s (filename build elapsed=%s)",
-        path,
-        _format_seconds(time.time() - t_filename),
-    )
-    if _prs_cache_usable(path, person_ids, logger=logger):
-        logger.info("[prs] using local cache %s", path)
-        return _read_prs_panel(path, logger=logger), str(path)
-
     remote_name = f"{PRS_PANEL_CACHE_DIRNAME}/{filename}"
     logger.info(
-        "[prs] local cache unusable; attempting workspace fetch %s -> %s",
+        "[prs] PRS panel target: %s (fingerprint elapsed=%s)",
         remote_name,
-        path,
+        _format_seconds(time.time() - t_fp),
     )
-    t_fetch = time.time()
-    cache.fetch(remote_name, path, overwrite=True)
-    fetched_size = path.stat().st_size if path.is_file() else 0
-    logger.info(
-        "[prs] workspace fetch finished in %s (local size=%.1f MiB exists=%s)",
-        _format_seconds(time.time() - t_fetch),
-        fetched_size / (1 << 20),
-        path.is_file(),
+    panel_local_dir = Path(DEFAULT_CACHE_DIR) / PRS_PANEL_CACHE_DIRNAME
+    restored = _restore_prs_panel(
+        cache, panel_local_dir, fingerprint, person_ids, logger
     )
-    if _prs_cache_usable(path, person_ids, logger=logger):
-        logger.info("[prs] restored workspace cache %s", path)
-        return _read_prs_panel(path, logger=logger), str(path)
-    adopted = _adopt_orphan_prs_panel(
-        cache, path, remote_name, person_ids, logger
-    )
-    if adopted is not None:
-        return adopted, str(path)
+    if restored is not None:
+        panel, panel_path = restored
+        return panel, str(panel_path)
     logger.info(
         "[prs] no usable cache; building PRS panel from gnomon scoring -> %s",
         path,
     )
-
     panel = _build_prs_panel(
         cohort_csv,
         path,
@@ -1470,6 +1484,7 @@ def _load_or_build_prs_panel(
     )
     t_store = time.time()
     cache.store(path, remote_name)
+    _write_workspace_sidecar(cache, path, remote_name, fingerprint)
     logger.info(
         "[prs] workspace store finished in %s",
         _format_seconds(time.time() - t_store),
