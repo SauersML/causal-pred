@@ -518,11 +518,11 @@ def survival_fan(
     quantiles: Sequence[float] = (0.05, 0.25, 0.5, 0.75, 0.95),
     ax: Optional[plt.Axes] = None,
 ) -> Figure:
-    """Posterior fan chart for one individual's survival curve.
+    """Uncertainty fan chart for one individual's survival curve.
 
     ``survival_samples`` has shape ``(n_samples, n_t)`` and holds
-    posterior draws of S(t).  We draw the median line together with
-    50% and 90% credible bands.
+    sampled or delta-method quantile slices of S(t).  We draw the median
+    line together with 50% and 90% bands.
     """
     t = np.asarray(t_grid, dtype=float).ravel()
     S = np.asarray(survival_samples, dtype=float)
@@ -569,7 +569,7 @@ def survival_fan(
             label=f"{int((hi_q - lo_q) * 100)}% band",
         )
 
-    ax.plot(t, median, color=cm.cividis(0.15), linewidth=1.8, label="posterior median")
+    ax.plot(t, median, color=cm.cividis(0.15), linewidth=1.8, label="median")
 
     ax.set_ylim(0.0, 1.02)
     ax.set_xlabel("time")

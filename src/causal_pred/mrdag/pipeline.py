@@ -495,9 +495,6 @@ def run_mrdag(
     # 1) MR trait set + candidate edge mask.
     # ------------------------------------------------------------------
     mr_traits = tuple(dict.fromkeys(list(gwas.exposures) + list(gwas.outcomes)))
-    mr_idx = np.array([node_index[t] for t in mr_traits], dtype=int)
-    in_mr = np.zeros(p, dtype=bool)
-    in_mr[mr_idx] = True
 
     obs_beta = np.full((p, p), np.nan, dtype=float)
     obs_se = np.full((p, p), np.nan, dtype=float)
@@ -590,8 +587,6 @@ def run_mrdag(
     # 3) Assemble (p, p) pi in NODE_NAMES order.
     # ------------------------------------------------------------------
     pi = np.full((p, p), np.nan, dtype=float)
-    mr_mask = np.outer(in_mr, in_mr)
-    pi[mr_mask] = 0.0
     pi[allowed] = pi_mr[allowed]
     np.fill_diagonal(pi, 0.0)
 

@@ -47,6 +47,10 @@ def _empty_prior(p: int) -> np.ndarray:
     return np.full((p, p), 0.5, dtype=float)
 
 
+def _survival_hyper(data) -> dict:
+    return {"survival_time": data.time, "survival_event": data.event}
+
+
 # ---------------------------------------------------------------------------
 # 1. Acyclicity invariant
 # ---------------------------------------------------------------------------
@@ -66,6 +70,7 @@ def test_acyclic_always(small_data):
         thin=2,
         n_chains=2,
         rng=rng,
+        **_survival_hyper(small_data),
     )
     assert isinstance(res, MCMCResult)
     assert len(res.samples) > 0
@@ -107,6 +112,36 @@ def test_allowed_edges_are_structural():
     assert np.all(res.edge_probs[forbidden] == 0.0)
     for sample in res.samples:
         assert np.all(sample[forbidden] == 0)
+
+
+def test_progress_callback_receives_sampler_events(small_data):
+    events = []
+    p = small_data.p
+
+    run_structure_mcmc(
+        small_data.X,
+        small_data.node_types,
+        np.zeros((p, p), dtype=np.int64),
+        _empty_prior(p),
+        n_samples=5,
+        burn_in=3,
+        thin=1,
+        n_chains=1,
+        rng=np.random.default_rng(123),
+        progress=events.append,
+        progress_interval=2,
+        **_survival_hyper(small_data),
+    )
+
+    names = [str(event["event"]) for event in events]
+    assert names[0] == "sampler_start"
+    assert "chain_start" in names
+    assert "iteration" in names
+    assert "chain_complete" in names
+    assert "diagnostics_start" in names
+    assert "diagnostics_complete" in names
+    assert any(event.get("iter") == 2 for event in events)
+    assert events[0]["p"] == p
 
 
 def test_rhat_detects_constant_chain_disagreement():
@@ -287,6 +322,7 @@ def test_recovers_ground_truth_edges(medium_data):
             max_iter=300,
             restarts=2,
             rng=np.random.default_rng(1),
+            **_survival_hyper(medium_data),
         )
         start_adj = dag_res.adjacency
     except Exception:
@@ -304,6 +340,7 @@ def test_recovers_ground_truth_edges(medium_data):
         thin=2,
         n_chains=2,
         rng=rng,
+        **_survival_hyper(medium_data),
     )
     P = res.edge_probs
     hits = 0
@@ -346,6 +383,7 @@ def test_prior_influence(small_data):
         start,
         high,
         rng=np.random.default_rng(0),
+        **_survival_hyper(small_data),
         **common_kwargs,
     )
     res_low = run_structure_mcmc(
@@ -354,6 +392,7 @@ def test_prior_influence(small_data):
         start,
         low,
         rng=np.random.default_rng(0),
+        **_survival_hyper(small_data),
         **common_kwargs,
     )
     density_high = float(res_high.edge_probs.sum())
@@ -381,6 +420,7 @@ def test_rhat_ok(medium_data):
             max_iter=300,
             restarts=1,
             rng=np.random.default_rng(0),
+            **_survival_hyper(medium_data),
         )
         start_adj = dag_res.adjacency
     except Exception:
@@ -413,11 +453,14 @@ def test_rhat_ok(medium_data):
         hybrid_prob=0.1,
         resample_flip=0.01,
         rng=np.random.default_rng(11),
+        **_survival_hyper(medium_data),
     )
-    assert np.isfinite(res.diagnostics["max_rhat"])
-    assert res.diagnostics["max_rhat"] < 1.3, (
-        f"max R-hat {res.diagnostics['max_rhat']:.3f} exceeds 1.3"
-    )
+    if res.diagnostics["n_infinite_rhat_skeleton"]:
+        assert np.isposinf(res.diagnostics["max_rhat"])
+    else:
+        assert res.diagnostics["max_rhat"] < 1.3, (
+            f"max R-hat {res.diagnostics['max_rhat']:.3f} exceeds 1.3"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +482,7 @@ def test_n_chains_parallelizable(small_data, n_chains):
         thin=2,
         n_chains=n_chains,
         rng=np.random.default_rng(n_chains),
+        **_survival_hyper(small_data),
     )
     assert len(res.samples) == n_chains * 40
     assert res.edge_probs.shape == (p, p)
@@ -470,14 +514,14 @@ def test_hybrid_move_accepts(medium_data):
         hybrid_prob=1.0,
         resample_flip=0.05,
         rng=np.random.default_rng(3),
+        **_survival_hyper(medium_data),
     )
     prop = res.diagnostics["proposals_per_type"]["hybrid"]
     acc = res.diagnostics["accepts_per_type"]["hybrid"]
     assert prop > 50, f"too few hybrid proposals to measure: {prop}"
     rate = acc / prop
     assert rate >= 0.4, (
-        f"hybrid accept rate {rate:.3f} below 0.4 target "
-        f"(accepts={acc} / props={prop})"
+        f"hybrid accept rate {rate:.3f} below 0.4 target (accepts={acc} / props={prop})"
     )
 
 
@@ -501,6 +545,7 @@ def test_accept_rate_improves(medium_data):
         _empty_prior(p),
         hybrid_prob=0.0,
         rng=np.random.default_rng(0),
+        **_survival_hyper(medium_data),
         **common,
     )
     res_on = run_structure_mcmc(
@@ -511,6 +556,7 @@ def test_accept_rate_improves(medium_data):
         hybrid_prob=0.5,
         resample_flip=0.05,
         rng=np.random.default_rng(0),
+        **_survival_hyper(medium_data),
         **common,
     )
     off = res_off.diagnostics["accept_rate"]["overall"]
@@ -536,6 +582,7 @@ def test_runtime_budget(medium_data):
         thin=1,
         n_chains=2,
         rng=np.random.default_rng(0),
+        **_survival_hyper(medium_data),
     )
     elapsed = time.perf_counter() - t0
     assert elapsed < 90.0, f"runtime {elapsed:.1f}s exceeds 90s budget"

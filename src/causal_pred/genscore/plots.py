@@ -392,9 +392,14 @@ def training_dynamics(
     """
     step = np.asarray(history.get("step", []), dtype=float)
     loss_main = np.asarray(history.get("loss_main", []), dtype=float)
+    loss_val = np.asarray(history.get("loss_val", []), dtype=float)
+    loss_cross = np.asarray(history.get("loss_cross", []), dtype=float)
     loss_aux = np.asarray(history.get("loss_aux", []), dtype=float)
     frac_dead = np.asarray(history.get("frac_dead", []), dtype=float)
-    frac_active = np.asarray(history.get("frac_active_batch", []), dtype=float)
+    frac_active = np.asarray(
+        history.get("avg_l0_batch", history.get("frac_active_batch", [])),
+        dtype=float,
+    )
     ever_active = np.asarray(history.get("ever_active_count", []), dtype=float)
 
     fig, axes = plt.subplots(
@@ -410,6 +415,14 @@ def training_dynamics(
     if step.size:
         ax.semilogy(step, loss_main, color=GENOME_COLOR, linewidth=1.6,
                     label="main")
+        if loss_val.size == step.size:
+            ax.semilogy(step, np.maximum(loss_val, 1e-12),
+                        color=CROSSMODAL_COLOR, linewidth=1.2,
+                        label="validation")
+        if loss_cross.size == step.size:
+            ax.semilogy(step, np.maximum(loss_cross, 1e-12),
+                        color=PROMOTED_COLOR, linewidth=1.1,
+                        linestyle="-.", label="cross")
         if np.any(loss_aux > 0):
             ax.semilogy(step, np.maximum(loss_aux, 1e-12),
                         color=EHR_COLOR, linewidth=1.2,
@@ -436,18 +449,18 @@ def training_dynamics(
         ax.fill_between(step, 0, frac_active,
                         color=CROSSMODAL_COLOR, alpha=0.12)
     if k is not None and d is not None and d > 0:
-        target = float(k) / float(d)
+        target = float(k)
         ax.axhline(target, color=AXIS_COLOR, linestyle=":",
                    linewidth=0.9, alpha=0.7)
         ax.text(
             ax.get_xlim()[1] if step.size else 1.0,
-            target, f"  k/d = {target:.3f}",
+            target, f"  BatchTopK avg k = {target:.0f}",
             ha="left", va="center", fontsize=8.5, color=AXIS_COLOR,
             transform=ax.transData,
         )
     ax.set_xlabel("training step")
-    ax.set_ylabel("active per batch")
-    ax.set_title("C. Sparsity (per-batch coverage)", loc="left",
+    ax.set_ylabel("average L0 per row")
+    ax.set_title("C. Sparsity", loc="left",
                  fontsize=10.5, fontweight="bold", color=TEXT_COLOR)
 
     # (D) Ever-active count

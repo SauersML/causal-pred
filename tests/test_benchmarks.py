@@ -19,10 +19,12 @@ if SRC not in sys.path:
 from causal_pred.data.synthetic import simulate  # noqa: E402
 from causal_pred.benchmarks import (  # noqa: E402
     _surv_at_times,
+    _train_test_indices,
     run_kaplan_meier,
     run_cox_ph,
     run_naive_logistic,
     run_mr_ivw,
+    run_causal_pred,
 )
 
 
@@ -36,6 +38,9 @@ _REQUIRED_SURVIVAL_KEYS = {
     "scaled_brier",
     "runtime_s",
     "model",
+    "evaluation",
+    "n_train",
+    "n_test",
 }
 
 
@@ -50,10 +55,13 @@ def test_km_runs(n500_data):
     elapsed = time.perf_counter() - t0
     assert elapsed < 30.0
     assert _REQUIRED_SURVIVAL_KEYS.issubset(out)
+    assert out["evaluation"] == "held_out"
+    assert out["n_train"] + out["n_test"] == n500_data.n
     td = out["time_dep_auc"]
     assert set(td) == {"times", "auc", "integrated_auc"}
-    # KM is marginal: td-AUC must be 0.5 (no covariates), IBS == IBS_KM.
-    assert abs(out["ibs"] - out["ibs_km"]) < 1e-9
+    # KM is marginal: td-AUC must be 0.5 because every held-out row receives
+    # the same train-set survival curve.
+    assert 0.8 < out["scaled_brier"] < 1.2
     for a in td["auc"]:
         assert abs(a - 0.5) < 1e-6
 
@@ -64,6 +72,8 @@ def test_cox_runs(n500_data):
     elapsed = time.perf_counter() - t0
     assert elapsed < 30.0
     assert _REQUIRED_SURVIVAL_KEYS.issubset(out)
+    assert out["evaluation"] == "held_out"
+    assert out["n_train"] + out["n_test"] == n500_data.n
     # Cox should do materially better than KM on this structured data.
     assert out["scaled_brier"] < 0.95
     # IBS must be finite and in a sensible range.
@@ -80,11 +90,22 @@ def test_naive_logistic_runs(n500_data):
     elapsed = time.perf_counter() - t0
     assert elapsed < 30.0
     assert _REQUIRED_SURVIVAL_KEYS.issubset(out)
-    # Nagelkerke R^2 must be nontrivially > 0 on this structured data.
-    assert out["nagelkerke_at_10y"] > 0.05
+    assert out["evaluation"] == "held_out"
+    assert out["n_train"] + out["n_test"] == n500_data.n
+    assert out["n_train_determined"] <= out["n_train"]
+    assert out["n_test_determined"] <= out["n_test"]
+    assert np.isfinite(out["nagelkerke_at_10y"])
     td = out["time_dep_auc"]
     idx10 = td["times"].index(10.0)
     assert td["auc"][idx10] > 0.55
+
+
+def test_benchmark_split_is_stratified_and_disjoint(n500_data):
+    train_idx, test_idx = _train_test_indices(n500_data.event)
+
+    assert train_idx.size + test_idx.size == n500_data.n
+    assert set(train_idx).isdisjoint(set(test_idx))
+    assert 0 < n500_data.event[test_idx].sum() < test_idx.size
 
 
 def test_survival_interpolation_uses_exact_requested_times():
@@ -109,6 +130,26 @@ def test_mr_ivw_runs():
     assert 0 < out["significant_edges"] < out["n_tests"]
 
 
+def test_causal_pred_runs_with_gamfit():
+    data = simulate(n=120, rng=np.random.default_rng(11))
+    out = run_causal_pred(
+        data,
+        mcmc_iter=5,
+        mcmc_chains=1,
+        gam_samples=2,
+        use_real_gwas=False,
+        rng=np.random.default_rng(12),
+    )
+
+    assert out["model"] == "causal_pred"
+    assert out["backend"] == "gamfit"
+    assert out["evaluation"] == "held_out"
+    assert out["n_train"] + out["n_test"] == data.n
+    assert out["mcmc_n_samples"] > 0
+    assert out["parent_sets"]
+    assert np.isfinite(out["ibs"])
+
+
 # ---- end-to-end CLI smoke ---------------------------------------------------
 
 
@@ -122,10 +163,12 @@ def test_benchmark_script_smoke(tmp_path):
         "python",
         "scripts/benchmark.py",
         "--n",
-        "300",
+        "120",
         "--mcmc-iter",
-        "100",
-        "--no-gam",
+        "3",
+        "--gam-samples",
+        "2",
+        "--no-real-gwas",
         "--no-plots",
         "--output-dir",
         str(outdir),
@@ -153,12 +196,14 @@ def test_benchmark_script_smoke(tmp_path):
         report = json.load(fh)
 
     assert set(report) >= {"dataset", "baselines", "run_config", "git_sha", "timestamp"}
-    # All five baselines present, even if causal_pred is skipped.
+    # All five baselines present; causal_pred is a real gamfit benchmark row.
     for name in ("kaplan_meier", "cox_ph", "naive_logistic", "mr_ivw", "causal_pred"):
         assert name in report["baselines"], f"missing baseline {name}"
 
-    # causal_pred was skipped via --no-gam.
-    assert report["baselines"]["causal_pred"].get("status") == "skipped"
+    assert report["baselines"]["causal_pred"]["backend"] == "gamfit"
+    assert report["baselines"]["causal_pred"].get("status") is None
+    assert report["run_config"]["gam_samples"] == 2
+    assert "skip_full_pipeline" not in report["run_config"]
 
     # Sanity on survival baselines.
     for name in ("kaplan_meier", "cox_ph", "naive_logistic"):

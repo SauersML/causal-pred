@@ -77,7 +77,7 @@ COHORT_NODES: Tuple[str, ...] = (
 )
 
 COHORT_NODE_TYPES: dict = {
-    "type2_diabetes": "binary",
+    "type2_diabetes": "survival",
     "age": "continuous",
     "sex": "binary",
     "ancestry_pc1": "continuous",
@@ -470,7 +470,7 @@ def load_cohort_csv(
     types = tuple(COHORT_NODE_TYPES[c] for c in present)
 
     for col, kind in zip(present, types):
-        if kind == "binary":
+        if kind in {"binary", "survival"}:
             df[col] = df[col].round().astype(int)
 
     if standardise_continuous:
@@ -584,8 +584,10 @@ def load_cohort_dataset_with_person_ids(
     types = tuple(COHORT_NODE_TYPES[c] for c in present)
 
     for col, kind in zip(present, types):
-        if kind == "binary":
+        if kind in {"binary", "survival"}:
             df[col] = df[col].round().astype(int)
+    if survival_meta["has_survival"] and "type2_diabetes" in df.columns:
+        df["type2_diabetes"] = event.astype(int)
 
     if standardise_continuous:
         for col, kind in zip(present, types):
@@ -625,7 +627,8 @@ def load_cohort_dataset(
     Static cohort tables can omit time-to-event columns; in that case
     ``time`` and ``event`` are filled with zeros here and the production
     pipeline must attach an OMOP-derived survival outcome before GAM. The
-    structure-search stages (DAGSLAM, MCMC) treat the T2D node as binary.
+    structure-search stages (DAGSLAM, MCMC) score the T2D node with
+    the aligned right-censored survival outcome.
     """
     from .synthetic import SyntheticDataset
 
@@ -654,6 +657,8 @@ def load_cohort_dataset(
         event = event[keep]
         if time.shape[0] != n:
             raise RuntimeError("internal survival row alignment mismatch")
+        if "type2_diabetes" in columns:
+            X[:, columns.index("type2_diabetes")] = event.astype(float)
     else:
         time = np.zeros(n, dtype=float)
         event = np.zeros(n, dtype=int)
@@ -932,7 +937,7 @@ AOU_GENOTYPE_FILES: Tuple[str, ...] = ("arrays.bed", "arrays.bim", "arrays.fam")
 # `condition_concept_ids=` argument to `None`) when adding new clinical
 # phenotypes — keeping it explicit makes config hashes deterministic and
 # downstream feature names traceable.
-CURATED_OMOP_CONDITION_CATALOG: Tuple[Tuple[str, int], ...] = (
+_RAW_CURATED_OMOP_CONDITION_CATALOG: Tuple[Tuple[str, int], ...] = (
     ("Hypertensive disorder", 316866),
     ("Hyperlipidemia", 432867),
     ("Osteoarthritis", 80180),
@@ -1121,6 +1126,67 @@ CURATED_OMOP_CONDITION_CATALOG: Tuple[Tuple[str, int], ...] = (
     ("Biliary cirrhosis", 192675),
     ("Respiratory syncytial virus infection", 437222),
     ("Myocarditis", 314383),
+)
+
+T2D_EHR_CONDITION_BLACKLIST_IDS: Tuple[int, ...] = (
+    201826,   # Type 2 diabetes mellitus
+    201820,
+    443767,
+    443729,
+    442793,
+    443592,
+    435216,
+    376112,
+    4174977,  # Retinopathy due to diabetes mellitus
+    201254,   # Type 1 diabetes mellitus
+    443727,   # Diabetic ketoacidosis
+    4024659,  # Gestational diabetes mellitus
+)
+
+T2D_EHR_CONDITION_BLACKLIST_TERMS: Tuple[str, ...] = (
+    "diabetes",
+    "diabetic",
+    "ketoacidosis",
+    "hypoglycemia",
+)
+
+T2D_TREATMENT_DRUG_PREFIXES: Tuple[str, ...] = ("A10",)
+T2D_TREATMENT_DRUG_TERMS: Tuple[str, ...] = (
+    "antidiabetic",
+    "anti-diabetic",
+    "insulin",
+    "metformin",
+    "glp-1",
+    "glp1",
+    "sglt2",
+    "dpp-4",
+    "sulfonylurea",
+    "thiazolidinedione",
+)
+
+
+def _is_t2d_target_condition(name: str, concept_id: int) -> bool:
+    lowered = str(name).lower()
+    return (
+        int(concept_id) in set(T2D_EHR_CONDITION_BLACKLIST_IDS)
+        or any(term in lowered for term in T2D_EHR_CONDITION_BLACKLIST_TERMS)
+    )
+
+
+def _is_t2d_treatment_proxy_group(value: object) -> bool:
+    text = str(value).strip()
+    upper = text.upper()
+    lowered = text.lower()
+    return (
+        any(upper.startswith(prefix) for prefix in T2D_TREATMENT_DRUG_PREFIXES)
+        or any(term in lowered for term in T2D_TREATMENT_DRUG_TERMS)
+    )
+
+
+CURATED_OMOP_CONDITION_CATALOG: Tuple[Tuple[str, int], ...] = tuple(
+    (name, cid)
+    for name, cid in _RAW_CURATED_OMOP_CONDITION_CATALOG
+    if not _is_t2d_target_condition(name, cid)
 )
 CURATED_OMOP_CONDITION_IDS: Tuple[int, ...] = tuple(
     cid for _name, cid in CURATED_OMOP_CONDITION_CATALOG
@@ -1736,7 +1802,8 @@ class EhrPanel:
         Column names of ``matrix``.
     feature_kinds : tuple of str, length m_E
         Per-column kind tag, one of ``"condition"``, ``"drug"``, ``"lab_mean"``,
-        ``"lab_min"``, ``"lab_max"``, ``"lab_slope"``, ``"utilisation"``.
+        ``"lab_min"``, ``"lab_max"``, ``"lab_slope"``, ``"lab_missing"``,
+        ``"utilisation"``.
         Useful for downstream reweighting / residualisation.
     """
 
@@ -1770,6 +1837,7 @@ def _filter_pre_baseline(
     df = long_df.copy()
     df[datetime_col] = pd.to_datetime(df[datetime_col], errors="coerce")
     df = df.dropna(subset=[datetime_col, person_col])
+    df[person_col] = df[person_col].astype(str)
     bd = baseline_dt.reindex(df[person_col]).to_numpy()
     keep = df[datetime_col].to_numpy() < bd
     if lookback_days is not None:
@@ -1833,9 +1901,14 @@ def _lab_summary_column_names(keep_labs: Sequence[str]) -> tuple[list[str], list
         + [f"lab_min:{lab}" for lab in labs]
         + [f"lab_max:{lab}" for lab in labs]
         + [f"lab_slope:{lab}" for lab in labs]
+        + [f"lab_missing:{lab}" for lab in labs]
     )
     kinds = (
-        ["lab_mean"] * m + ["lab_min"] * m + ["lab_max"] * m + ["lab_slope"] * m
+        ["lab_mean"] * m
+        + ["lab_min"] * m
+        + ["lab_max"] * m
+        + ["lab_slope"] * m
+        + ["lab_missing"] * m
     )
     return names, kinds
 
@@ -1885,6 +1958,9 @@ def _lab_summary_from_aggregates(
     col_idx = pd.Categorical(df[lab_col], categories=keep_labs).codes
     valid = (row_idx >= 0) & (col_idx >= 0)
 
+    observed = np.zeros((n, m), dtype=np.float64)
+    observed[row_idx[valid], col_idx[valid]] = 1.0
+
     def _fill(stat_col: str) -> np.ndarray:
         mat = np.full((n, m), np.nan, dtype=np.float64)
         values = df[stat_col].to_numpy(dtype=float)
@@ -1895,8 +1971,9 @@ def _lab_summary_from_aggregates(
     mins = _fill("value_min")
     maxs = _fill("value_max")
     slopes = _fill("value_slope")
+    missing = 1.0 - observed
 
-    block = np.concatenate([means, mins, maxs, slopes], axis=1)
+    block = np.concatenate([means, mins, maxs, slopes, missing], axis=1)
     names, kinds = _lab_summary_column_names(keep_labs)
     return block, names, kinds
 
@@ -1986,6 +2063,13 @@ def build_ehr_panel(
         )
         cf[person_col] = cf[person_col].astype(str)
         cf[condition_group_col] = cf[condition_group_col].astype(str)
+        cf = cf.loc[
+            ~cf[condition_group_col].map(
+                lambda value: _is_t2d_target_condition(str(value), int(value))
+                if str(value).isdigit()
+                else _is_t2d_target_condition(str(value), -1)
+            )
+        ].copy()
         mat, cols = _wide_indicator(
             cf, person_col, condition_group_col, person_order,
             min_prevalence, prefix="cond",
@@ -1998,6 +2082,9 @@ def build_ehr_panel(
         )
         df[person_col] = df[person_col].astype(str)
         df[drug_group_col] = df[drug_group_col].astype(str)
+        df = df.loc[
+            ~df[drug_group_col].map(_is_t2d_treatment_proxy_group)
+        ].copy()
         mat, cols = _wide_indicator(
             df, person_col, drug_group_col, person_order,
             min_prevalence, prefix="drug",
@@ -2065,6 +2152,8 @@ __all__ = [
     "CURATED_OMOP_CONDITION_CATALOG",
     "CURATED_OMOP_CONDITION_IDS",
     "CURATED_OMOP_MEASUREMENT_CATALOG",
+    "T2D_EHR_CONDITION_BLACKLIST_IDS",
+    "T2D_TREATMENT_DRUG_PREFIXES",
     "fetch_omop_long_frames",
     "resolve_baseline_dt",
     "build_ehr_panel",

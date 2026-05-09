@@ -19,11 +19,10 @@ with three attributes:
     censored   : boolean alias for event==0
 
 For nodes declared ``survival`` the corresponding column of ``X``
-holds ``time`` and a sibling column ``{name}_event`` is NOT added; the
-survival outcome is exposed via the separate ``time`` / ``event``
-attributes.  Upstream structure learners treat the T2D node as binary
-(event indicator) during DAG search and use (``time``, ``event``) only
-inside the GAM stage.
+holds the event indicator and a sibling column ``{name}_event`` is NOT
+added; the censoring-aware survival outcome is exposed via the separate
+``time`` / ``event`` attributes and used by structure learning and the
+GAM stage.
 """
 
 from __future__ import annotations
@@ -221,7 +220,7 @@ def simulate(
         "systolic_BP": systolic_BP,
         "hypertension": hypertension.astype(float),
         "cardiovascular_disease": cardiovascular_disease.astype(float),
-        "T2D": event.astype(float),  # DAG search treats T2D as binary
+        "T2D": event.astype(float),
     }
     for i, name in enumerate(NODE_NAMES):
         X[:, i] = values[name]

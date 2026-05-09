@@ -55,8 +55,7 @@ def test_fit_smoke(medium_data):
         event,
         X,
         columns=parents,
-        n_samples=100,
-        rng=np.random.default_rng(7),
+        n_uncertainty_slices=100,
         progress=progress_messages.append,
     )
     elapsed = _time.perf_counter() - t0
@@ -93,7 +92,7 @@ def test_fit_smoke(medium_data):
 
 
 def test_predict_shape(small_data):
-    """Check (n_samples, n_new, n_t) shape contracts."""
+    """Check (n_uncertainty_slices, n_new, n_t) shape contracts."""
     from causal_pred.data.nodes import NODE_INDEX
     from causal_pred.gam.survival import fit_survival_gam
 
@@ -111,8 +110,7 @@ def test_predict_shape(small_data):
         event,
         X,
         columns=parents,
-        n_samples=n_post,
-        rng=np.random.default_rng(1),
+        n_uncertainty_slices=n_post,
     )
 
     X_new = X[:4]
@@ -134,6 +132,7 @@ def test_predict_survival_mean_uses_chunked_surface():
 
     n_new = 11
     t_grid = np.arange(7, dtype=float)
+    backend_t_grid = 1.0 + t_grid
     X = np.zeros((n_new, 1), dtype=float)
 
     class _Prediction:
@@ -143,7 +142,7 @@ def test_predict_survival_mean_uses_chunked_surface():
             )
 
         def survival_at_chunks(self, times, *, people_chunk=50000, time_grid_chunk=64):
-            assert np.array_equal(times, t_grid)
+            assert np.array_equal(times, backend_t_grid)
             yield slice(0, 5), slice(0, 3), np.full((5, 3), 0.9)
             yield slice(0, 5), slice(3, 7), np.full((5, 4), 0.8)
             yield slice(5, 11), slice(0, 7), np.full((6, 7), 0.7)
@@ -160,6 +159,7 @@ def test_predict_survival_mean_uses_chunked_surface():
         n_train=10,
         n_events=3,
         formula="Surv(entry, exit, event) ~ s(x, type=ps, knots=10)",
+        survival_likelihood="location-scale",
         train_summary={},
     )
     S = _predict_survival_matrix(fit, X, t_grid)
@@ -194,22 +194,22 @@ def test_bma_weights(small_data, monkeypatch):
     X_eval = X_full[:10]
 
     class _FixedSurvivalFit:
-        def __init__(self, offset: float, n_samples: int):
+        def __init__(self, offset: float):
             self.offset = float(offset)
-            self.n_samples = int(n_samples)
 
-        def predict_survival(self, X_new, t_grid):
+        def predict_survival_mean(self, X_new, t_grid):
             row_term = (
                 np.arange(X_new.shape[0], dtype=float).reshape(-1, 1) * 0.001
             )
             time_term = np.asarray(t_grid, dtype=float).reshape(1, -1) * 0.01
-            mean = 0.9 - self.offset - row_term - time_term
-            return np.repeat(mean[None, :, :], self.n_samples, axis=0)
+            return 0.9 - self.offset - row_term - time_term
 
-    def _fixed_fit(_time, _event, _X, columns, **kwargs):
+        def predict_survival_variance(self, X_new, t_grid):
+            return np.zeros((X_new.shape[0], len(t_grid)), dtype=float)
+
+    def _fixed_fit(_time, _event, _X, columns, **_kwargs):
         offsets = {("BMI", "HbA1c"): 0.0, ("ancestry_PC1",): 0.2}
-        n_samples = kwargs["n_samples"]
-        return _FixedSurvivalFit(offsets[tuple(columns)], n_samples)
+        return _FixedSurvivalFit(offsets[tuple(columns)])
 
     monkeypatch.setattr(survival_mod, "fit_survival_gam", _fixed_fit)
 
@@ -222,39 +222,37 @@ def test_bma_weights(small_data, monkeypatch):
         d.columns,
         t_grid,
         X_eval=X_eval,
-        n_samples=50,
-        rng=np.random.default_rng(23),
+        n_uncertainty_slices=50,
     )
-    S_bma = out["S_bma"]
-    S_A = out["per_model_mean"][0]
-    S_B = out["per_model_mean"][1]
+    S_bma = out["survival_mean"]
+    S_A = out["per_set_mean"][0]
+    S_B = out["per_set_mean"][1]
     err_A = float(np.mean(np.abs(S_bma - S_A)))
     err_B = float(np.mean(np.abs(S_bma - S_B)))
     assert err_A < err_B, (
         f"BMA closer to B than A (weights [0.9, 0.1]): {err_A:.3f} vs {err_B:.3f}"
     )
     # Structural/parametric decomposition is non-negative.
-    assert np.all(out["var_parametric"] >= -1e-12)
-    assert np.all(out["var_structural"] >= -1e-12)
-    total = out["var_parametric"] + out["var_structural"]
-    assert np.allclose(total, out["var_total"], atol=1e-9)
+    assert np.all(out["variance_parametric"] >= -1e-12)
+    assert np.all(out["variance_structural"] >= -1e-12)
+    total = out["variance_parametric"] + out["variance_structural"]
+    assert np.allclose(total, out["variance_total"], atol=1e-9)
 
 
-def test_bma_uses_unbiased_within_model_variance(monkeypatch):
+def test_bma_uses_gamfit_within_model_variance(monkeypatch):
     import causal_pred.gam.survival as survival_mod
 
-    class _DrawFit:
-        def predict_survival(self, X_new, t_grid):
-            draws = np.array([0.2, 0.4, 0.6], dtype=float)
-            return np.broadcast_to(
-                draws[:, None, None],
-                (draws.size, X_new.shape[0], len(t_grid)),
-            ).copy()
+    class _VarianceFit:
+        def predict_survival_mean(self, X_new, t_grid):
+            return np.full((X_new.shape[0], len(t_grid)), 0.4, dtype=float)
+
+        def predict_survival_variance(self, X_new, t_grid):
+            return np.full((X_new.shape[0], len(t_grid)), 0.04, dtype=float)
 
     monkeypatch.setattr(
         survival_mod,
         "fit_survival_gam",
-        lambda *_args, **_kwargs: _DrawFit(),
+        lambda *_args, **_kwargs: _VarianceFit(),
     )
 
     out = survival_mod.bma_survival(
@@ -266,7 +264,7 @@ def test_bma_uses_unbiased_within_model_variance(monkeypatch):
         ("x0",),
         np.array([1.0, 2.0]),
         X_eval=np.zeros((2, 1)),
-        n_samples=3,
+        n_uncertainty_slices=3,
     )
 
     np.testing.assert_allclose(out["variance_parametric"], 0.04)
@@ -280,10 +278,8 @@ def test_bma_uses_unbiased_within_model_variance(monkeypatch):
 def test_censoring_sanity():
     """Fit runs cleanly whether censoring rate is 0 or ~50%.
 
-    We don't assert parameter equality -- the library (v0.1.15) exposes
-    only the 'standard' model class, so the wrapper uses a complete-case
-    AFT workaround and biases are expected.  This test only checks that
-    both censoring regimes produce finite, in-range survival curves.
+    We don't assert parameter equality; this test only checks that both
+    censoring regimes produce finite, in-range survival curves.
     """
     from causal_pred.data.synthetic import simulate
     from causal_pred.data.nodes import NODE_INDEX
@@ -302,8 +298,7 @@ def test_censoring_sanity():
             d.event,
             X,
             columns=parents,
-            n_samples=50,
-            rng=np.random.default_rng(seed + 1),
+            n_uncertainty_slices=50,
         )
         t_grid = np.array([2.0, 5.0, 10.0])
         S = gam_model.predict_survival(X[:5], t_grid)

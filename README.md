@@ -2,7 +2,9 @@
 
 End-to-end implementation of the project proposed in `paper/main.tex`: predict
 disease *and* its causes on biobank-scale individual-level data, with explicit
-uncertainty at both structural (DAG) and parametric (GAM) levels.
+structural uncertainty over DAG parent sets. The gamfit survival backend
+reports response-scale delta-method uncertainty, which is combined with
+structural parent-set uncertainty in the delivered survival intervals.
 
 Target disease: **Type 2 Diabetes (T2D)**. T2D has well-characterised causal
 parents (BMI, HbA1c, lifestyle, genetic risk), strong Mendelian-randomisation
@@ -57,7 +59,7 @@ src/causal_pred/
   plots.py     figure helpers (heatmaps, calibration, survival fans)
   pipeline.py  end-to-end orchestration
 
-scripts/       runnable drivers (run_full_pipeline.py, generate_report.py, benchmark.py)
+scripts/       runnable drivers (run_full_pipeline.py, generate_figures.py, benchmark.py)
 tests/         pytest tests for every component
 outputs/       JSON / PNG artefacts produced by the pipeline
 paper/         LaTeX paper and build script

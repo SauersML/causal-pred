@@ -709,6 +709,19 @@ def load_live_gwas(
         circular_pairs=tuple(circular),
     )
     summary.per_pair = per_pair  # type: ignore[attr-defined]
+    summary.source_metadata = {  # type: ignore[attr-defined]
+        "source": "opengwas",
+        "cache_version": CACHE_VERSION,
+        "params": {"pval": float(pval), "r2": float(r2), "kb": int(kb)},
+        "drop_circular": bool(drop_circular),
+        "study_ids": {
+            trait: OPENGWAS_STUDY_IDS[trait]
+            for trait in sorted(set(exposures) | set(outcomes))
+            if trait in OPENGWAS_STUDY_IDS
+        },
+        "authenticated": bool(client.authenticated),
+        "cache_dir": str(cache_root),
+    }
     return summary
 
 

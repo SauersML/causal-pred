@@ -120,7 +120,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from itertools import combinations, product
-from typing import List, Optional, Sequence, Tuple
+from math import comb
+import time
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -144,6 +146,39 @@ class MCMCResult:
     log_post: np.ndarray = field(default_factory=lambda: np.zeros(0))
     edge_probs: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
     diagnostics: dict = field(default_factory=dict)
+
+
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _progress_callback(progress: bool | ProgressCallback) -> Optional[ProgressCallback]:
+    if callable(progress):
+        return progress
+    if not progress:
+        return None
+
+    def _print_progress(payload: dict[str, Any]) -> None:
+        chain = int(payload.get("chain", 0))
+        n_chains = int(payload.get("n_chains", 0))
+        iteration = int(payload.get("iter", 0))
+        total_iters = int(payload.get("total_iters", 0))
+        kept = int(payload.get("kept", 0))
+        target = int(payload.get("target_samples", 0))
+        elapsed = float(payload.get("elapsed_s", 0.0))
+        eta = float(payload.get("eta_s", 0.0))
+        event = str(payload.get("event", "progress"))
+        phase = str(payload.get("phase", "unknown"))
+        print(
+            "[mcmc] "
+            f"event={event} chain={chain}/{n_chains} "
+            f"iter={iteration}/{total_iters} phase={phase} "
+            f"kept={kept}/{target} edges={int(payload.get('edges', 0))} "
+            f"logpost={float(payload.get('log_post', 0.0)):.2f} "
+            f"iter_per_s={float(payload.get('iter_per_s', 0.0)):.2f} "
+            f"elapsed={elapsed:.1f}s eta={eta:.1f}s"
+        )
+
+    return _print_progress
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +559,8 @@ def _rhat_edgewise(chain_samples: Sequence[np.ndarray]) -> np.ndarray:
     """Classic (non-split) Gelman-Rubin R-hat per edge across chains.
 
     ``chain_samples`` is a list of (S, p, p) 0/1 arrays (one per chain,
-    same S).  Constant edges (variance 0 within every chain) return 1.
+    same S).  Constant edges return 1 only when every chain has the same
+    constant value. Constant chains with different values report infinity.
     """
     m = len(chain_samples)
     if m < 2:
@@ -672,6 +708,7 @@ def _gibbs_resample_parents(
     rng: np.random.Generator,
     hyper: dict,
     allowed_edges: Optional[np.ndarray] = None,
+    progress: Optional[ProgressCallback] = None,
 ) -> Tuple[bool, float, float]:
     """Exact conditional parent-set update for one node.
 
@@ -696,11 +733,23 @@ def _gibbs_resample_parents(
         allowed_col = allowed_edges[:, j].astype(bool, copy=True)
         allowed_col[j] = False
     candidates = [
-        int(i)
-        for i in range(p)
-        if allowed_col[i] and i != j and not bool(reach[j, i])
+        int(i) for i in range(p) if allowed_col[i] and i != j and not bool(reach[j, i])
     ]
     cap = min(cap, len(candidates))
+    n_parent_sets = int(sum(comb(len(candidates), size) for size in range(cap + 1)))
+    emit_parent_progress = progress is not None and n_parent_sets >= 500
+    parent_started_at = time.time()
+    if emit_parent_progress:
+        progress(
+            {
+                "event": "exact_parent_sets_start",
+                "target_node": int(j),
+                "candidate_parents": int(len(candidates)),
+                "parent_cap": int(cap),
+                "parent_sets_total": n_parent_sets,
+                "old_parent_count": int(old_col.sum()),
+            }
+        )
 
     old_parents = tuple(int(i) for i in np.flatnonzero(old_col))
     old_score = score_node(j, old_parents, data, node_types, cache=cache, **hyper)
@@ -712,12 +761,31 @@ def _gibbs_resample_parents(
     log_odds = log_pi[:, j] - log_1m[:, j]
     parent_sets: List[Tuple[int, ...]] = []
     log_weights: List[float] = []
+    scored_sets = 0
+    last_parent_progress_at = parent_started_at
     for size in range(cap + 1):
         for parents in combinations(candidates, size):
             parent_sets.append(tuple(int(i) for i in parents))
             score = score_node(j, parents, data, node_types, cache=cache, **hyper)
-            prior = absent_prior + float(log_odds[list(parents)].sum())
+            prior = absent_prior + (
+                float(log_odds[list(parents)].sum()) if parents else 0.0
+            )
             log_weights.append(float(score + prior))
+            scored_sets += 1
+            now = time.time()
+            if emit_parent_progress and now - last_parent_progress_at >= 10.0:
+                progress(
+                    {
+                        "event": "exact_parent_sets_progress",
+                        "target_node": int(j),
+                        "candidate_parents": int(len(candidates)),
+                        "parent_cap": int(cap),
+                        "parent_sets_scored": int(scored_sets),
+                        "parent_sets_total": n_parent_sets,
+                        "parent_elapsed_s": float(now - parent_started_at),
+                    }
+                )
+                last_parent_progress_at = now
 
     weights_log = np.asarray(log_weights, dtype=float)
     weights = np.exp(weights_log - float(weights_log.max()))
@@ -739,6 +807,19 @@ def _gibbs_resample_parents(
     new_prior_col = float(
         np.where(new_col.astype(bool), log_pi[:, j], log_1m[:, j]).sum()
     )
+    if emit_parent_progress:
+        progress(
+            {
+                "event": "exact_parent_sets_complete",
+                "target_node": int(j),
+                "candidate_parents": int(len(candidates)),
+                "parent_cap": int(cap),
+                "parent_sets_scored": int(scored_sets),
+                "parent_sets_total": n_parent_sets,
+                "selected_parent_count": int(len(new_parents)),
+                "parent_elapsed_s": float(time.time() - parent_started_at),
+            }
+        )
     return True, float(new_score - old_score), float(new_prior_col - old_prior_col)
 
 
@@ -792,8 +873,10 @@ def _gibbs_resample_edge_pair(
     allow_ij = True if allowed_edges is None else bool(allowed_edges[i, j])
     allow_ji = True if allowed_edges is None else bool(allowed_edges[j, i])
 
-    if allow_ij and not bool(reach[j, i]) and (
-        max_parents is None or j_parent_count < int(max_parents)
+    if (
+        allow_ij
+        and not bool(reach[j, i])
+        and (max_parents is None or j_parent_count < int(max_parents))
     ):
         parents_j = tuple(sorted(base_j_parents + (int(i),)))
         score_j = score_node(j, parents_j, data, node_types, cache=cache, **hyper)
@@ -801,8 +884,10 @@ def _gibbs_resample_edge_pair(
         states.append((1, base_i_score + score_j, prior, base_i_parents, parents_j))
 
     i_parent_count = len(base_i_parents)
-    if allow_ji and not bool(reach[i, j]) and (
-        max_parents is None or i_parent_count < int(max_parents)
+    if (
+        allow_ji
+        and not bool(reach[i, j])
+        and (max_parents is None or i_parent_count < int(max_parents))
     ):
         parents_i = tuple(sorted(base_i_parents + (int(j),)))
         score_i = score_node(i, parents_i, data, node_types, cache=cache, **hyper)
@@ -942,8 +1027,11 @@ def _run_chain(
     thin: int,
     rng: np.random.Generator,
     cache: dict,
-    progress: bool,
     hyper: dict,
+    progress_callback: Optional[ProgressCallback] = None,
+    chain_index: int = 0,
+    n_chains: int = 1,
+    progress_interval: Optional[int] = None,
     hybrid_prob: float = 0.1,
     resample_flip: float = 0.3,
     resample_flip_burn: Optional[float] = None,
@@ -955,7 +1043,6 @@ def _run_chain(
     allowed_edges: Optional[np.ndarray] = None,
 ) -> dict:
     """Run one MCMC chain.  Returns a dict of per-chain outputs."""
-    data.shape[1]
     adj = start_adj.astype(np.int64, copy=True)
     # Anchor current log score and prior.
     cur_score = float(score_dag(adj, data, node_types, cache=cache, **hyper))
@@ -981,6 +1068,100 @@ def _run_chain(
     }
     accept = {"add": 0, "remove": 0, "reverse": 0, "hybrid": 0, "edge_gibbs": 0}
     accept["block_gibbs"] = 0
+    progress_every = max(
+        1,
+        int(progress_interval)
+        if progress_interval is not None
+        else max(1, total_iters // 20),
+    )
+    chain_started_at = time.time()
+    last_progress_at = chain_started_at
+
+    def _keep_sample_if_due(it: int) -> None:
+        if it >= burn_in and ((it - burn_in) % thin == 0):
+            samples.append(adj.copy())
+            log_post_kept.append(cur_score + cur_prior)
+
+    def _accept_rate_snapshot() -> dict[str, float]:
+        rates = {k: (accept[k] / prop[k]) if prop[k] > 0 else 0.0 for k in prop}
+        mh_prop = prop["add"] + prop["remove"] + prop["reverse"]
+        mh_acc = accept["add"] + accept["remove"] + accept["reverse"]
+        rates["metropolis_hastings"] = mh_acc / mh_prop if mh_prop > 0 else 0.0
+        total_prop = sum(prop.values())
+        total_acc = sum(accept.values())
+        rates["overall"] = total_acc / total_prop if total_prop > 0 else 0.0
+        return rates
+
+    def _emit_progress(
+        it: int,
+        event: str,
+        *,
+        force: bool = False,
+        move_type: str | None = None,
+        accepted: bool | None = None,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> None:
+        nonlocal last_progress_at
+        if progress_callback is None:
+            return
+        now = time.time()
+        completed = max(0, it + 1)
+        if not force and completed < total_iters:
+            if completed % progress_every != 0 and now - last_progress_at < 30.0:
+                return
+        elapsed = max(now - chain_started_at, 1e-9)
+        iter_per_s = completed / elapsed if completed > 0 else 0.0
+        remaining = max(total_iters - completed, 0)
+        eta_s = remaining / iter_per_s if iter_per_s > 0.0 else float("nan")
+        phase = "burn_in" if completed <= burn_in else "sampling"
+        payload: dict[str, Any] = {
+            "event": event,
+            "chain": int(chain_index + 1),
+            "n_chains": int(n_chains),
+            "iter": int(completed),
+            "total_iters": int(total_iters),
+            "burn_in": int(burn_in),
+            "thin": int(thin),
+            "phase": phase,
+            "kept": int(len(samples)),
+            "target_samples": int(n_samples),
+            "elapsed_s": float(now - chain_started_at),
+            "eta_s": float(eta_s),
+            "iter_per_s": float(iter_per_s),
+            "score": float(cur_score),
+            "prior": float(cur_prior),
+            "log_post": float(cur_score + cur_prior),
+            "edges": int(adj.sum()),
+            "n_add": int(n_add),
+            "n_remove": int(n_rem),
+            "n_reverse": int(n_rev),
+            "n_moves": int(cur_nmoves),
+            "move_type": move_type,
+            "accepted": accepted,
+            "proposals": dict(prop),
+            "accepts": dict(accept),
+            "accept_rate": _accept_rate_snapshot(),
+            "score_cache_entries": int(len(cache)),
+        }
+        if extra:
+            payload.update(extra)
+        progress_callback(payload)
+        last_progress_at = time.time()
+
+    def _after_iteration(
+        it: int,
+        move_type: str,
+        accepted: bool | None = None,
+    ) -> None:
+        _keep_sample_if_due(it)
+        _emit_progress(
+            it,
+            "iteration",
+            move_type=move_type,
+            accepted=accepted,
+        )
+
+    _emit_progress(-1, "chain_start", force=True)
 
     # Effective hybrid flip rate per iteration: during burn-in we optionally
     # use ``resample_flip_burn`` (if provided) to take larger exploratory
@@ -1023,9 +1204,7 @@ def _run_chain(
                 )
                 cur_nmoves = n_add + n_rem + n_rev
                 accept["block_gibbs"] += 1
-            if it >= burn_in and ((it - burn_in) % thin == 0):
-                samples.append(adj.copy())
-                log_post_kept.append(cur_score + cur_prior)
+            _after_iteration(it, "block_gibbs", accepted=accepted)
             continue
 
         edge_cutoff = block_resample_prob + edge_resample_prob
@@ -1056,9 +1235,7 @@ def _run_chain(
                 )
                 cur_nmoves = n_add + n_rem + n_rev
                 accept["edge_gibbs"] += 1
-            if it >= burn_in and ((it - burn_in) % thin == 0):
-                samples.append(adj.copy())
-                log_post_kept.append(cur_score + cur_prior)
+            _after_iteration(it, "edge_gibbs", accepted=accepted)
             continue
 
         # Hybrid parent-set resample move with probability ``hybrid_prob``.
@@ -1073,6 +1250,16 @@ def _run_chain(
                     raise ValueError(
                         "exact_parent_resample requires a finite max_parents"
                     )
+
+                def _parent_progress(payload: dict[str, Any]) -> None:
+                    _emit_progress(
+                        it,
+                        str(payload.get("event", "exact_parent_sets")),
+                        force=True,
+                        move_type="hybrid",
+                        extra=payload,
+                    )
+
                 accepted, d_score, d_prior = _gibbs_resample_parents(
                     adj,
                     j_target,
@@ -1085,6 +1272,9 @@ def _run_chain(
                     rng,
                     hyper,
                     allowed_edges=allowed_edges,
+                    progress=(
+                        _parent_progress if progress_callback is not None else None
+                    ),
                 )
             else:
                 accepted, d_score, d_prior = _hybrid_resample_parents(
@@ -1112,16 +1302,12 @@ def _run_chain(
                 )
                 cur_nmoves = n_add + n_rem + n_rev
                 accept["hybrid"] += 1
-            if it >= burn_in and ((it - burn_in) % thin == 0):
-                samples.append(adj.copy())
-                log_post_kept.append(cur_score + cur_prior)
+            _after_iteration(it, "hybrid", accepted=accepted)
             continue
 
         if cur_nmoves == 0:
             # Degenerate; nothing to do besides record.
-            if it >= burn_in and ((it - burn_in) % thin == 0):
-                samples.append(adj.copy())
-                log_post_kept.append(cur_score + cur_prior)
+            _after_iteration(it, "none", accepted=None)
             continue
 
         # Pick move type by proportional weight.
@@ -1194,6 +1380,7 @@ def _run_chain(
         log_alpha = d_score + d_prior + np.log(cur_nmoves) - np.log(max(new_nmoves, 1))
         log_u = np.log(rng.random() + 1e-300)
 
+        accepted_move = False
         if log_u < log_alpha and new_nmoves > 0:
             # Accept.
             cur_score += d_score
@@ -1202,6 +1389,7 @@ def _run_chain(
             cur_nmoves = new_nmoves
             _reach = new_reach
             accept[mtype] += 1
+            accepted_move = True
         else:
             # Revert.
             if mtype == "add":
@@ -1212,21 +1400,15 @@ def _run_chain(
                 adj[j, i] = 0
                 adj[i, j] = 1
 
-        if it >= burn_in and ((it - burn_in) % thin == 0):
-            samples.append(adj.copy())
-            log_post_kept.append(cur_score + cur_prior)
-
-        if progress and (it + 1) % max(1, total_iters // 10) == 0:
-            print(
-                f"[mcmc] iter {it + 1}/{total_iters} "
-                f"score={cur_score:.2f} prior={cur_prior:.2f}"
-            )
+        _after_iteration(it, mtype, accepted=accepted_move)
 
     # Keep only the first n_samples (the tail may briefly exceed due to edge
     # rounding: e.g. if total_iters % thin != 0).
     if len(samples) > n_samples:
         samples = samples[:n_samples]
         log_post_kept = log_post_kept[:n_samples]
+
+    _emit_progress(total_iters - 1, "chain_complete", force=True)
 
     return {
         "samples": samples,
@@ -1252,7 +1434,8 @@ def run_structure_mcmc(
     thin: int = 5,
     n_chains: int = 4,
     rng: Optional[np.random.Generator] = None,
-    progress: bool = False,
+    progress: bool | ProgressCallback = False,
+    progress_interval: Optional[int] = None,
     perturb_flips: int = 5,
     hybrid_prob: float = 0.1,
     resample_flip: float = 0.3,
@@ -1288,8 +1471,12 @@ def run_structure_mcmc(
         Independent chains, run sequentially (no multiprocessing).
     rng : numpy.random.Generator, optional
         Parent RNG; per-chain streams are spawned from it.
-    progress : bool
-        If True, occasional progress prints during each chain.
+    progress : bool or callable
+        If True, print structured progress during each chain. If callable,
+        call it with a progress payload dict.
+    progress_interval : int, optional
+        Emit one iteration heartbeat every ``progress_interval`` iterations
+        per chain. Time-based heartbeats still emit at least every 30 seconds.
     perturb_flips : int
         Target number of random edge flips (kept acyclic) applied to
         ``start_adj`` to form each chain's initial graph.  The first
@@ -1388,6 +1575,41 @@ def run_structure_mcmc(
 
     # Shared score cache across chains (scores are graph-state-free).
     cache: dict = {}
+    emit = _progress_callback(progress)
+    sampler_started_at = time.time()
+    total_iters_per_chain = int(burn_in + n_samples * thin)
+    if emit is not None:
+        emit(
+            {
+                "event": "sampler_start",
+                "chain": 0,
+                "n_chains": int(n_chains),
+                "iter": 0,
+                "total_iters": total_iters_per_chain,
+                "burn_in": int(burn_in),
+                "thin": int(thin),
+                "phase": "setup",
+                "kept": 0,
+                "target_samples": int(n_samples),
+                "elapsed_s": 0.0,
+                "eta_s": float("nan"),
+                "iter_per_s": 0.0,
+                "score": 0.0,
+                "prior": 0.0,
+                "log_post": 0.0,
+                "edges": int(start_adj.sum()),
+                "n": int(_n),
+                "p": int(p),
+                "n_allowed_edges": int(allowed.sum()),
+                "start_edges": int(start_adj.sum()),
+                "samples_per_chain": int(n_samples),
+                "edge_resample_prob": float(edge_resample_prob),
+                "parent_resample_prob": float(hybrid_prob),
+                "block_resample_prob": float(block_resample_prob),
+                "exact_parent_resample": bool(exact_parent_resample),
+                "max_parents": None if max_parents is None else int(max_parents),
+            }
+        )
 
     all_chain_samples: List[np.ndarray] = []
     all_log_post: List[np.ndarray] = []
@@ -1431,8 +1653,11 @@ def run_structure_mcmc(
             thin=thin,
             rng=child_rngs[c],
             cache=cache,
-            progress=progress,
             hyper=hyper,
+            progress_callback=emit,
+            chain_index=c,
+            n_chains=n_chains,
+            progress_interval=progress_interval,
             hybrid_prob=hybrid_prob,
             resample_flip=resample_flip,
             resample_flip_burn=resample_flip_burn,
@@ -1457,6 +1682,33 @@ def run_structure_mcmc(
             mean_lp_per_chain.append(float(chain_out["log_post"].mean()))
         else:
             mean_lp_per_chain.append(float("nan"))
+        if emit is not None:
+            elapsed = time.time() - sampler_started_at
+            emit(
+                {
+                    "event": "chain_stacked",
+                    "chain": int(c + 1),
+                    "n_chains": int(n_chains),
+                    "iter": total_iters_per_chain,
+                    "total_iters": total_iters_per_chain,
+                    "burn_in": int(burn_in),
+                    "thin": int(thin),
+                    "phase": "chain_done",
+                    "kept": int(arr.shape[0]),
+                    "target_samples": int(n_samples),
+                    "elapsed_s": float(elapsed),
+                    "eta_s": float("nan"),
+                    "iter_per_s": float(
+                        ((c + 1) * total_iters_per_chain) / max(elapsed, 1e-9)
+                    ),
+                    "score": 0.0,
+                    "prior": 0.0,
+                    "log_post": float(mean_lp_per_chain[-1]),
+                    "edges": int(arr[-1].sum()) if arr.shape[0] else 0,
+                    "score_cache_entries": int(len(cache)),
+                    "chain_samples": int(arr.shape[0]),
+                }
+            )
 
     # Concatenate samples across chains for edge_probs and the flat sample list.
     if sum(a.shape[0] for a in all_chain_samples) > 0:
@@ -1489,9 +1741,38 @@ def run_structure_mcmc(
     mh_keys = ("add", "remove", "reverse")
     mh_prop = sum(prop_totals[k] for k in mh_keys)
     mh_acc = sum(accept_totals[k] for k in mh_keys)
-    accept_rate["metropolis_hastings"] = (
-        mh_acc / mh_prop if mh_prop > 0 else 0.0
-    )
+    accept_rate["metropolis_hastings"] = mh_acc / mh_prop if mh_prop > 0 else 0.0
+    if emit is not None:
+        elapsed = time.time() - sampler_started_at
+        emit(
+            {
+                "event": "diagnostics_start",
+                "chain": int(n_chains),
+                "n_chains": int(n_chains),
+                "iter": total_iters_per_chain,
+                "total_iters": total_iters_per_chain,
+                "burn_in": int(burn_in),
+                "thin": int(thin),
+                "phase": "diagnostics",
+                "kept": int(flat.shape[0]),
+                "target_samples": int(n_samples * n_chains),
+                "elapsed_s": float(elapsed),
+                "eta_s": float("nan"),
+                "iter_per_s": float(
+                    (n_chains * total_iters_per_chain) / max(elapsed, 1e-9)
+                ),
+                "score": 0.0,
+                "prior": 0.0,
+                "log_post": float(log_post_concat.mean())
+                if log_post_concat.size
+                else float("nan"),
+                "edges": int(flat[-1].sum()) if flat.shape[0] else 0,
+                "score_cache_entries": int(len(cache)),
+                "proposals": dict(prop_totals),
+                "accepts": dict(accept_totals),
+                "accept_rate": dict(accept_rate),
+            }
+        )
 
     # R-hat and ESS diagnostics.
     # We compute R-hat both on the directed-edge indicators and on the
@@ -1514,9 +1795,29 @@ def run_structure_mcmc(
         # Upper-triangle mask of off-diagonal: skeleton is symmetric so
         # we take the max over i < j only.
         triu = np.triu(np.ones((p, p), dtype=bool), k=1)
-        max_rhat_skel = float(np.nanmax(rhat_skel[triu])) if triu.any() else 1.0
+        rhat_skel_scored = rhat_skel[triu]
+        finite_skel = np.isfinite(rhat_skel_scored)
+        max_rhat_skel = (
+            float(np.nanmax(rhat_skel_scored)) if rhat_skel_scored.size else 1.0
+        )
+        max_finite_rhat_skel = (
+            float(np.max(rhat_skel_scored[finite_skel]))
+            if np.any(finite_skel)
+            else float("nan")
+        )
+        n_infinite_rhat_skel = int(np.sum(np.isposinf(rhat_skel_scored)))
         off = ~np.eye(p, dtype=bool)
-        max_rhat_dir = float(np.nanmax(rhat_mat[off])) if off.any() else 1.0
+        rhat_dir_scored = rhat_mat[off]
+        finite_dir = np.isfinite(rhat_dir_scored)
+        max_rhat_dir = (
+            float(np.nanmax(rhat_dir_scored)) if rhat_dir_scored.size else 1.0
+        )
+        max_finite_rhat_dir = (
+            float(np.max(rhat_dir_scored[finite_dir]))
+            if np.any(finite_dir)
+            else float("nan")
+        )
+        n_infinite_rhat_dir = int(np.sum(np.isposinf(rhat_dir_scored)))
         max_rhat = max_rhat_skel
     else:
         rhat_mat = np.ones((p, p), dtype=float)
@@ -1524,6 +1825,10 @@ def run_structure_mcmc(
         max_rhat = 1.0
         max_rhat_dir = 1.0
         max_rhat_skel = 1.0
+        max_finite_rhat_dir = 1.0
+        max_finite_rhat_skel = 1.0
+        n_infinite_rhat_dir = 0
+        n_infinite_rhat_skel = 0
 
     # Per-edge ESS: sum the per-chain ESS rather than computing on the
     # concatenated trace.  Concatenating chains that occupy different
@@ -1541,10 +1846,7 @@ def run_structure_mcmc(
                     ess_mat[i, j] = float(flat.shape[0])
                     continue
                 ess_mat[i, j] = float(
-                    sum(
-                        _ess_ips(c[:, i, j].astype(float))
-                        for c in eligible_chains
-                    )
+                    sum(_ess_ips(c[:, i, j].astype(float)) for c in eligible_chains)
                 )
         off = ~np.eye(p, dtype=bool)
         min_ess = float(np.min(ess_mat[off])) if off.any() else float(flat.shape[0])
@@ -1562,6 +1864,10 @@ def run_structure_mcmc(
         "max_rhat": max_rhat,
         "max_rhat_directed": max_rhat_dir,
         "max_rhat_skeleton": max_rhat_skel,
+        "max_finite_rhat_directed": max_finite_rhat_dir,
+        "max_finite_rhat_skeleton": max_finite_rhat_skel,
+        "n_infinite_rhat_directed": n_infinite_rhat_dir,
+        "n_infinite_rhat_skeleton": n_infinite_rhat_skel,
         "ess_per_edge": ess_mat,
         "min_ess": min_ess,
         "n_chains": int(n_chains),
@@ -1571,10 +1877,46 @@ def run_structure_mcmc(
         "exact_parent_resample": bool(exact_parent_resample),
         "max_parents": None if max_parents is None else int(max_parents),
         "edge_resample_prob": float(edge_resample_prob),
+        "parent_resample_prob": float(hybrid_prob),
         "block_resample_prob": float(block_resample_prob),
         "block_size": int(block_size),
         "n_allowed_edges": int(allowed.sum()),
     }
+    if emit is not None:
+        elapsed = time.time() - sampler_started_at
+        emit(
+            {
+                "event": "diagnostics_complete",
+                "chain": int(n_chains),
+                "n_chains": int(n_chains),
+                "iter": total_iters_per_chain,
+                "total_iters": total_iters_per_chain,
+                "burn_in": int(burn_in),
+                "thin": int(thin),
+                "phase": "complete",
+                "kept": int(flat.shape[0]),
+                "target_samples": int(n_samples * n_chains),
+                "elapsed_s": float(elapsed),
+                "eta_s": 0.0,
+                "iter_per_s": float(
+                    (n_chains * total_iters_per_chain) / max(elapsed, 1e-9)
+                ),
+                "score": 0.0,
+                "prior": 0.0,
+                "log_post": float(log_post_concat.mean())
+                if log_post_concat.size
+                else float("nan"),
+                "edges": int(flat[-1].sum()) if flat.shape[0] else 0,
+                "score_cache_entries": int(len(cache)),
+                "proposals": dict(prop_totals),
+                "accepts": dict(accept_totals),
+                "accept_rate": dict(accept_rate),
+                "max_rhat_directed": float(max_rhat_dir),
+                "max_rhat_skeleton": float(max_rhat_skel),
+                "min_ess": float(min_ess),
+                "samples_total": int(flat.shape[0]),
+            }
+        )
 
     return MCMCResult(
         samples=flat_samples_list,

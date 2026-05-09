@@ -3,7 +3,7 @@
 Run with
 
     uv run python scripts/benchmark.py \
-        --n 1000 --mcmc-iter 500 --gam-samples 100 --gam-warmup 50
+        --n 1000 --mcmc-iter 500 --gam-samples 100
 
 Writes ``outputs/benchmarks.json`` (the full metrics table) and, unless
 ``--no-plots`` is passed, ``outputs/benchmarks.png`` (a bar chart
@@ -14,10 +14,7 @@ Baselines included:
   * Cox proportional hazards (all covariates)
   * Naive logistic at t = 10 y
   * Naive MR-IVW edge recovery (Bonferroni on published PUBLISHED_MR)
-  * The full causal-pred pipeline (MrDAG -> DAGSLAM -> MCMC -> GAM)
-
-``--no-gam`` / ``--skip-causal-pred`` skip the full-pipeline entry so a
-quick sanity benchmark can run without fitting the GAM.
+  * The causal-pred stack (MrDAG -> DAGSLAM -> MCMC -> gamfit survival GAM)
 """
 
 from __future__ import annotations
@@ -126,13 +123,6 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--mcmc-iter", type=int, default=500)
     parser.add_argument("--mcmc-chains", type=int, default=1)
     parser.add_argument("--gam-samples", type=int, default=100)
-    parser.add_argument("--gam-warmup", type=int, default=50)
-    parser.add_argument(
-        "--no-gam", action="store_true", help="skip the full causal-pred pipeline entry"
-    )
-    parser.add_argument(
-        "--skip-causal-pred", action="store_true", help="alias for --no-gam"
-    )
     parser.add_argument(
         "--no-real-gwas",
         action="store_true",
@@ -144,8 +134,6 @@ def main(argv: list | None = None) -> int:
     args = parser.parse_args(argv)
 
     os.makedirs(args.output_dir, exist_ok=True)
-
-    skip_full = bool(args.no_gam or args.skip_causal_pred)
 
     rng = np.random.default_rng(args.seed)
     t0 = time.perf_counter()
@@ -160,11 +148,9 @@ def main(argv: list | None = None) -> int:
         data,
         t_grid=DEFAULT_T_GRID,
         auc_times=DEFAULT_AUC_TIMES,
-        run_full_pipeline=not skip_full,
         mcmc_iter=args.mcmc_iter,
         mcmc_chains=args.mcmc_chains,
         gam_samples=args.gam_samples,
-        gam_warmup=args.gam_warmup,
         use_real_gwas=not args.no_real_gwas,
         rng=np.random.default_rng(args.seed + 1),
     )
@@ -203,8 +189,6 @@ def main(argv: list | None = None) -> int:
             "mcmc_iter": args.mcmc_iter,
             "mcmc_chains": args.mcmc_chains,
             "gam_samples": args.gam_samples,
-            "gam_warmup": args.gam_warmup,
-            "skip_full_pipeline": skip_full,
             "use_real_gwas": not args.no_real_gwas,
         },
         "git_sha": _git_sha(ROOT),

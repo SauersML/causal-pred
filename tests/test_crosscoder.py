@@ -25,9 +25,15 @@ from causal_pred.genscore import (
     classify_features,
     encode,
     feature_stream_share,
+    reconstruct,
     train_crosscoder,
 )
-from causal_pred.genscore.crosscoder import _normalise_decoders
+from causal_pred.genscore.crosscoder import (
+    BANK_EHR_PRIVATE,
+    BANK_GENOME_PRIVATE,
+    _batch_topk_np,
+    _normalise_decoders,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +154,89 @@ def test_decoder_normalisation_unit_norm():
     np.testing.assert_allclose(norms, np.ones(d), atol=1e-10)
 
 
+def test_batch_topk_allows_variable_row_sparsity():
+    pre = np.array(
+        [
+            [9.0, 8.0, 7.0, 0.1],
+            [0.2, 0.1, 0.0, -1.0],
+            [6.0, 5.0, 4.0, 3.0],
+        ]
+    )
+    z, mask = _batch_topk_np(pre, k=2, row_cap_multiplier=4.0)
+    row_l0 = mask.sum(axis=1)
+    assert int(mask.sum()) == 6
+    assert row_l0.max() > row_l0.min()
+    assert np.all(z[~mask] == 0.0)
+
+
+def test_multiview_trainer_enforces_private_decoder_masks_and_logs_cross_metrics():
+    rng = np.random.default_rng(123)
+    A = rng.normal(size=(96, 5))
+    B = rng.normal(size=(96, 7))
+    model = train_crosscoder(
+        A=A,
+        B=B,
+        d=18,
+        k=3,
+        n_steps=8,
+        batch_size=24,
+        lr=1e-3,
+        log_every=4,
+        rng=np.random.default_rng(0),
+        device="cpu",
+        contrastive_coef=0.0,
+    )
+
+    assert np.allclose(model.W_d_E[model.latent_bank == BANK_GENOME_PRIVATE], 0.0)
+    assert np.allclose(model.W_d_G[model.latent_bank == BANK_EHR_PRIVATE], 0.0)
+    assert model.activation_kind == "batch_topk"
+    assert "loss_val" in model.history
+    assert "cross_r2_ehr_from_genome_val" in model.history
+    assert "cross_r2_genome_from_ehr_val" in model.history
+    assert "negative_control_margin_val" in model.history
+
+
+def test_mixed_likelihood_ranks_rare_binary_signal_better_than_gaussian_mse():
+    rng = np.random.default_rng(0)
+    n = 240
+    latent = rng.normal(size=n)
+    A = np.column_stack([
+        latent + 0.1 * rng.normal(size=n),
+        rng.normal(size=n),
+    ])
+    prob = 1.0 / (1.0 + np.exp(-4.0 * (latent - 1.5)))
+    B = (rng.random(n) < prob).astype(float).reshape(-1, 1)
+    assert 0.02 < float(B.mean()) < 0.15
+
+    kwargs = dict(
+        d=18,
+        k=3,
+        n_steps=40,
+        batch_size=48,
+        lr=2e-3,
+        log_every=40,
+        rng=np.random.default_rng(1),
+        device="cpu",
+        contrastive_coef=0.0,
+        validation_fraction=0.1,
+        ehr_feature_kinds=("condition",),
+    )
+    mixed = train_crosscoder(A, B, mixed_likelihood=True, **kwargs)
+    gaussian = train_crosscoder(
+        A,
+        B,
+        mixed_likelihood=False,
+        **{**kwargs, "rng": np.random.default_rng(1)},
+    )
+
+    def _score(model):
+        z = encode(model, A, B)
+        _a_hat, b_hat = reconstruct(model, z)
+        return float(np.corrcoef(b_hat[:, 0], B[:, 0])[0, 1])
+
+    assert _score(mixed) > _score(gaussian) + 0.02
+
+
 def test_crosscoder_checkpoint_resume_matches_uninterrupted_fit(tmp_path):
     rng = np.random.default_rng(123)
     A = rng.normal(size=(160, 5))
@@ -161,6 +250,8 @@ def test_crosscoder_checkpoint_resume_matches_uninterrupted_fit(tmp_path):
         n_steps=24,
         log_every=6,
         train_dtype="float32",
+        device="cpu",
+        contrastive_coef=0.0,
     )
 
     full = train_crosscoder(

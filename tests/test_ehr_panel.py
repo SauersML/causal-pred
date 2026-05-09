@@ -60,12 +60,15 @@ def test_baseline_strict_censoring_drops_post_baseline_events():
 
 
 def test_min_prevalence_filters_rare_groups():
-    """Drug groups touched by fewer than min_prevalence persons are dropped."""
+    """Rare groups and T2D treatment proxies are dropped."""
     person_ids = [f"p{i:03d}" for i in range(100)]
     baseline = _baseline_series(person_ids, ["2025-01-01"] * 100)
     rows = []
-    # Common: 60 persons receive metformin
+    # Common non-diabetes drug group is retained.
     for p in person_ids[:60]:
+        rows.append({"person_id": p, "atc_class": "B01AC", "datetime": "2024-06-01"})
+    # Common anti-diabetic ATC class is target-treatment leakage and removed.
+    for p in person_ids[:70]:
         rows.append({"person_id": p, "atc_class": "A10BA", "datetime": "2024-06-01"})
     # Rare: 5 persons receive a niche drug
     for p in person_ids[:5]:
@@ -77,8 +80,29 @@ def test_min_prevalence_filters_rare_groups():
         drug_long=drug,
         min_prevalence=10,
     )
-    assert "drug:A10BA" in panel.feature_names
+    assert "drug:B01AC" in panel.feature_names
+    assert "drug:A10BA" not in panel.feature_names
     assert "drug:X99XX" not in panel.feature_names
+
+
+def test_ehr_panel_blacklists_t2d_target_conditions():
+    person_ids = [f"p{i:03d}" for i in range(40)]
+    baseline = _baseline_series(person_ids, ["2025-01-01"] * 40)
+    rows = []
+    for p in person_ids:
+        rows.append({"person_id": p, "phecode": "201826", "datetime": "2024-01-01"})
+        rows.append({"person_id": p, "phecode": "hypertension", "datetime": "2024-01-01"})
+    cond = pd.DataFrame(rows)
+
+    panel = build_ehr_panel(
+        person_ids,
+        baseline,
+        condition_long=cond,
+        min_prevalence=5,
+    )
+
+    assert "cond:hypertension" in panel.feature_names
+    assert "cond:201826" not in panel.feature_names
 
 
 def test_lab_summary_slope_sign_matches_truth():
@@ -155,9 +179,12 @@ def test_lab_summary_accepts_bigquery_aggregates():
     assert "lab_mean:rare_lab" not in panel.feature_names
     j_mean = panel.feature_names.index("lab_mean:hba1c")
     j_slope = panel.feature_names.index("lab_slope:hba1c")
+    j_missing = panel.feature_names.index("lab_missing:hba1c")
     assert panel.matrix[0, j_mean] == pytest.approx(6.0)
     assert np.isfinite(panel.matrix[:, j_slope]).all()
     assert panel.matrix[20, j_slope] == pytest.approx(0.1)
+    assert panel.matrix[0, j_missing] == 0.0
+    assert panel.matrix[-1, j_missing] == 1.0
 
 
 def test_utilisation_counts_pre_baseline_encounters_only():

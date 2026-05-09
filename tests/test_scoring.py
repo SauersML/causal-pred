@@ -17,6 +17,7 @@ import math
 import time
 
 import numpy as np
+import pytest
 
 from causal_pred.scoring.mixed import (
     _BGeWorkspace,
@@ -54,6 +55,10 @@ def _is_dag(adj: np.ndarray) -> bool:
         A[r, :] = 0
         A[:, r] = 0
     return True
+
+
+def _survival_hyper(data) -> dict:
+    return {"survival_time": data.time, "survival_event": data.event}
 
 
 # ---------------------------------------------------------------------------
@@ -257,15 +262,15 @@ def test_score_is_finite(small_data):
     rng = np.random.default_rng(0)
     p = small_data.p
     adj = _random_acyclic_adj(p, density=0.15, rng=rng)
-    s = score_dag(adj, small_data.X, small_data.node_types)
+    s = score_dag(adj, small_data.X, small_data.node_types, **_survival_hyper(small_data))
     assert np.isfinite(s)
 
 
 def test_true_dag_beats_empty(small_data):
     adj_true = small_data.ground_truth_adj
     adj_empty = np.zeros_like(adj_true)
-    s_true = score_dag(adj_true, small_data.X, small_data.node_types)
-    s_empty = score_dag(adj_empty, small_data.X, small_data.node_types)
+    s_true = score_dag(adj_true, small_data.X, small_data.node_types, **_survival_hyper(small_data))
+    s_empty = score_dag(adj_empty, small_data.X, small_data.node_types, **_survival_hyper(small_data))
     assert s_true - s_empty > 200.0, (
         f"truth {s_true:.2f} vs empty {s_empty:.2f} gap too small"
     )
@@ -287,11 +292,11 @@ def _pick_addable_edge(adj):
 def test_add_edge_delta_matches_full_rescore(small_data):
     adj = small_data.ground_truth_adj.copy()
     i, j = _pick_addable_edge(adj)
-    s_before = score_dag(adj, small_data.X, small_data.node_types)
-    delta = score_delta_add_edge(i, j, adj, small_data.X, small_data.node_types)
+    s_before = score_dag(adj, small_data.X, small_data.node_types, **_survival_hyper(small_data))
+    delta = score_delta_add_edge(i, j, adj, small_data.X, small_data.node_types, **_survival_hyper(small_data))
     adj2 = adj.copy()
     adj2[i, j] = 1
-    s_after = score_dag(adj2, small_data.X, small_data.node_types)
+    s_after = score_dag(adj2, small_data.X, small_data.node_types, **_survival_hyper(small_data))
     assert abs((s_after - s_before) - delta) < 1e-8
 
 
@@ -299,11 +304,11 @@ def test_remove_edge_delta_matches_full_rescore(small_data):
     adj = small_data.ground_truth_adj.copy()
     idx = np.argwhere(adj == 1)
     i, j = int(idx[0, 0]), int(idx[0, 1])
-    s_before = score_dag(adj, small_data.X, small_data.node_types)
-    delta = score_delta_remove_edge(i, j, adj, small_data.X, small_data.node_types)
+    s_before = score_dag(adj, small_data.X, small_data.node_types, **_survival_hyper(small_data))
+    delta = score_delta_remove_edge(i, j, adj, small_data.X, small_data.node_types, **_survival_hyper(small_data))
     adj2 = adj.copy()
     adj2[i, j] = 0
-    s_after = score_dag(adj2, small_data.X, small_data.node_types)
+    s_after = score_dag(adj2, small_data.X, small_data.node_types, **_survival_hyper(small_data))
     assert abs((s_after - s_before) - delta) < 1e-8
 
 
@@ -316,9 +321,14 @@ def test_reverse_edge_delta_matches_full_rescore(small_data):
     adj_rev[j, i] = 1
     assert _is_dag(adj_rev), "this ground-truth edge can't be cleanly reversed"
 
-    s_before = score_dag(adj, small_data.X, small_data.node_types)
-    delta = score_delta_reverse_edge(i, j, adj, small_data.X, small_data.node_types)
-    s_after = score_dag(adj_rev, small_data.X, small_data.node_types)
+    s_before = score_dag(adj, small_data.X, small_data.node_types, **_survival_hyper(small_data))
+    delta = score_delta_reverse_edge(i, j, adj, small_data.X, small_data.node_types, **_survival_hyper(small_data))
+    s_after = score_dag(
+        adj_rev,
+        small_data.X,
+        small_data.node_types,
+        **_survival_hyper(small_data),
+    )
     assert abs((s_after - s_before) - delta) < 1e-8
 
 
@@ -331,21 +341,22 @@ def test_delta_exact_match(small_data):
 
     # Add
     i, j = _pick_addable_edge(adj)
-    s0 = score_dag(adj, X, nt)
-    d = score_delta_add_edge(i, j, adj, X, nt)
+    h = _survival_hyper(small_data)
+    s0 = score_dag(adj, X, nt, **h)
+    d = score_delta_add_edge(i, j, adj, X, nt, **h)
     adj2 = adj.copy()
     adj2[i, j] = 1
-    s1 = score_dag(adj2, X, nt)
+    s1 = score_dag(adj2, X, nt, **h)
     assert abs((s1 - s0) - d) < 1e-8
 
     # Remove
     idx = np.argwhere(adj == 1)
     ii, jj = int(idx[-1, 0]), int(idx[-1, 1])
-    s0 = score_dag(adj, X, nt)
-    d = score_delta_remove_edge(ii, jj, adj, X, nt)
+    s0 = score_dag(adj, X, nt, **h)
+    d = score_delta_remove_edge(ii, jj, adj, X, nt, **h)
     adj2 = adj.copy()
     adj2[ii, jj] = 0
-    s1 = score_dag(adj2, X, nt)
+    s1 = score_dag(adj2, X, nt, **h)
     assert abs((s1 - s0) - d) < 1e-8
 
 
@@ -374,8 +385,9 @@ def test_insensitive_to_column_order(small_data):
     for op, oc in zip(*np.where(adj == 1)):
         adj_perm[inv[op], inv[oc]] = 1
 
-    s_orig = score_dag(adj, X, nt)
-    s_perm = score_dag(adj_perm, X_perm, nt_perm)
+    h = _survival_hyper(small_data)
+    s_orig = score_dag(adj, X, nt, **h)
+    s_perm = score_dag(adj_perm, X_perm, nt_perm, **h)
 
     assert abs(s_orig - s_perm) < 1e-6, f"{s_orig} vs {s_perm}"
 
@@ -388,10 +400,10 @@ def test_cache_hit_speeds_up(medium_data):
     adj = medium_data.ground_truth_adj
     cache = {}
     t0 = time.perf_counter()
-    s1 = score_dag(adj, medium_data.X, medium_data.node_types, cache=cache)
+    s1 = score_dag(adj, medium_data.X, medium_data.node_types, cache=cache, **_survival_hyper(medium_data))
     t_cold = time.perf_counter() - t0
     t0 = time.perf_counter()
-    s2 = score_dag(adj, medium_data.X, medium_data.node_types, cache=cache)
+    s2 = score_dag(adj, medium_data.X, medium_data.node_types, cache=cache, **_survival_hyper(medium_data))
     t_warm = time.perf_counter() - t0
     assert s1 == s2
     assert t_warm < 0.05 * t_cold, (
@@ -399,14 +411,32 @@ def test_cache_hit_speeds_up(medium_data):
     )
 
 
+def test_score_cache_rejects_different_data_or_hyperparameters(medium_data):
+    cache = {}
+    h = _survival_hyper(medium_data)
+    score_node(0, [], medium_data.X, medium_data.node_types, cache=cache, **h)
+
+    changed_data = medium_data.X.copy()
+    changed_data[:, 0] += 0.1
+    with pytest.raises(ValueError, match="score cache was reused"):
+        score_node(0, [], changed_data, medium_data.node_types, cache=cache, **h)
+
+    cache = {}
+    score_node(0, [], medium_data.X, medium_data.node_types, cache=cache, **h)
+    changed_h = dict(h)
+    changed_h["alpha_mu"] = 2.0
+    with pytest.raises(ValueError, match="score cache was reused"):
+        score_node(0, [], medium_data.X, medium_data.node_types, cache=cache, **changed_h)
+
+
 def test_runtime_budget(medium_data):
     adj = medium_data.ground_truth_adj
     cache = {}
     t0 = time.perf_counter()
-    score_dag(adj, medium_data.X, medium_data.node_types, cache=cache)
+    score_dag(adj, medium_data.X, medium_data.node_types, cache=cache, **_survival_hyper(medium_data))
     t_cold = time.perf_counter() - t0
     t0 = time.perf_counter()
-    score_dag(adj, medium_data.X, medium_data.node_types, cache=cache)
+    score_dag(adj, medium_data.X, medium_data.node_types, cache=cache, **_survival_hyper(medium_data))
     t_warm = time.perf_counter() - t0
     assert t_cold < 1.0, f"cold rescore too slow: {t_cold*1e3:.1f}ms"
     assert t_warm < 0.010, f"warm rescore too slow: {t_warm*1e3:.1f}ms"

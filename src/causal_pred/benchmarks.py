@@ -7,14 +7,13 @@ report and bar chart.  The baselines are:
   * ``run_kaplan_meier``: marginal survival with no covariates.
   * ``run_cox_ph``: Cox proportional-hazards regression on all covariates
     except the T2D indicator.
-  * ``run_naive_logistic``: sklearn logistic regression predicting
-    ``(time <= 10y) & (event == 1)``.
+  * ``run_naive_logistic``: sklearn logistic regression predicting an
+    IPCW fixed-horizon 10-year endpoint.
   * ``run_mr_ivw``: causal-edge classifier using the published MR-IVW
     estimates in :mod:`causal_pred.data.real_gwas` with a Bonferroni
     cut-off.
-  * ``run_causal_pred``: the full pipeline (imports :mod:`causal_pred.pipeline`).
-    Allowed to return ``{"status": "skipped", ...}`` if MCMC/GAM stages
-    are unavailable.
+  * ``run_causal_pred``: synthetic-data run of the causal-pred stack:
+    MrDAG priors -> DAGSLAM -> structure MCMC -> gamfit survival GAM.
 
 Metrics computed (where defined):
   * Nagelkerke R^2 at t=10 y from the predicted survival.
@@ -36,9 +35,18 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
-from .data.nodes import NODE_INDEX, NODE_NAMES, CANONICAL_EDGES
+from .data.nodes import NODE_INDEX, NODE_NAMES, NODE_TYPES, NODES, CANONICAL_EDGES
 from .data.synthetic import SyntheticDataset
-from .data.real_gwas import PUBLISHED_MR, LITERATURE_UNAVAILABLE, CIRCULAR_PAIRS
+from .data.gwas import simulate_gwas
+from .data.real_gwas import (
+    PUBLISHED_MR,
+    LITERATURE_UNAVAILABLE,
+    CIRCULAR_PAIRS,
+    load_real_gwas,
+)
+from .dagslam import run_dagslam
+from .mcmc import run_structure_mcmc
+from .mrdag import run_mrdag
 from .validation import nagelkerke_r2, time_dependent_auc, brier_score
 
 
@@ -51,6 +59,32 @@ DEFAULT_T_GRID = np.linspace(0.5, 20.0, 40)
 
 #: Default time-points for time-dependent AUC reporting.
 DEFAULT_AUC_TIMES = (5.0, 10.0, 15.0)
+
+
+def _train_test_indices(
+    event: np.ndarray,
+    test_fraction: float = 0.3,
+    seed: int = 20260416,
+) -> tuple[np.ndarray, np.ndarray]:
+    e = np.asarray(event, dtype=int).ravel()
+    rng = np.random.default_rng(seed)
+    train_parts = []
+    test_parts = []
+    for value in (0, 1):
+        idx = np.flatnonzero(e == value)
+        rng.shuffle(idx)
+        if idx.size == 0:
+            continue
+        n_test = max(1, int(round(test_fraction * idx.size))) if idx.size > 1 else 0
+        test_parts.append(idx[:n_test])
+        train_parts.append(idx[n_test:])
+    train = np.concatenate(train_parts) if train_parts else np.arange(e.size)
+    test = np.concatenate(test_parts) if test_parts else np.zeros(0, dtype=int)
+    if train.size == 0 or test.size == 0:
+        raise ValueError("benchmark split produced an empty train or test set")
+    train.sort()
+    test.sort()
+    return train, test
 
 
 def _covariate_matrix(data: SyntheticDataset) -> Tuple[np.ndarray, list]:
@@ -92,6 +126,44 @@ def _surv_at_times(surv: np.ndarray, t_grid: np.ndarray, times: Sequence[float])
     return out
 
 
+def _determined_horizon_status(
+    time: np.ndarray,
+    event: np.ndarray,
+    horizon: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    t = np.asarray(time, dtype=float).ravel()
+    e = np.asarray(event, dtype=int).ravel()
+    indeterminate = (t < horizon) & (e == 0)
+    determined = ~indeterminate
+    y = ((t[determined] <= horizon) & (e[determined] == 1)).astype(int)
+    return y, determined
+
+
+def _horizon_ipcw_training_endpoint(
+    time: np.ndarray,
+    event: np.ndarray,
+    horizon: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    t = np.asarray(time, dtype=float).ravel()
+    e = np.asarray(event, dtype=int).ravel()
+    case = (t <= horizon) & (e == 1)
+    control = t > horizon
+    keep = case | control
+    if not np.any(keep):
+        raise ValueError("no determined rows for fixed-horizon logistic baseline")
+
+    cens = 1 - e
+    km_t, km_s = _km(t, cens)
+    g_t_minus = _km_eval(km_t, km_s, np.nextafter(t, -np.inf))
+    g_horizon = float(_km_eval(km_t, km_s, np.asarray([horizon]))[0])
+    eps = 1e-8
+    weights = np.zeros_like(t, dtype=float)
+    weights[case] = 1.0 / np.clip(g_t_minus[case], eps, 1.0)
+    weights[control] = 1.0 / np.clip(g_horizon, eps, 1.0)
+    y = case[keep].astype(int)
+    return y, weights[keep], keep
+
+
 def _surv_metrics(
     time: np.ndarray,
     event: np.ndarray,
@@ -103,8 +175,11 @@ def _surv_metrics(
     """Compute Nagelkerke R^2 at ``eval_t``, td-AUC, and IBS from a survival
     matrix ``surv`` of shape ``(n, len(t_grid))``."""
     p_event = 1.0 - _surv_at_times(surv, t_grid, [eval_t])[:, 0]
-    y_event = ((time <= eval_t) & (event == 1)).astype(int)
-    r2 = nagelkerke_r2(y_event, p_event) if y_event.sum() > 0 else float("nan")
+    y_event, determined = _determined_horizon_status(time, event, eval_t)
+    if y_event.size > 0 and 0 < int(y_event.sum()) < y_event.size:
+        r2 = nagelkerke_r2(y_event, p_event[determined])
+    else:
+        r2 = float("nan")
 
     auc_surv = _surv_at_times(surv, t_grid, auc_times)
     td = time_dependent_auc(
@@ -125,6 +200,8 @@ def _surv_metrics(
         "ibs": float(br["ibs"]),
         "ibs_km": float(br["ibs_km"]),
         "scaled_brier": float(br["scaled_brier"]),
+        "nagelkerke_n_used": int(determined.sum()),
+        "nagelkerke_n_indeterminate": int((~determined).sum()),
     }
 
 
@@ -178,12 +255,22 @@ def run_kaplan_meier(
     them anyway for completeness.
     """
     t0 = time.perf_counter()
-    uniq, S = _km(data.time, data.event)
+    train_idx, test_idx = _train_test_indices(data.event)
+    uniq, S = _km(data.time[train_idx], data.event[train_idx])
     S_grid = _km_eval(uniq, S, t_grid)  # (n_t,)
-    surv = np.broadcast_to(S_grid, (data.n, t_grid.size)).copy()
-    metrics = _surv_metrics(data.time, data.event, surv, t_grid, auc_times=auc_times)
+    surv = np.broadcast_to(S_grid, (test_idx.size, t_grid.size)).copy()
+    metrics = _surv_metrics(
+        data.time[test_idx],
+        data.event[test_idx],
+        surv,
+        t_grid,
+        auc_times=auc_times,
+    )
     metrics["runtime_s"] = float(time.perf_counter() - t0)
     metrics["model"] = "kaplan_meier"
+    metrics["evaluation"] = "held_out"
+    metrics["n_train"] = int(train_idx.size)
+    metrics["n_test"] = int(test_idx.size)
     metrics["note"] = (
         "Population-level marginal survival; identical prediction per "
         "individual, so Nagelkerke R^2 and AUC are not meaningful."
@@ -206,20 +293,24 @@ def run_cox_ph(
 
     t0 = time.perf_counter()
     X, names = _covariate_matrix(data)
+    train_idx, test_idx = _train_test_indices(data.event)
+    X_train = X[train_idx]
+    X_test = X[test_idx]
 
     # Standardise continuous columns for numerical stability (Cox PH is
     # scale-invariant on the hazard ratio but the solver is not).
-    mu = X.mean(axis=0)
-    sd = X.std(axis=0)
+    mu = X_train.mean(axis=0)
+    sd = X_train.std(axis=0)
     sd = np.where(sd > 0, sd, 1.0)
-    Xs = (X - mu) / sd
+    Xs_train = (X_train - mu) / sd
+    Xs_test = (X_test - mu) / sd
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         model = PHReg(
-            endog=data.time.astype(float),
-            exog=Xs,
-            status=data.event.astype(float),
+            endog=data.time[train_idx].astype(float),
+            exog=Xs_train,
+            status=data.event[train_idx].astype(float),
             ties="breslow",
         )
         fit = model.fit(method="bfgs", disp=0, maxiter=200)
@@ -230,16 +321,25 @@ def run_cox_ph(
     bch = fit.baseline_cumulative_hazard_function[0]
     H0_grid = np.asarray(bch(t_grid), dtype=float)  # (n_t,)
 
-    lp = Xs @ fit.params  # linear predictor (n,)
+    lp = Xs_test @ fit.params  # linear predictor (n_test,)
     # S(t | X) = exp(-H0(t) * exp(lp))
     exp_lp = np.exp(lp)
     # broadcasting: (n, n_t) = exp(-H0(t)[None, :] * exp_lp[:, None])
     surv = np.exp(-np.outer(exp_lp, H0_grid))
     surv = np.clip(surv, 1e-9, 1.0)
 
-    metrics = _surv_metrics(data.time, data.event, surv, t_grid, auc_times=auc_times)
+    metrics = _surv_metrics(
+        data.time[test_idx],
+        data.event[test_idx],
+        surv,
+        t_grid,
+        auc_times=auc_times,
+    )
     metrics["runtime_s"] = float(time.perf_counter() - t0)
     metrics["model"] = "cox_ph"
+    metrics["evaluation"] = "held_out"
+    metrics["n_train"] = int(train_idx.size)
+    metrics["n_test"] = int(test_idx.size)
     metrics["covariates"] = names
     metrics["n_params"] = int(fit.params.size)
     metrics["llf"] = float(fit.llf)
@@ -267,18 +367,26 @@ def run_naive_logistic(
     """
     t0 = time.perf_counter()
     X, names = _covariate_matrix(data)
+    train_idx, test_idx = _train_test_indices(data.event)
 
-    y = ((data.time <= t_eval) & (data.event == 1)).astype(int)
+    y_train, w_train, keep_train = _horizon_ipcw_training_endpoint(
+        data.time[train_idx],
+        data.event[train_idx],
+        t_eval,
+    )
+    X_train = X[train_idx][keep_train]
+    X_test = X[test_idx]
 
-    scaler = StandardScaler().fit(X)
-    Xs = scaler.transform(X)
+    scaler = StandardScaler().fit(X_train)
+    Xs_train = scaler.transform(X_train)
+    Xs_test = scaler.transform(X_test)
 
     # ``max_iter=500`` to suppress convergence warnings on harder folds.
     # No regularisation tuning -- we keep the baseline "naive".
     clf = LogisticRegression(max_iter=500, C=1.0, solver="lbfgs")
-    clf.fit(Xs, y)
+    clf.fit(Xs_train, y_train, sample_weight=w_train)
 
-    p10 = clf.predict_proba(Xs)[:, 1]
+    p10 = clf.predict_proba(Xs_test)[:, 1]
     p10 = np.clip(p10, 1e-6, 1.0 - 1e-6)
 
     # Construct a survival curve S(t) = (1 - p10)^((t / t_eval)^shape).
@@ -293,16 +401,27 @@ def run_naive_logistic(
 
     # Compute Nagelkerke directly on the classifier's 10y probability (it
     # is exactly the model's target).
-    r2 = nagelkerke_r2(y, p10)
+    y_test, determined_test = _determined_horizon_status(
+        data.time[test_idx],
+        data.event[test_idx],
+        t_eval,
+    )
+    if y_test.size > 0 and 0 < int(y_test.sum()) < y_test.size:
+        r2 = nagelkerke_r2(y_test, p10[determined_test])
+    else:
+        r2 = float("nan")
     auc_surv = _surv_at_times(surv, t_grid, auc_times)
     td = time_dependent_auc(
-        time=data.time,
-        event=data.event,
+        time=data.time[test_idx],
+        event=data.event[test_idx],
         risk_score=1.0 - auc_surv,
         eval_times=np.array(auc_times, dtype=float),
     )
     br = brier_score(
-        time=data.time, event=data.event, survival_pred=surv, eval_times=t_grid
+        time=data.time[test_idx],
+        event=data.event[test_idx],
+        survival_pred=surv,
+        eval_times=t_grid,
     )
 
     out = {
@@ -317,8 +436,13 @@ def run_naive_logistic(
         "scaled_brier": float(br["scaled_brier"]),
         "runtime_s": float(time.perf_counter() - t0),
         "model": "naive_logistic",
+        "evaluation": "held_out",
         "covariates": names,
-        "n_positives": int(y.sum()),
+        "n_train": int(train_idx.size),
+        "n_test": int(test_idx.size),
+        "n_train_determined": int(keep_train.sum()),
+        "n_test_determined": int(determined_test.sum()),
+        "n_positives": int(y_train.sum()),
         "t_eval": t_eval,
     }
     return out
@@ -441,36 +565,243 @@ def run_causal_pred(
     mcmc_iter: int = 500,
     mcmc_chains: int = 1,
     gam_samples: int = 100,
-    gam_warmup: int = 50,
     use_real_gwas: bool = True,
     t_grid: np.ndarray = DEFAULT_T_GRID,
     auc_times: Sequence[float] = DEFAULT_AUC_TIMES,
     rng: Optional[np.random.Generator] = None,
 ) -> dict:
-    """Return the causal-pred benchmark row for the synthetic benchmark.
+    """Run the causal-pred stack on the synthetic benchmark data.
 
-    The production causal-pred path now has one fixed AoU entry point
-    (``scripts/run_full_pipeline.py``) because it must align the cohort CSV
-    with microarray-derived PRS. It is not a synthetic-data injectable
-    baseline, so the benchmark records that distinction explicitly.
+    The benchmark uses the same model families as production while keeping
+    the input synthetic-data native: MrDAG supplies edge priors, DAGSLAM
+    gives a warm-start DAG, structure MCMC samples parent sets, and gamfit
+    fits held-out survival curves for the sampled T2D parent sets.
     """
     t0 = time.perf_counter()
-    _ = (
-        data,
-        mcmc_iter,
-        mcmc_chains,
-        gam_samples,
-        gam_warmup,
-        use_real_gwas,
-        t_grid,
-        auc_times,
-        rng,
+    if rng is None:
+        rng = np.random.default_rng(20260416)
+    if tuple(data.columns) != tuple(NODE_NAMES):
+        raise ValueError("causal-pred benchmark requires synthetic NODE_NAMES order")
+    if tuple(data.node_types) != tuple(NODE_TYPES):
+        raise ValueError("causal-pred benchmark requires synthetic NODE_TYPES")
+
+    train_idx, test_idx = _train_test_indices(data.event)
+    X_train = np.asarray(data.X[train_idx], dtype=float)
+    X_test = np.asarray(data.X[test_idx], dtype=float)
+    allowed_edges = _benchmark_allowed_edges(data.columns, data.node_types)
+
+    gwas = load_real_gwas() if use_real_gwas else simulate_gwas(rng=rng)
+    mrdag_iter = max(80, min(1000, int(mcmc_iter) * 4))
+    mrdag_burn = max(20, min(mrdag_iter // 2, mrdag_iter // 5))
+    mrdag_thin = max(1, (mrdag_iter - mrdag_burn) // max(20, int(mcmc_iter)))
+    mrdag = run_mrdag(
+        gwas,
+        rng=rng,
+        n_iter=mrdag_iter,
+        n_chains=max(1, int(mcmc_chains)),
+        n_burn=mrdag_burn,
+        thin=mrdag_thin,
     )
+    pi_prior = np.asarray(mrdag.pi, dtype=float)
+
+    dagslam = run_dagslam(
+        data=X_train,
+        node_types=data.node_types,
+        max_parents=3,
+        max_iter=max(25, min(500, int(mcmc_iter))),
+        restarts=1,
+        rng=rng,
+        pi_prior=pi_prior,
+        allowed_edges=allowed_edges,
+        survival_time=data.time[train_idx],
+        survival_event=data.event[train_idx],
+        survival_horizon=10.0,
+    )
+
+    n_graph_samples = max(1, int(mcmc_iter))
+    mcmc = run_structure_mcmc(
+        data=X_train,
+        node_types=data.node_types,
+        start_adj=dagslam.adjacency,
+        pi_prior=pi_prior,
+        n_samples=n_graph_samples,
+        burn_in=max(5, min(100, n_graph_samples // 2)),
+        thin=1,
+        n_chains=max(1, int(mcmc_chains)),
+        rng=rng,
+        perturb_flips=2,
+        hybrid_prob=0.1,
+        edge_resample_prob=0.2,
+        block_resample_prob=0.0,
+        exact_parent_resample=False,
+        max_parents=3,
+        allowed_edges=allowed_edges,
+        survival_time=data.time[train_idx],
+        survival_event=data.event[train_idx],
+        survival_horizon=10.0,
+    )
+    samples = (
+        np.stack(mcmc.samples, axis=0).astype(np.int8)
+        if mcmc.samples
+        else np.zeros((0, data.p, data.p), dtype=np.int8)
+    )
+    target_idx = NODE_INDEX["T2D"]
+    parent_sets, weights, parent_counts = _sampled_parent_sets(
+        samples,
+        target_idx=target_idx,
+        edge_probs=np.asarray(mcmc.edge_probs, dtype=float),
+        top_k=3,
+    )
+
+    from .gam.survival import fit_survival_gam
+
+    per_model = []
+    parent_set_rows = []
+    fit_summaries = []
+    gam_t0 = time.perf_counter()
+    for parent_set, weight, count in zip(parent_sets, weights, parent_counts):
+        cols = tuple(data.columns[i] for i in parent_set)
+        train_X_ps = (
+            X_train[:, list(parent_set)]
+            if parent_set
+            else np.zeros((train_idx.size, 0), dtype=float)
+        )
+        test_X_ps = (
+            X_test[:, list(parent_set)]
+            if parent_set
+            else np.zeros((test_idx.size, 0), dtype=float)
+        )
+        fit = fit_survival_gam(
+            data.time[train_idx],
+            data.event[train_idx],
+            train_X_ps,
+            columns=cols,
+            n_uncertainty_slices=max(1, int(gam_samples)),
+            progress=False,
+        )
+        per_model.append(fit.predict_survival_mean(test_X_ps, t_grid))
+        diag = fit.posterior_summary()
+        diag["parent_columns"] = list(cols)
+        diag["posterior_parent_set_weight"] = float(weight)
+        diag["posterior_parent_set_count"] = int(count)
+        fit_summaries.append(diag)
+        parent_set_rows.append(
+            {
+                "columns": list(cols),
+                "weight": float(weight),
+                "count": int(count),
+            }
+        )
+
+    stack = np.stack(per_model, axis=0)
+    survival = np.einsum("k,knt->nt", weights, stack)
+    metrics = _surv_metrics(
+        data.time[test_idx],
+        data.event[test_idx],
+        survival,
+        t_grid,
+        auc_times=auc_times,
+    )
+    edge_metrics = _edge_recovery_from_probs(
+        np.asarray(mcmc.edge_probs, dtype=float),
+        data.ground_truth_adj,
+        allowed_edges,
+    )
+    metrics.update(edge_metrics)
+    metrics.update(
+        {
+            "model": "causal_pred",
+            "backend": "gamfit",
+            "evaluation": "held_out",
+            "n_train": int(train_idx.size),
+            "n_test": int(test_idx.size),
+            "runtime_s": float(time.perf_counter() - t0),
+            "gam_runtime_s": float(time.perf_counter() - gam_t0),
+            "gwas_source": "literature" if use_real_gwas else "simulated",
+            "mrdag_n_candidate_edges": int(
+                mrdag.diagnostics.get("n_candidate_edges", 0)
+            ),
+            "dagslam_n_edges": int(dagslam.n_edges),
+            "dagslam_log_score": float(dagslam.log_score),
+            "mcmc_n_samples": int(samples.shape[0]),
+            "mcmc_accept_rate": dict(mcmc.diagnostics.get("accept_rate", {})),
+            "mcmc_max_rhat_skeleton": float(
+                mcmc.diagnostics.get("max_rhat_skeleton", float("nan"))
+            ),
+            "parent_sets": parent_set_rows,
+            "gam_fit_summaries": fit_summaries,
+        }
+    )
+    return metrics
+
+
+def _benchmark_allowed_edges(
+    columns: Sequence[str],
+    node_types: Sequence[str],
+) -> np.ndarray:
+    p = len(columns)
+    allowed = np.ones((p, p), dtype=bool)
+    np.fill_diagonal(allowed, False)
+    exogenous = {node.name for node in NODES if node.exogenous}
+    for i, (name, kind) in enumerate(zip(columns, node_types)):
+        if str(kind) == "survival":
+            allowed[i, :] = False
+        if str(name) in exogenous:
+            allowed[:, i] = False
+    np.fill_diagonal(allowed, False)
+    return allowed
+
+
+def _sampled_parent_sets(
+    samples: np.ndarray,
+    target_idx: int,
+    edge_probs: np.ndarray,
+    top_k: int,
+) -> tuple[list[tuple[int, ...]], np.ndarray, list[int]]:
+    counts: dict[tuple[int, ...], int] = {}
+    for sample in samples:
+        parents = tuple(int(i) for i in np.flatnonzero(sample[:, target_idx]))
+        parents = tuple(i for i in parents if i != target_idx)
+        counts[parents] = counts.get(parents, 0) + 1
+
+    if not counts:
+        probs = np.asarray(edge_probs[:, target_idx], dtype=float).copy()
+        probs[target_idx] = 0.0
+        parents = tuple(int(i) for i in np.argsort(-probs)[:3] if probs[i] > 0.0)
+        counts[parents] = 1
+
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:top_k]
+    parent_sets = [k for k, _v in ranked]
+    raw_counts = [int(v) for _k, v in ranked]
+    weights = np.asarray(raw_counts, dtype=float)
+    weights /= float(weights.sum())
+    return parent_sets, weights, raw_counts
+
+
+def _edge_recovery_from_probs(
+    edge_probs: np.ndarray,
+    ground_truth_adj: np.ndarray,
+    allowed_edges: np.ndarray,
+) -> dict:
+    from .validation.known_edges import _auprc, _auroc
+
+    p = edge_probs.shape[0]
+    off_diag = ~np.eye(p, dtype=bool)
+    mask = off_diag & np.asarray(allowed_edges, dtype=bool)
+    scores = np.asarray(edge_probs, dtype=float)[mask]
+    labels = np.asarray(ground_truth_adj, dtype=bool)[mask]
+    if scores.size == 0 or labels.sum() == 0 or labels.sum() == labels.size:
+        return {
+            "edge_auroc": float("nan"),
+            "edge_auprc": float("nan"),
+            "edge_n_eval": int(scores.size),
+            "edge_n_positive": int(labels.sum()),
+        }
     return {
-        "model": "causal_pred",
-        "status": "skipped",
-        "reason": "production path requires AoU cohort + microarray PRS; run scripts/run_full_pipeline.py",
-        "runtime_s": float(time.perf_counter() - t0),
+        "edge_auroc": float(_auroc(scores, labels)),
+        "edge_auprc": float(_auprc(scores, labels)),
+        "edge_n_eval": int(scores.size),
+        "edge_n_positive": int(labels.sum()),
     }
 
 
@@ -483,11 +814,9 @@ def run_all_baselines(
     data: SyntheticDataset,
     t_grid: np.ndarray = DEFAULT_T_GRID,
     auc_times: Sequence[float] = DEFAULT_AUC_TIMES,
-    run_full_pipeline: bool = True,
     mcmc_iter: int = 500,
     mcmc_chains: int = 1,
     gam_samples: int = 100,
-    gam_warmup: int = 50,
     use_real_gwas: bool = True,
     rng: Optional[np.random.Generator] = None,
 ) -> dict:
@@ -498,24 +827,16 @@ def run_all_baselines(
         "naive_logistic": run_naive_logistic(data, t_grid=t_grid, auc_times=auc_times),
         "mr_ivw": run_mr_ivw(),
     }
-    if run_full_pipeline:
-        out["causal_pred"] = run_causal_pred(
-            data,
-            mcmc_iter=mcmc_iter,
-            mcmc_chains=mcmc_chains,
-            gam_samples=gam_samples,
-            gam_warmup=gam_warmup,
-            use_real_gwas=use_real_gwas,
-            t_grid=t_grid,
-            auc_times=auc_times,
-            rng=rng,
-        )
-    else:
-        out["causal_pred"] = {
-            "model": "causal_pred",
-            "status": "skipped",
-            "reason": "run_full_pipeline=False",
-        }
+    out["causal_pred"] = run_causal_pred(
+        data,
+        mcmc_iter=mcmc_iter,
+        mcmc_chains=mcmc_chains,
+        gam_samples=gam_samples,
+        use_real_gwas=use_real_gwas,
+        t_grid=t_grid,
+        auc_times=auc_times,
+        rng=rng,
+    )
     return out
 
 

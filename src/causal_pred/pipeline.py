@@ -57,7 +57,6 @@ from .data.opengwas import load_live_gwas
 from .data.real_gwas import load_real_gwas
 from .data.synthetic import SyntheticDataset
 from .dagslam import run_dagslam
-from .gam.survival import fit_survival_gam
 from .genscore.integrate import run_genscore
 from .genscore.panels import download_panel
 from .mcmc import run_structure_mcmc
@@ -77,12 +76,12 @@ DEFAULT_OUTPUT_DIR = str(REPO_ROOT / "outputs")
 
 WORKSPACE_CACHE_PREFIX = "intermediates/causal-pred"
 WORKSPACE_RESULTS_PREFIX = "results/causal-pred/latest"
-PRS_PANEL_FILENAME = "aou_prs_panel.csv.gz"
 PGS_PANEL_DIRNAME = "pgs_panel"
+PRS_PANEL_CACHE_DIRNAME = "prs_panel_cache"
 GNOMON_OUT_DIRNAME = "gnomon_score"
 GENOTYPE_CACHE_DIR = str(Path.home() / "causal-pred" / "genomes")
 
-PIPELINE_CONFIG_VERSION = "2026-05-09.metrics-eligible-cache.1"
+PIPELINE_CONFIG_VERSION = "2026-05-09.survival-gamfit-uncertainty.1"
 PIPELINE_SEED = 20260416
 PIPELINE_VERBOSE = False
 
@@ -101,15 +100,16 @@ DAGSLAM_MAX_PARENTS = 3
 DAGSLAM_MAX_ITER = 500
 DAGSLAM_RESTARTS = 3
 
-MCMC_SAMPLES = 1500
-MCMC_BURN_IN = 500
-MCMC_THIN = 10
-MCMC_CHAINS = 4
+MCMC_SAMPLES = 500
+MCMC_BURN_IN = 250
+MCMC_THIN = 2
+MCMC_CHAINS = 2
 MCMC_BLOCK_RESAMPLE_PROB = 0.0
-MCMC_EDGE_RESAMPLE_PROB = 0.7
-MCMC_PARENT_RESAMPLE_PROB = 0.2
+MCMC_EDGE_RESAMPLE_PROB = 0.9
+MCMC_PARENT_RESAMPLE_PROB = 0.05
 MCMC_BLOCK_SIZE = 3
 MCMC_EXACT_PARENT_RESAMPLE = True
+MCMC_PROGRESS_INTERVAL = 100
 THRESHOLD_DEFAULT = 0.5
 
 VALIDATION_N_PERMUTE = 200
@@ -130,15 +130,21 @@ GENSCORE_GENOME_SHARE_MIN = 0.2
 GENSCORE_GENOME_SHARE_MAX = 0.8
 GENSCORE_MIN_ACTIVATION_RATE = 0.01
 GENSCORE_CROSSCODER_KWARGS = {
-    "d": 512,
+    "d": 2048,
     "k": 32,
-    "n_steps": 4000,
+    "n_steps": 10000,
     "batch_size": 1024,
     "lr": 3e-4,
     "train_dtype": "float32",
-    "stream_dropout_prob": 0.25,
-    "cross_stream_align_coef": 0.02,
-    "decoder_balance_coef": 0.02,
+    "device": "auto",
+    "activation_kind": "batch_topk",
+    "row_cap_multiplier": 4.0,
+    "shared_fraction": 0.5,
+    "cross_reconstruction_coef": 0.35,
+    "shared_alignment_coef": 0.05,
+    "contrastive_coef": 0.02,
+    "validation_fraction": 0.1,
+    "mixed_likelihood": True,
 }
 GENSCORE_CROSSCODER_CHECKPOINT_EVERY = 100
 
@@ -148,6 +154,7 @@ SURVIVAL_EVAL_TIMES = (5.0, 10.0, 15.0)
 SURVIVAL_TARGET_COLUMN = "type2_diabetes"
 SURVIVAL_GAM_MAX_PARENTS = 6
 SURVIVAL_GAM_MIN_EDGE_PROB = 0.5
+SURVIVAL_INTERVAL_Z_90 = 1.6448536269514722
 
 CAUSAL_PATH_TARGET = "type2_diabetes"
 CAUSAL_PATH_TOP_K = 20
@@ -200,7 +207,9 @@ class PipelineResult:
     dagslam_log_score: float = 0.0
     dagslam_n_edges: int = 0
     mcmc_edge_probs: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
-    mcmc_samples: np.ndarray = field(default_factory=lambda: np.zeros((0, 0, 0), dtype=int))
+    mcmc_samples: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 0, 0), dtype=int)
+    )
     mcmc_diagnostics: dict[str, Any] = field(default_factory=dict)
     thresholded_adjacency: np.ndarray = field(
         default_factory=lambda: np.zeros((0, 0), dtype=int)
@@ -508,7 +517,12 @@ def _file_sha256(path: Path) -> str:
 
 def _file_stat_fingerprint(path: Path) -> dict[str, Any]:
     st = path.stat()
-    return {"name": path.name, "size": int(st.st_size)}
+    return {
+        "name": path.name,
+        "size": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns),
+        "sha256": _file_sha256(path),
+    }
 
 
 def _plink_stat_fingerprint(bed: Path) -> dict[str, Any]:
@@ -521,20 +535,84 @@ def _plink_stat_fingerprint(bed: Path) -> dict[str, Any]:
 
 
 def _gnomon_score_cache_filename(bed: Path, score_files: Sequence[Path]) -> str:
-    return "gnomon-scores-" + _short_hash(
-        {
-            "version": PIPELINE_CONFIG_VERSION,
-            "genotype": _plink_stat_fingerprint(bed),
-            "score_files": [
-                {
-                    "name": p.name,
-                    "size": int(p.stat().st_size),
-                    "sha256": _file_sha256(p),
-                }
-                for p in sorted(score_files, key=lambda x: x.name)
-            ],
-        }
-    ) + ".sscore"
+    return (
+        "gnomon-scores-"
+        + _short_hash(
+            {
+                "version": PIPELINE_CONFIG_VERSION,
+                "genotype": _plink_stat_fingerprint(bed),
+                "scorer": _gnomon_scorer_fingerprint(),
+                "score_files": [
+                    {
+                        "name": p.name,
+                        "size": int(p.stat().st_size),
+                        "mtime_ns": int(p.stat().st_mtime_ns),
+                        "sha256": _file_sha256(p),
+                    }
+                    for p in sorted(score_files, key=lambda x: x.name)
+                ],
+            }
+        )
+        + ".sscore"
+    )
+
+
+def _gnomon_scorer_fingerprint() -> dict[str, Any]:
+    binary = shutil.which("gnomon")
+    fallback = Path("/Users/user/.local/bin/gnomon")
+    if binary is None and fallback.is_file() and os.access(fallback, os.X_OK):
+        binary = str(fallback)
+    if binary is None:
+        return {"available": False, "path": None}
+    path = Path(binary).resolve()
+    st = path.stat()
+    version = None
+    try:
+        proc = subprocess.run(
+            [str(path), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        version = (proc.stdout or proc.stderr).strip() or None
+    except Exception:
+        version = None
+    return {
+        "available": True,
+        "path": str(path),
+        "size": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns),
+        "sha256": _file_sha256(path),
+        "version": version,
+    }
+
+
+def _score_files_fingerprint(score_files: Sequence[Path]) -> list[dict[str, Any]]:
+    return [
+        _file_stat_fingerprint(p)
+        for p in sorted((Path(p) for p in score_files), key=lambda x: x.name)
+    ]
+
+
+def _prs_panel_cache_filename(
+    bed: Path,
+    score_files: Sequence[Path],
+    person_ids: Sequence[str],
+) -> str:
+    return (
+        "aou-prs-panel-"
+        + _short_hash(
+            {
+                "version": PIPELINE_CONFIG_VERSION,
+                "genotype": _plink_stat_fingerprint(bed),
+                "score_files": _score_files_fingerprint(score_files),
+                "scorer": _gnomon_scorer_fingerprint(),
+                "person_ids": [str(p) for p in person_ids],
+            }
+        )
+        + ".csv.gz"
+    )
 
 
 def _pipeline_config() -> dict[str, Any]:
@@ -589,11 +667,13 @@ def _pipeline_config() -> dict[str, Any]:
             "edge_resample_prob": MCMC_EDGE_RESAMPLE_PROB,
             "parent_resample_prob": MCMC_PARENT_RESAMPLE_PROB,
             "exact_parent_resample": MCMC_EXACT_PARENT_RESAMPLE,
+            "progress_interval": MCMC_PROGRESS_INTERVAL,
             "max_parents": DAGSLAM_MAX_PARENTS,
         },
         "structural_constraints": {
             "target_sink": SURVIVAL_TARGET_COLUMN,
-            "exogenous_rule": "node-metadata-or-generated-feature",
+            "exogenous_rule": "node-metadata-or-pgs-prefix",
+            "promoted_crosscoder_features": "non_root_with_forbidden_target_to_feature_and_feature_to_pgs",
         },
         "threshold": THRESHOLD_DEFAULT,
         "gam": {
@@ -613,7 +693,11 @@ def _pipeline_config() -> dict[str, Any]:
     }
 
 
-def _run_key(data: SyntheticDataset, mrdag_prior: np.ndarray) -> str:
+def _run_key(
+    data: SyntheticDataset,
+    mrdag_prior: np.ndarray,
+    allowed_edges: np.ndarray,
+) -> str:
     return _short_hash(
         {
             "config": _pipeline_config(),
@@ -623,6 +707,9 @@ def _run_key(data: SyntheticDataset, mrdag_prior: np.ndarray) -> str:
             "time_sha256": _array_hash(data.time),
             "event_sha256": _array_hash(data.event),
             "mrdag_prior_sha256": _array_hash(mrdag_prior),
+            "allowed_edges_sha256": _array_hash(
+                np.asarray(allowed_edges, dtype=np.bool_)
+            ),
         }
     )
 
@@ -772,16 +859,21 @@ def _build_prs_panel(
     path: Path,
     logger: logging.Logger,
     cache: Optional[WorkspaceCache] = None,
+    bed: Optional[Path] = None,
+    score_files: Optional[Sequence[Path]] = None,
 ) -> pd.DataFrame:
     person_ids = _cohort_person_ids(cohort_csv)
-    bed = _resolve_microarray_bed()
+    bed = _resolve_microarray_bed() if bed is None else Path(bed)
     panel_dir = Path(DEFAULT_CACHE_DIR) / PGS_PANEL_DIRNAME
     out_dir = Path(DEFAULT_CACHE_DIR) / GNOMON_OUT_DIRNAME
     panel_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("[prs] downloading PGS scoring panel into %s", panel_dir)
-    score_files = [Path(p) for p in download_panel(panel_dir)]
+    if score_files is None:
+        logger.info("[prs] resolving PGS scoring panel into %s", panel_dir)
+        score_files = [Path(p) for p in download_panel(panel_dir)]
+    else:
+        score_files = [Path(p) for p in score_files]
     sscore_name = _gnomon_score_cache_filename(bed, score_files)
     local_sscore = out_dir / sscore_name
     remote_sscore = f"{GNOMON_OUT_DIRNAME}/{sscore_name}"
@@ -860,18 +952,32 @@ def _load_or_build_prs_panel(
     person_ids: Sequence[str],
     logger: logging.Logger,
 ) -> tuple[pd.DataFrame, str]:
-    path = Path(DEFAULT_CACHE_DIR) / PRS_PANEL_FILENAME
+    bed = _resolve_microarray_bed()
+    panel_dir = Path(DEFAULT_CACHE_DIR) / PGS_PANEL_DIRNAME
+    panel_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("[prs] resolving PGS scoring panel into %s", panel_dir)
+    score_files = [Path(p) for p in download_panel(panel_dir)]
+    filename = _prs_panel_cache_filename(bed, score_files, person_ids)
+    path = Path(DEFAULT_CACHE_DIR) / PRS_PANEL_CACHE_DIRNAME / filename
     if _prs_cache_usable(path, person_ids):
         logger.info("[prs] using local cache %s", path)
         return _read_prs_panel(path), str(path)
 
-    cache.fetch(PRS_PANEL_FILENAME, path, overwrite=True)
+    remote_name = f"{PRS_PANEL_CACHE_DIRNAME}/{filename}"
+    cache.fetch(remote_name, path, overwrite=True)
     if _prs_cache_usable(path, person_ids):
         logger.info("[prs] restored workspace cache %s", path)
         return _read_prs_panel(path), str(path)
 
-    panel = _build_prs_panel(cohort_csv, path, logger, cache=cache)
-    cache.store(path, PRS_PANEL_FILENAME)
+    panel = _build_prs_panel(
+        cohort_csv,
+        path,
+        logger,
+        cache=cache,
+        bed=bed,
+        score_files=score_files,
+    )
+    cache.store(path, remote_name)
     return panel, str(path)
 
 
@@ -979,6 +1085,8 @@ def _apply_survival_outcome(
     X = data.X[keep].copy()
     target_idx = _target_index(data.columns, SURVIVAL_TARGET_COLUMN)
     X[:, target_idx] = event[keep].astype(float)
+    node_types = list(data.node_types)
+    node_types[target_idx] = "survival"
     p = X.shape[1]
     ground_truth_adj = np.zeros((p, p), dtype=int)
     if data.ground_truth_adj.size:
@@ -990,7 +1098,7 @@ def _apply_survival_outcome(
             time=outcome.time[keep].astype(float, copy=False),
             event=event[keep],
             columns=data.columns,
-            node_types=data.node_types,
+            node_types=tuple(node_types),
             ground_truth_adj=ground_truth_adj,
         ),
         pid[keep],
@@ -1133,7 +1241,7 @@ def _prs_node_name(original: str, used: set[str]) -> str:
     i = 2
     while name in used:
         suffix = f"_{i}"
-        name = f"{stem[:48 - len(suffix)]}{suffix}"
+        name = f"{stem[: 48 - len(suffix)]}{suffix}"
         i += 1
     used.add(name)
     return name
@@ -1174,16 +1282,20 @@ def _augment_with_prs_nodes(
         present_rate = float(finite.mean())
         n_finite = int(finite.sum())
         if present_rate < 1.0 - PRS_MAX_MISSING:
-            drop_reasons.append((
-                str(col),
-                f"missing={1.0 - present_rate:.3f} > max={PRS_MAX_MISSING:.3f}",
-            ))
+            drop_reasons.append(
+                (
+                    str(col),
+                    f"missing={1.0 - present_rate:.3f} > max={PRS_MAX_MISSING:.3f}",
+                )
+            )
             continue
         if n_finite < min_required:
-            drop_reasons.append((
-                str(col),
-                f"finite_rows={n_finite} < min_required={min_required}",
-            ))
+            drop_reasons.append(
+                (
+                    str(col),
+                    f"finite_rows={n_finite} < min_required={min_required}",
+                )
+            )
             continue
         sd = float(vals[finite].std(ddof=0))
         if sd == 0.0:
@@ -1229,7 +1341,9 @@ def _augment_with_prs_nodes(
         raw = vals[keep].astype(float)
         sd = float(raw.std(ddof=0))
         if sd == 0.0:
-            raise ValueError(f"selected PRS column became constant after row filter: {col}")
+            raise ValueError(
+                f"selected PRS column became constant after row filter: {col}"
+            )
         prs_cols.append((raw - float(raw.mean())) / sd)
         original_names.append(col)
         present_rates.append(present)
@@ -1307,22 +1421,31 @@ def _render_genscore_plots_async(
             history = {
                 "step": list(genscore_meta.get("loss_history_step", [])),
                 "loss_main": list(genscore_meta.get("loss_history_main", [])),
-                "loss_eval": list(genscore_meta.get("loss_history_eval", [])),
+                "loss_val": list(genscore_meta.get("loss_history_val", [])),
                 "loss_aux": list(genscore_meta.get("loss_history_aux", [])),
+                "loss_cross": list(genscore_meta.get("loss_history_cross", [])),
                 "loss_align": list(genscore_meta.get("loss_history_align", [])),
-                "loss_balance": list(genscore_meta.get("loss_history_balance", [])),
+                "loss_contrastive": list(
+                    genscore_meta.get("loss_history_contrastive", [])
+                ),
                 "frac_dead": list(genscore_meta.get("frac_dead_history", [])),
+                "avg_l0_batch": list(genscore_meta.get("avg_l0_batch_history", [])),
                 "frac_active_batch": list(
                     genscore_meta.get("frac_active_batch_history", [])
                 ),
                 "ever_active_count": list(
                     genscore_meta.get("ever_active_count_history", [])
                 ),
-                "r2_genome_eval": list(
-                    genscore_meta.get("r2_genome_eval_history", [])
+                "r2_genome_val": list(genscore_meta.get("r2_genome_val_history", [])),
+                "r2_ehr_val": list(genscore_meta.get("r2_ehr_val_history", [])),
+                "cross_r2_ehr_from_genome_val": list(
+                    genscore_meta.get("cross_r2_ehr_from_genome_val_history", [])
                 ),
-                "r2_ehr_eval": list(
-                    genscore_meta.get("r2_ehr_eval_history", [])
+                "cross_r2_genome_from_ehr_val": list(
+                    genscore_meta.get("cross_r2_genome_from_ehr_val_history", [])
+                ),
+                "negative_control_margin_val": list(
+                    genscore_meta.get("negative_control_margin_val_history", [])
                 ),
                 "frac_shared_decoder": list(
                     genscore_meta.get("frac_shared_decoder_history", [])
@@ -1339,14 +1462,16 @@ def _render_genscore_plots_async(
                 mean_E=np.asarray(model_bundle["mean_E"], dtype=np.float64),
                 std_E=np.asarray(model_bundle["std_E"], dtype=np.float64),
                 k=int(model_bundle["k"]),
+                latent_bank=np.asarray(model_bundle["latent_bank"], dtype=np.int8),
+                activation_kind=str(model_bundle["activation_kind"]),
                 history=history,
+                ehr_feature_kinds=tuple(model_bundle.get("ehr_feature_kinds", ())),
+                device=str(model_bundle.get("device", "cached")),
             )
 
             panels = align_panels_by_iid(person_ids, prs_df, ehr_panel)
 
-            promoted_indices = np.asarray(
-                model_bundle["promoted_indices"], dtype=int
-            )
+            promoted_indices = np.asarray(model_bundle["promoted_indices"], dtype=int)
             promoted_names = tuple(
                 str(n) for n in genscore_meta.get("promoted_names", [])
             )
@@ -1364,20 +1489,36 @@ def _render_genscore_plots_async(
                 # Recompute on the fly from the model + panels if metadata is
                 # inconsistent (e.g. a hand-edited cache).
                 from .genscore.crosscoder import encode, feature_stream_share
+
                 z_full = encode(model, panels.A, panels.B)
                 rate_full = (z_full > 0).mean(axis=0)
                 rg_full = feature_stream_share(model)
                 promoted_activation_rate = rate_full[promoted_indices]
                 promoted_genome_share = rg_full[promoted_indices]
-                promoted_names = tuple(
-                    f"feat_{int(j):04d}" for j in promoted_indices
-                )
+                promoted_names = tuple(f"feat_{int(j):04d}" for j in promoted_indices)
 
             selection = FeatureSelection(
                 indices=promoted_indices,
                 names=promoted_names,
                 genome_share=promoted_genome_share,
                 activation_rate=promoted_activation_rate,
+                score=np.asarray(genscore_meta.get("promoted_score", []), dtype=float),
+                cross_reconstruction_gain=np.asarray(
+                    genscore_meta.get("promoted_cross_reconstruction_gain", []),
+                    dtype=float,
+                ),
+                bootstrap_stability=np.asarray(
+                    genscore_meta.get("promoted_bootstrap_stability", []),
+                    dtype=float,
+                ),
+                negative_control_margin=np.asarray(
+                    genscore_meta.get("promoted_negative_control_margin", []),
+                    dtype=float,
+                ),
+                redundancy_penalty=np.asarray(
+                    genscore_meta.get("promoted_redundancy_penalty", []),
+                    dtype=float,
+                ),
             )
 
             plots_dir = str(Path(DEFAULT_OUTPUT_DIR) / "plots")
@@ -1400,20 +1541,16 @@ def _render_genscore_plots_async(
                 time.time() - t0,
             )
         except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(
-                "[genscore-plots] rendering failed: %s", exc, exc_info=True
-            )
+            logger.warning("[genscore-plots] rendering failed: %s", exc, exc_info=True)
 
     t = threading.Thread(
         target=_worker,
         name="genscore-plots",
-        daemon=False,
+        daemon=True,
     )
     t.start()
     _BACKGROUND_PLOT_THREADS.append(t)
-    logger.info(
-        "[genscore-plots] dispatched in background while downstream phases run"
-    )
+    logger.info("[genscore-plots] dispatched in background while downstream phases run")
 
 
 _BACKGROUND_PLOT_THREADS: list = []
@@ -1426,15 +1563,16 @@ def _join_background_plot_threads(
     for t in list(_BACKGROUND_PLOT_THREADS):
         if t.is_alive():
             logger.info(
-                "[genscore-plots] waiting up to %.0fs for background "
-                "plot thread %s",
-                timeout, t.name,
+                "[genscore-plots] waiting up to %.0fs for background plot thread %s",
+                timeout,
+                t.name,
             )
             t.join(timeout=timeout)
             if t.is_alive():
                 logger.warning(
                     "[genscore-plots] thread %s still running after "
-                    "timeout; continuing", t.name,
+                    "timeout; continuing",
+                    t.name,
                 )
     _BACKGROUND_PLOT_THREADS.clear()
 
@@ -1476,6 +1614,12 @@ def _load_or_run_genscore_features(
                     "mean_E": np.asarray(z["cc_mean_E"]),
                     "std_E": np.asarray(z["cc_std_E"]),
                     "k": int(np.asarray(z["cc_k"]).item()),
+                    "latent_bank": np.asarray(z["cc_latent_bank"], dtype=np.int8),
+                    "activation_kind": str(z["cc_activation_kind"].item()),
+                    "ehr_feature_kinds": tuple(
+                        json.loads(str(z["cc_ehr_feature_kinds_json"].item()))
+                    ),
+                    "device": str(z["cc_device"].item()),
                     "promoted_indices": np.asarray(z["cc_promoted_indices"], dtype=int),
                 }
             return dataset, z["person_id"].astype(str), meta, model_bundle
@@ -1544,10 +1688,20 @@ def _load_or_run_genscore_features(
     meta = {
         "crosscoder_d": int(model.d),
         "crosscoder_k": int(model.k),
+        "crosscoder_device": str(model.device),
+        "crosscoder_activation_kind": str(model.activation_kind),
+        "crosscoder_shared_bank_size": int(np.sum(model.latent_bank == 0)),
+        "crosscoder_genome_private_bank_size": int(np.sum(model.latent_bank == 1)),
+        "crosscoder_ehr_private_bank_size": int(np.sum(model.latent_bank == 2)),
         "promoted_indices": sel.indices.tolist(),
         "promoted_names": list(sel.names),
         "promoted_genome_share": sel.genome_share.tolist(),
         "promoted_activation_rate": sel.activation_rate.tolist(),
+        "promoted_score": sel.score.tolist(),
+        "promoted_cross_reconstruction_gain": sel.cross_reconstruction_gain.tolist(),
+        "promoted_bootstrap_stability": sel.bootstrap_stability.tolist(),
+        "promoted_negative_control_margin": sel.negative_control_margin.tolist(),
+        "promoted_redundancy_penalty": sel.redundancy_penalty.tolist(),
         "base_n": int(aug_result.base_n),
         "augmented_n": int(aug_result.augmented_n),
         "ehr_feature_count": int(ehr_panel.m),
@@ -1555,22 +1709,25 @@ def _load_or_run_genscore_features(
         "promoted_feature_top_ehr_loadings": top_ehr_loadings,
         "loss_history_step": list(model.history["step"]),
         "loss_history_main": list(model.history["loss_main"]),
-        "loss_history_eval": list(model.history.get("loss_eval", [])),
+        "loss_history_val": list(model.history.get("loss_val", [])),
         "loss_history_aux": list(model.history["loss_aux"]),
+        "loss_history_cross": list(model.history.get("loss_cross", [])),
         "loss_history_align": list(model.history.get("loss_align", [])),
-        "loss_history_balance": list(model.history.get("loss_balance", [])),
+        "loss_history_contrastive": list(model.history.get("loss_contrastive", [])),
         "frac_dead_history": list(model.history["frac_dead"]),
-        "frac_active_batch_history": list(
-            model.history.get("frac_active_batch", [])
+        "avg_l0_batch_history": list(model.history.get("avg_l0_batch", [])),
+        "frac_active_batch_history": list(model.history.get("frac_active_batch", [])),
+        "ever_active_count_history": list(model.history.get("ever_active_count", [])),
+        "r2_genome_val_history": list(model.history.get("r2_genome_val", [])),
+        "r2_ehr_val_history": list(model.history.get("r2_ehr_val", [])),
+        "cross_r2_ehr_from_genome_val_history": list(
+            model.history.get("cross_r2_ehr_from_genome_val", [])
         ),
-        "ever_active_count_history": list(
-            model.history.get("ever_active_count", [])
+        "cross_r2_genome_from_ehr_val_history": list(
+            model.history.get("cross_r2_genome_from_ehr_val", [])
         ),
-        "r2_genome_eval_history": list(
-            model.history.get("r2_genome_eval", [])
-        ),
-        "r2_ehr_eval_history": list(
-            model.history.get("r2_ehr_eval", [])
+        "negative_control_margin_val_history": list(
+            model.history.get("negative_control_margin_val", [])
         ),
         "frac_shared_decoder_history": list(
             model.history.get("frac_shared_decoder", [])
@@ -1597,6 +1754,10 @@ def _load_or_run_genscore_features(
         cc_mean_E=model.mean_E.astype(np.float64, copy=False),
         cc_std_E=model.std_E.astype(np.float64, copy=False),
         cc_k=np.asarray(int(model.k)),
+        cc_latent_bank=model.latent_bank.astype(np.int8, copy=False),
+        cc_activation_kind=np.array(str(model.activation_kind)),
+        cc_ehr_feature_kinds_json=np.array(json.dumps(list(model.ehr_feature_kinds))),
+        cc_device=np.array(str(model.device)),
         cc_promoted_indices=sel.indices.astype(np.int64, copy=False),
     )
     cache.store(path)
@@ -1610,6 +1771,10 @@ def _load_or_run_genscore_features(
         "mean_E": np.asarray(model.mean_E),
         "std_E": np.asarray(model.std_E),
         "k": int(model.k),
+        "latent_bank": np.asarray(model.latent_bank, dtype=np.int8),
+        "activation_kind": str(model.activation_kind),
+        "ehr_feature_kinds": tuple(model.ehr_feature_kinds),
+        "device": str(model.device),
         "promoted_indices": np.asarray(sel.indices, dtype=int),
     }
 
@@ -1635,9 +1800,9 @@ def _load_or_run_genscore_features(
     a_z = (panels_aligned.A - model.mean_G) / model.std_G
     b_z = (panels_aligned.B - model.mean_E) / model.std_E
     ss_res_a = float(np.sum((a_z - a_hat) ** 2))
-    ss_tot_a = float(np.sum(a_z ** 2))
+    ss_tot_a = float(np.sum(a_z**2))
     ss_res_b = float(np.sum((b_z - b_hat) ** 2))
-    ss_tot_b = float(np.sum(b_z ** 2))
+    ss_tot_b = float(np.sum(b_z**2))
     r2_g = 1.0 - ss_res_a / ss_tot_a if ss_tot_a > 0 else float("nan")
     r2_e = 1.0 - ss_res_b / ss_tot_b if ss_tot_b > 0 else float("nan")
 
@@ -1648,10 +1813,15 @@ def _load_or_run_genscore_features(
     else:
         rate_q = np.zeros(5)
 
+    cross_e_hist = model.history.get("cross_r2_ehr_from_genome_val", [])
+    cross_g_hist = model.history.get("cross_r2_genome_from_ehr_val", [])
     logger.info(
-        "[genscore] reconstruction R^2 genome=%.4f ehr=%.4f",
+        "[genscore] reconstruction R^2 genome=%.4f ehr=%.4f "
+        "cross_ehr_from_genome=%.4f cross_genome_from_ehr=%.4f",
         r2_g,
         r2_e,
+        float(cross_e_hist[-1]) if cross_e_hist else float("nan"),
+        float(cross_g_hist[-1]) if cross_g_hist else float("nan"),
     )
     logger.info(
         "[genscore] feature counts d=%d alive=%d dead=%d "
@@ -1682,11 +1852,13 @@ def _load_or_run_genscore_features(
         GENSCORE_N_PROMOTE,
         eligible_pool,
     )
-    for name, idx, share, rate in zip(
+    for name, idx, share, rate, score, neg_margin in zip(
         sel.names,
         sel.indices.tolist(),
         sel.genome_share.tolist(),
         sel.activation_rate.tolist(),
+        sel.score.tolist(),
+        sel.negative_control_margin.tolist(),
     ):
         top_g = top_genome_loadings.get(str(name), [])[:3]
         top_e = top_ehr_loadings.get(str(name), [])[:3]
@@ -1697,11 +1869,14 @@ def _load_or_run_genscore_features(
             f"{entry['feature']}={entry['weight']:+.2f}" for entry in top_e
         )
         logger.info(
-            "[genscore]   %s idx=%d r_G=%.3f rate=%.4f top_genome=[%s] top_ehr=[%s]",
+            "[genscore]   %s idx=%d score=%.6g r_G=%.3f rate=%.4f "
+            "neg_margin=%.4f top_genome=[%s] top_ehr=[%s]",
             name,
             int(idx),
+            float(score),
             float(share),
             float(rate),
+            float(neg_margin),
             g_summary,
             e_summary,
         )
@@ -1730,17 +1905,60 @@ def _mr_gwas_source() -> str:
     return "live"
 
 
-def _mrdag_cache_key() -> str:
-    return _short_hash({
-        "version": PIPELINE_CONFIG_VERSION,
-        "mrdag": _pipeline_config()["mrdag"],
-        "mr_gwas_source": _mr_gwas_source(),
-    })
+def _gwas_fingerprint(gwas: Any, source: str) -> dict[str, Any]:
+    per_pair = []
+    for row in getattr(gwas, "per_pair", []) or []:
+        per_pair.append(
+            {
+                "exposure": str(getattr(row, "exposure", "")),
+                "outcome": str(getattr(row, "outcome", "")),
+                "exposure_id": str(getattr(row, "exposure_id", "")),
+                "outcome_id": str(getattr(row, "outcome_id", "")),
+                "beta": float(getattr(row, "beta", float("nan"))),
+                "se": float(getattr(row, "se", float("nan"))),
+                "n_snps": int(getattr(row, "n_snps", 0)),
+                "source": str(getattr(row, "source", "")),
+                "note": str(getattr(row, "note", "")),
+            }
+        )
+    per_pair.sort(key=lambda r: (r["exposure"], r["outcome"], r["source"]))
+    citations = getattr(gwas, "citations", {}) or {}
+    source_metadata = getattr(gwas, "source_metadata", {}) or {}
+    return {
+        "source": source,
+        "exposures": [str(x) for x in getattr(gwas, "exposures")],
+        "outcomes": [str(x) for x in getattr(gwas, "outcomes")],
+        "betas_sha256": _array_hash(np.asarray(getattr(gwas, "betas"), dtype=float)),
+        "ses_sha256": _array_hash(np.asarray(getattr(gwas, "ses"), dtype=float)),
+        "ivw_pvals_sha256": _array_hash(
+            np.asarray(getattr(gwas, "ivw_pvals"), dtype=float)
+        ),
+        "n_snps_sha256": _array_hash(
+            np.asarray(getattr(gwas, "n_snps"), dtype=np.int64)
+        ),
+        "circular_pairs": [
+            [str(a), str(b)] for a, b in getattr(gwas, "circular_pairs", ())
+        ],
+        "citations": [
+            {"exposure": str(k[0]), "outcome": str(k[1]), "citation": str(v)}
+            for k, v in sorted(citations.items())
+        ],
+        "source_metadata": _json_sanitise(source_metadata),
+        "per_pair": per_pair,
+    }
 
 
-def _log_gwas_per_pair(
-    logger: logging.Logger, summary: Any, source: str
-) -> None:
+def _mrdag_cache_key(gwas: Any, source: str) -> str:
+    return _short_hash(
+        {
+            "version": PIPELINE_CONFIG_VERSION,
+            "mrdag": _pipeline_config()["mrdag"],
+            "gwas": _gwas_fingerprint(gwas, source),
+        }
+    )
+
+
+def _log_gwas_per_pair(logger: logging.Logger, summary: Any, source: str) -> None:
     rows = getattr(summary, "per_pair", None)
     if not rows:
         finite = int(np.sum(np.isfinite(summary.betas)))
@@ -1760,9 +1978,7 @@ def _log_gwas_per_pair(
         source,
         ", ".join(f"{k}={v}" for k, v in sorted(by_source.items())),
     )
-    fetched_or_cached = [
-        r for r in rows if r.source in {"fetched", "cache"}
-    ]
+    fetched_or_cached = [r for r in rows if r.source in {"fetched", "cache"}]
     fetched_or_cached.sort(key=lambda r: -abs(r.beta) if np.isfinite(r.beta) else 0.0)
     for r in fetched_or_cached[:20]:
         logger.info(
@@ -1810,7 +2026,8 @@ def _load_gwas_for_mrdag(logger: logging.Logger) -> tuple[Any, str]:
 def _load_or_run_mrdag(
     cache: WorkspaceCache, logger: logging.Logger
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    key = _mrdag_cache_key()
+    gwas, source_used = _load_gwas_for_mrdag(logger)
+    key = _mrdag_cache_key(gwas, source_used)
     filename = f"mrdag-real-{key}.npz"
     path = cache.fetch(filename)
     if path.is_file():
@@ -1818,7 +2035,6 @@ def _load_or_run_mrdag(
             logger.info("[mrdag] using cache %s", path)
             return z["pi"], json.loads(str(z["diagnostics_json"].item()))
 
-    gwas, source_used = _load_gwas_for_mrdag(logger)
     logger.info("[mrdag] running MR prior sampler (source=%s)", source_used)
     t0 = time.time()
     result = run_mrdag(
@@ -1832,10 +2048,13 @@ def _load_or_run_mrdag(
     diagnostics = dict(result.diagnostics)
     diagnostics["runtime_s"] = time.time() - t0
     diagnostics["gwas_source"] = source_used
+    diagnostics["gwas_cache_key"] = key
     _atomic_npz(
         path,
         pi=result.pi,
-        diagnostics_json=np.array(json.dumps(_json_sanitise(diagnostics), allow_nan=False)),
+        diagnostics_json=np.array(
+            json.dumps(_json_sanitise(diagnostics), allow_nan=False)
+        ),
     )
     cache.store(path)
     return result.pi, diagnostics
@@ -1874,7 +2093,11 @@ def _is_root_covariate(name: str) -> bool:
     mr_name = COHORT_TO_MR_NODE.get(str(name))
     if mr_name in _exogenous_mr_nodes():
         return True
-    return lowered.startswith(("pgs_", "feat_"))
+    return lowered.startswith("pgs_")
+
+
+def _is_promoted_crosscoder_feature(name: str) -> bool:
+    return str(name).lower().startswith("feat_")
 
 
 def _structural_allowed_edges(
@@ -1904,6 +2127,20 @@ def _structural_allowed_edges(
             allowed[:, idx] = False
             allowed[idx, idx] = False
 
+    pgs_idx = [
+        i for i, name in enumerate(columns) if str(name).lower().startswith("pgs_")
+    ]
+    feature_idx = [
+        i
+        for i, name in enumerate(columns)
+        if _is_promoted_crosscoder_feature(str(name))
+    ]
+    for feat in feature_idx:
+        for pgs in pgs_idx:
+            allowed[feat, pgs] = False
+        for target in target_like:
+            allowed[target, feat] = False
+
     return allowed
 
 
@@ -1915,11 +2152,7 @@ def _log_structural_constraints(
     p = len(columns)
     forbidden = int(p * (p - 1) - allowed_edges.sum())
     root_cols = [str(c) for c in columns if _is_root_covariate(str(c))]
-    sink_cols = [
-        str(c)
-        for c in columns
-        if str(c) == SURVIVAL_TARGET_COLUMN
-    ]
+    sink_cols = [str(c) for c in columns if str(c) == SURVIVAL_TARGET_COLUMN]
     logger.info(
         "[graph] structural constraints allowed_edges=%d/%d forbidden=%d "
         "roots=%s sinks=%s",
@@ -1929,6 +2162,33 @@ def _log_structural_constraints(
         root_cols,
         sink_cols,
     )
+
+
+def _cached_allowed_edges_match(
+    z: Any,
+    allowed_edges: Optional[np.ndarray],
+) -> bool:
+    if allowed_edges is None:
+        return "allowed_edges" not in z.files or z["allowed_edges"].shape == (0, 0)
+    if "allowed_edges" not in z.files:
+        return False
+    return bool(
+        np.array_equal(
+            z["allowed_edges"].astype(bool),
+            np.asarray(allowed_edges, dtype=bool),
+        )
+    )
+
+
+def _adjacency_respects_allowed(
+    adjacency: np.ndarray,
+    allowed_edges: Optional[np.ndarray],
+) -> bool:
+    if allowed_edges is None:
+        return True
+    allowed = np.asarray(allowed_edges, dtype=bool)
+    adj = np.asarray(adjacency, dtype=bool)
+    return adj.shape == allowed.shape and not bool(np.any(adj & ~allowed))
 
 
 def _load_or_run_dagslam(
@@ -1943,13 +2203,23 @@ def _load_or_run_dagslam(
     path = cache.fetch(filename)
     if path.is_file():
         with np.load(path, allow_pickle=False) as z:
-            logger.info("[dagslam] using cache %s", path)
-            return {
-                "adjacency": z["adjacency"].astype(int),
-                "log_score": float(z["log_score"].item()),
-                "n_edges": int(z["n_edges"].item()),
-                "runtime_s": float(z["runtime_s"].item()),
-            }
+            adjacency = z["adjacency"].astype(int)
+            if _cached_allowed_edges_match(
+                z, allowed_edges
+            ) and _adjacency_respects_allowed(
+                adjacency,
+                allowed_edges,
+            ):
+                logger.info("[dagslam] using cache %s", path)
+                return {
+                    "adjacency": adjacency,
+                    "log_score": float(z["log_score"].item()),
+                    "n_edges": int(z["n_edges"].item()),
+                    "runtime_s": float(z["runtime_s"].item()),
+                }
+            logger.warning(
+                "[dagslam] ignoring cache with stale structural mask %s", path
+            )
 
     logger.info("[dagslam] running hill-climb")
     t0 = time.time()
@@ -1963,6 +2233,9 @@ def _load_or_run_dagslam(
         verbose=PIPELINE_VERBOSE,
         pi_prior=pi_prior,
         allowed_edges=allowed_edges,
+        survival_time=data.time,
+        survival_event=data.event,
+        survival_horizon=10.0,
     )
     runtime_s = time.time() - t0
     _atomic_npz(
@@ -1972,6 +2245,11 @@ def _load_or_run_dagslam(
         n_edges=np.array(int(result.n_edges)),
         runtime_s=np.array(runtime_s),
         pi_prior=np.asarray(pi_prior, dtype=float),
+        allowed_edges=(
+            np.asarray(allowed_edges, dtype=bool)
+            if allowed_edges is not None
+            else np.zeros((0, 0), dtype=bool)
+        ),
     )
     cache.store(path)
     return {
@@ -1980,6 +2258,82 @@ def _load_or_run_dagslam(
         "n_edges": int(result.n_edges),
         "runtime_s": runtime_s,
     }
+
+
+def _log_mcmc_progress_event(
+    logger: logging.Logger,
+    payload: dict[str, Any],
+) -> None:
+    event = str(payload.get("event", "progress"))
+    chain = int(payload.get("chain", 0))
+    n_chains = int(payload.get("n_chains", 0))
+    iteration = int(payload.get("iter", 0))
+    total_iters = int(payload.get("total_iters", 0))
+    if event.startswith("exact_parent_sets"):
+        scored = payload.get("parent_sets_scored")
+        total = payload.get("parent_sets_total")
+        scored_text = (
+            f" scored={int(scored)}/{int(total)}"
+            if scored is not None and total is not None
+            else f" total={int(total)}"
+            if total is not None
+            else ""
+        )
+        logger.info(
+            "[mcmc] %s chain=%d/%d iter=%d/%d target_node=%s "
+            "candidates=%s cap=%s%s parent_elapsed=%s cache_entries=%d",
+            event,
+            chain,
+            n_chains,
+            iteration,
+            total_iters,
+            payload.get("target_node", "?"),
+            payload.get("candidate_parents", "?"),
+            payload.get("parent_cap", "?"),
+            scored_text,
+            _format_seconds(float(payload.get("parent_elapsed_s", 0.0))),
+            int(payload.get("score_cache_entries", 0)),
+        )
+        return
+
+    accept_rate = payload.get("accept_rate", {}) or {}
+    proposals = payload.get("proposals", {}) or {}
+    logger.info(
+        "[mcmc] %s chain=%d/%d iter=%d/%d phase=%s kept=%d/%d "
+        "edges=%d logpost=%.2f score=%.2f prior=%.2f "
+        "moves(add/rem/rev=%d/%d/%d total=%d) props(edge=%d parent=%d block=%d) "
+        "acc_overall=%.3f acc_mh=%.3f rate=%.2fiter/s elapsed=%s eta=%s "
+        "cache_entries=%d move=%s accepted=%s",
+        event,
+        chain,
+        n_chains,
+        iteration,
+        total_iters,
+        str(payload.get("phase", "?")),
+        int(payload.get("kept", 0)),
+        int(payload.get("target_samples", 0)),
+        int(payload.get("edges", 0)),
+        float(payload.get("log_post", float("nan"))),
+        float(payload.get("score", float("nan"))),
+        float(payload.get("prior", float("nan"))),
+        int(payload.get("n_add", 0)),
+        int(payload.get("n_remove", 0)),
+        int(payload.get("n_reverse", 0)),
+        int(payload.get("n_moves", 0)),
+        int(proposals.get("edge_gibbs", 0)),
+        int(proposals.get("hybrid", 0)),
+        int(proposals.get("block_gibbs", 0)),
+        float(accept_rate.get("overall", 0.0)),
+        float(accept_rate.get("metropolis_hastings", 0.0)),
+        float(payload.get("iter_per_s", 0.0)),
+        _format_seconds(float(payload.get("elapsed_s", 0.0))),
+        _format_seconds(float(payload.get("eta_s", 0.0)))
+        if np.isfinite(float(payload.get("eta_s", float("nan"))))
+        else "?",
+        int(payload.get("score_cache_entries", 0)),
+        payload.get("move_type", "-"),
+        payload.get("accepted", "-"),
+    )
 
 
 def _load_or_run_mcmc(
@@ -1995,15 +2349,58 @@ def _load_or_run_mcmc(
     path = cache.fetch(filename)
     if path.is_file():
         with np.load(path, allow_pickle=False) as z:
-            logger.info("[mcmc] using cache %s", path)
-            return (
-                z["edge_probs"],
-                z["samples"].astype(int),
-                json.loads(str(z["diagnostics_json"].item())),
-                float(z["runtime_s"].item()),
-            )
+            samples = z["samples"].astype(int)
+            edge_probs = z["edge_probs"]
+            if _cached_allowed_edges_match(z, allowed_edges) and (
+                samples.shape[0] == 0
+                or all(
+                    _adjacency_respects_allowed(sample, allowed_edges)
+                    for sample in samples
+                )
+            ):
+                logger.info("[mcmc] using cache %s", path)
+                return (
+                    edge_probs,
+                    samples,
+                    json.loads(str(z["diagnostics_json"].item())),
+                    float(z["runtime_s"].item()),
+                )
+            logger.warning("[mcmc] ignoring cache with stale structural mask %s", path)
 
-    logger.info("[mcmc] running posterior structure sampler")
+    allowed_count = (
+        int(np.asarray(allowed_edges, dtype=bool).sum())
+        if allowed_edges is not None
+        else int(data.p * (data.p - 1))
+    )
+    total_iters_per_chain = int(MCMC_BURN_IN + MCMC_SAMPLES * MCMC_THIN)
+    logger.info(
+        "[mcmc] running posterior structure sampler n=%d p=%d "
+        "start_edges=%d allowed_edges=%d samples_per_chain=%d burn_in=%d "
+        "thin=%d chains=%d total_iters=%d move_probs(edge_gibbs=%.2f "
+        "parent=%.2f block=%.2f single_edge=%.2f) exact_parent=%s "
+        "max_parents=%d progress_interval=%d",
+        data.n,
+        data.p,
+        int(np.asarray(start_adj, dtype=int).sum()),
+        allowed_count,
+        MCMC_SAMPLES,
+        MCMC_BURN_IN,
+        MCMC_THIN,
+        MCMC_CHAINS,
+        total_iters_per_chain * MCMC_CHAINS,
+        float(MCMC_EDGE_RESAMPLE_PROB),
+        float(MCMC_PARENT_RESAMPLE_PROB),
+        float(MCMC_BLOCK_RESAMPLE_PROB),
+        float(
+            1.0
+            - MCMC_BLOCK_RESAMPLE_PROB
+            - MCMC_EDGE_RESAMPLE_PROB
+            - MCMC_PARENT_RESAMPLE_PROB
+        ),
+        bool(MCMC_EXACT_PARENT_RESAMPLE),
+        int(DAGSLAM_MAX_PARENTS),
+        int(MCMC_PROGRESS_INTERVAL),
+    )
     t0 = time.time()
     result = run_structure_mcmc(
         data=data.X,
@@ -2015,7 +2412,8 @@ def _load_or_run_mcmc(
         thin=MCMC_THIN,
         n_chains=MCMC_CHAINS,
         rng=np.random.default_rng(PIPELINE_SEED + 3),
-        progress=PIPELINE_VERBOSE,
+        progress=lambda payload: _log_mcmc_progress_event(logger, payload),
+        progress_interval=MCMC_PROGRESS_INTERVAL,
         block_resample_prob=MCMC_BLOCK_RESAMPLE_PROB,
         block_size=MCMC_BLOCK_SIZE,
         edge_resample_prob=MCMC_EDGE_RESAMPLE_PROB,
@@ -2023,6 +2421,9 @@ def _load_or_run_mcmc(
         exact_parent_resample=MCMC_EXACT_PARENT_RESAMPLE,
         max_parents=DAGSLAM_MAX_PARENTS,
         allowed_edges=allowed_edges,
+        survival_time=data.time,
+        survival_event=data.event,
+        survival_horizon=10.0,
     )
     runtime_s = time.time() - t0
     diagnostics = dict(result.diagnostics)
@@ -2031,14 +2432,51 @@ def _load_or_run_mcmc(
         if result.samples
         else np.zeros((0, data.p, data.p), dtype=np.int8)
     )
+    logger.info(
+        "[mcmc] sampler returned samples=%d edge_probs_shape=%s runtime=%s "
+        "mean_logpost=%s",
+        int(samples.shape[0]),
+        tuple(np.asarray(result.edge_probs).shape),
+        _format_seconds(runtime_s),
+        [
+            f"{float(x):.3f}"
+            for x in diagnostics.get("mean_log_posterior_per_chain", [])
+        ],
+    )
+    cache_write_started_at = time.time()
+    logger.info(
+        "[mcmc] writing cache path=%s samples_shape=%s",
+        path,
+        tuple(samples.shape),
+    )
     _atomic_npz(
         path,
         edge_probs=np.asarray(result.edge_probs, dtype=float),
         samples=samples,
-        diagnostics_json=np.array(json.dumps(_json_sanitise(diagnostics), allow_nan=False)),
+        diagnostics_json=np.array(
+            json.dumps(_json_sanitise(diagnostics), allow_nan=False)
+        ),
         runtime_s=np.array(runtime_s),
+        allowed_edges=(
+            np.asarray(allowed_edges, dtype=bool)
+            if allowed_edges is not None
+            else np.zeros((0, 0), dtype=bool)
+        ),
     )
+    logger.info(
+        "[mcmc] cache file written path=%s size=%.1fMiB elapsed=%s",
+        path,
+        _path_size_mib(path),
+        _format_seconds(time.time() - cache_write_started_at),
+    )
+    cache_store_started_at = time.time()
+    logger.info("[mcmc] storing cache artefact %s", path.name)
     cache.store(path)
+    logger.info(
+        "[mcmc] cache artefact stored elapsed=%s total_elapsed=%s",
+        _format_seconds(time.time() - cache_store_started_at),
+        _format_seconds(time.time() - t0),
+    )
     return np.asarray(result.edge_probs, dtype=float), samples, diagnostics, runtime_s
 
 
@@ -2209,6 +2647,33 @@ def _weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> np.
     return np.take_along_axis(sorted_vals, pick[None, :, :], axis=0)[0]
 
 
+def _survival_validation_split(
+    event_arr: np.ndarray,
+    test_fraction: float = 0.2,
+) -> tuple[np.ndarray, np.ndarray]:
+    e = np.asarray(event_arr, dtype=int).ravel()
+    rng = np.random.default_rng(PIPELINE_SEED + 21)
+    train_parts: list[np.ndarray] = []
+    test_parts: list[np.ndarray] = []
+    for value in (0, 1):
+        idx = np.flatnonzero(e == value)
+        rng.shuffle(idx)
+        if idx.size == 0:
+            continue
+        n_test = max(1, int(round(test_fraction * idx.size))) if idx.size > 1 else 0
+        test_parts.append(idx[:n_test])
+        train_parts.append(idx[n_test:])
+    train = np.concatenate(train_parts) if train_parts else np.arange(e.size)
+    test = np.concatenate(test_parts) if test_parts else np.zeros(0, dtype=int)
+    if train.size == 0 or test.size == 0:
+        raise ValueError(
+            "survival validation split produced an empty train or test set"
+        )
+    train.sort()
+    test.sort()
+    return train, test
+
+
 def _survival_metrics(
     time_arr: np.ndarray,
     event_arr: np.ndarray,
@@ -2218,11 +2683,14 @@ def _survival_metrics(
     eval_times = np.asarray(SURVIVAL_EVAL_TIMES, dtype=float)
     S_eval = _survival_at_times(survival_mean, t_grid, eval_times)
     p_event_eval = 1.0 - S_eval
-    p_event_10y = 1.0 - _survival_at_times(
-        survival_mean,
-        t_grid,
-        np.asarray([10.0], dtype=float),
-    )[:, 0]
+    p_event_10y = (
+        1.0
+        - _survival_at_times(
+            survival_mean,
+            t_grid,
+            np.asarray([10.0], dtype=float),
+        )[:, 0]
+    )
 
     # 10y status is *indeterminate* for subjects censored before 10y: we
     # do not know whether they would have had an event by 10y.  The model
@@ -2234,14 +2702,10 @@ def _survival_metrics(
     indeterminate = (time_arr < 10.0) & (event_arr == 0)
     determined = ~indeterminate
     p_det = p_event_10y[determined]
-    y_det = (
-        (time_arr[determined] <= 10.0) & (event_arr[determined] == 1)
-    ).astype(int)
+    y_det = ((time_arr[determined] <= 10.0) & (event_arr[determined] == 1)).astype(int)
     if p_det.size == 0:
         raise ValueError("no subjects have determined 10-year status for calibration")
-    calibration = calibration_metrics(
-        y_det, p_det, n_bins=10, strategy="quantile"
-    )
+    calibration = calibration_metrics(y_det, p_det, n_bins=10, strategy="quantile")
 
     td = time_dependent_auc(
         time=time_arr,
@@ -2257,9 +2721,7 @@ def _survival_metrics(
     # least 1% of the cohort still at risk (and >= 10 subjects).
     n_total = int(time_arr.size)
     min_at_risk = max(10, int(0.01 * n_total))
-    n_at_risk = np.array(
-        [int(np.sum(time_arr > tau)) for tau in t_grid], dtype=int
-    )
+    n_at_risk = np.array([int(np.sum(time_arr > tau)) for tau in t_grid], dtype=int)
     keep = n_at_risk >= min_at_risk
     if not np.any(keep):
         keep = np.zeros_like(n_at_risk, dtype=bool)
@@ -2289,13 +2751,17 @@ def _survival_metrics(
 
 
 def _survival_gam_fit_filename(key: str, parent_set: tuple[int, ...]) -> str:
-    return "survival-gam-fit-" + _short_hash(
-        {
-            "key": key,
-            "parent_set": list(parent_set),
-            "gam": _pipeline_config()["gam"],
-        }
-    ) + ".npz"
+    return (
+        "survival-gam-fit-"
+        + _short_hash(
+            {
+                "key": key,
+                "parent_set": list(parent_set),
+                "gam": _pipeline_config()["gam"],
+            }
+        )
+        + ".npz"
+    )
 
 
 def _load_or_run_survival_parent_fit(
@@ -2305,7 +2771,7 @@ def _load_or_run_survival_parent_fit(
     parent_set: tuple[int, ...],
     t_grid: np.ndarray,
     logger: logging.Logger,
-) -> tuple[np.ndarray, dict[str, Any], float]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any], float]:
     filename = _survival_gam_fit_filename(key, parent_set)
     path = cache.fetch(filename)
     if path.is_file():
@@ -2313,20 +2779,22 @@ def _load_or_run_survival_parent_fit(
             logger.info("[gamfit] using fit cache %s", path)
             return (
                 z["survival_mean"],
+                z["survival_variance"],
                 json.loads(str(z["diagnostics_json"].item())),
                 float(z["runtime_s"].item()),
             )
 
     cols = tuple(data.columns[i] for i in parent_set)
     X = data.X[:, list(parent_set)] if parent_set else np.zeros((data.n, 0))
+    from .gam.survival import fit_survival_gam
+
     t0 = time.time()
     fit = fit_survival_gam(
         data.time,
         data.event,
         X,
         columns=cols,
-        n_samples=GAM_N_SAMPLES,
-        rng=np.random.default_rng(PIPELINE_SEED + 20),
+        n_uncertainty_slices=GAM_N_SAMPLES,
         progress=lambda message, cols=cols: logger.info(
             "[gamfit] parents=%s %s",
             ",".join(cols) if cols else "(intercept)",
@@ -2334,12 +2802,14 @@ def _load_or_run_survival_parent_fit(
         ),
     )
     mean = fit.predict_survival_mean(X, t_grid)
+    variance = fit.predict_survival_variance(X, t_grid)
     runtime_s = time.time() - t0
     diag = fit.posterior_summary()
     diag["parent_columns"] = list(cols)
     _atomic_npz(
         path,
         survival_mean=mean,
+        survival_variance=variance,
         diagnostics_json=np.array(json.dumps(_json_sanitise(diag), allow_nan=False)),
         runtime_s=np.array(runtime_s),
     )
@@ -2349,7 +2819,38 @@ def _load_or_run_survival_parent_fit(
         path,
         _format_seconds(runtime_s),
     )
-    return mean, diag, runtime_s
+    return mean, variance, diag, runtime_s
+
+
+def _fit_survival_parent_set_holdout(
+    data: SyntheticDataset,
+    parent_set: tuple[int, ...],
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    t_grid: np.ndarray,
+    logger: logging.Logger,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    from .gam.survival import fit_survival_gam
+
+    cols = tuple(data.columns[i] for i in parent_set)
+    X_all = data.X[:, list(parent_set)] if parent_set else np.zeros((data.n, 0))
+    X_train = X_all[train_idx]
+    X_test = X_all[test_idx]
+    fit = fit_survival_gam(
+        data.time[train_idx],
+        data.event[train_idx],
+        X_train,
+        columns=cols,
+        n_uncertainty_slices=GAM_N_SAMPLES,
+        progress=lambda message, cols=cols: logger.info(
+            "[gamfit-validation] parents=%s %s",
+            ",".join(cols) if cols else "(intercept)",
+            message,
+        ),
+    )
+    diag = fit.posterior_summary()
+    diag["parent_columns"] = list(cols)
+    return fit.predict_survival_mean(X_test, t_grid), diag
 
 
 def _load_or_run_survival_gam(
@@ -2395,6 +2896,7 @@ def _load_or_run_survival_gam(
     )
     t_grid = _survival_time_grid(data.time)
     per_model = []
+    per_model_variance = []
     fit_summaries = []
     t0 = time.time()
     logger.info("[gam] fitting %d gamfit survival parent-set models", len(parent_sets))
@@ -2405,7 +2907,7 @@ def _load_or_run_survival_gam(
         parent_set_sources,
     ):
         cols = tuple(data.columns[i] for i in parent_set)
-        mean, diag, _fit_runtime_s = _load_or_run_survival_parent_fit(
+        mean, variance, diag, _fit_runtime_s = _load_or_run_survival_parent_fit(
             cache,
             key,
             data,
@@ -2414,6 +2916,7 @@ def _load_or_run_survival_gam(
             logger,
         )
         per_model.append(mean)
+        per_model_variance.append(variance)
         diag["posterior_parent_set_weight"] = float(weight)
         diag["posterior_parent_set_count"] = int(count)
         diag["parent_set_source"] = str(source)
@@ -2421,11 +2924,59 @@ def _load_or_run_survival_gam(
         fit_summaries.append(diag)
 
     stack = np.stack(per_model, axis=0)
+    stack_variance = np.stack(per_model_variance, axis=0)
     survival_mean = np.einsum("k,knt->nt", weights, stack)
-    survival_lower = _weighted_quantile(stack, weights, 0.05)
-    survival_upper = _weighted_quantile(stack, weights, 0.95)
+    variance_parametric = np.einsum("k,knt->nt", weights, stack_variance)
     variance_structural = np.einsum(
         "k,knt->nt", weights, (stack - survival_mean[None, :, :]) ** 2
+    )
+    variance_total = variance_parametric + variance_structural
+    survival_sd = np.sqrt(np.clip(variance_total, 0.0, None))
+    survival_lower = np.clip(
+        survival_mean - SURVIVAL_INTERVAL_Z_90 * survival_sd, 0.0, 1.0
+    )
+    survival_upper = np.clip(
+        survival_mean + SURVIVAL_INTERVAL_Z_90 * survival_sd, 0.0, 1.0
+    )
+    survival_lower = np.minimum.accumulate(survival_lower, axis=1)
+    survival_upper = np.minimum.accumulate(survival_upper, axis=1)
+    survival_lower = np.minimum(survival_lower, survival_mean)
+    survival_upper = np.maximum(survival_upper, survival_mean)
+    train_idx, test_idx = _survival_validation_split(data.event)
+    validation_models = []
+    validation_summaries = []
+    logger.info(
+        "[gam] fitting %d held-out validation parent-set models n_train=%d n_test=%d",
+        len(parent_sets),
+        int(train_idx.size),
+        int(test_idx.size),
+    )
+    for parent_set, weight, count, source in zip(
+        parent_sets,
+        weights,
+        parent_set_counts,
+        parent_set_sources,
+    ):
+        pred, diag = _fit_survival_parent_set_holdout(
+            data,
+            tuple(parent_set),
+            train_idx,
+            test_idx,
+            t_grid,
+            logger,
+        )
+        validation_models.append(pred)
+        diag["posterior_parent_set_weight"] = float(weight)
+        diag["posterior_parent_set_count"] = int(count)
+        diag["parent_set_source"] = str(source)
+        validation_summaries.append(diag)
+    validation_stack = np.stack(validation_models, axis=0)
+    validation_mean = np.einsum("k,knt->nt", weights, validation_stack)
+    validation_metrics = _survival_metrics(
+        data.time[test_idx],
+        data.event[test_idx],
+        validation_mean,
+        t_grid,
     )
     runtime_s = time.time() - t0
     diagnostics = {
@@ -2446,11 +2997,24 @@ def _load_or_run_survival_gam(
             )
         ],
         "fit_summaries": fit_summaries,
+        "validation_fit_summaries": validation_summaries,
+        "metrics_evaluation": {
+            "method": "stratified_holdout_refit",
+            "n_train": int(train_idx.size),
+            "n_test": int(test_idx.size),
+            "test_fraction": float(test_idx.size / data.n),
+        },
+        "interval_uncertainty": "gamfit_delta_method_plus_structural_parent_set",
+        "interval_level": 0.90,
+        "variance_parametric_mean": float(np.mean(variance_parametric)),
         "variance_structural_mean": float(np.mean(variance_structural)),
-        "metrics": _survival_metrics(data.time, data.event, survival_mean, t_grid),
+        "variance_total_mean": float(np.mean(variance_total)),
+        "metrics": validation_metrics,
     }
     parent_columns = tuple(
-        dict.fromkeys(col for ps in parent_sets for col in (data.columns[i] for i in ps))
+        dict.fromkeys(
+            col for ps in parent_sets for col in (data.columns[i] for i in ps)
+        )
     )
     _atomic_npz(
         path,
@@ -2460,7 +3024,9 @@ def _load_or_run_survival_gam(
         survival_upper=survival_upper,
         variance_structural=variance_structural,
         parent_columns_json=np.array(json.dumps(list(parent_columns))),
-        diagnostics_json=np.array(json.dumps(_json_sanitise(diagnostics), allow_nan=False)),
+        diagnostics_json=np.array(
+            json.dumps(_json_sanitise(diagnostics), allow_nan=False)
+        ),
         runtime_s=np.array(runtime_s),
     )
     cache.store(path)
@@ -2665,7 +3231,7 @@ def run_pipeline() -> PipelineResult:
 
     with _phase(logger, "dagslam"):
         t0 = time.time()
-        key = _run_key(data, mrdag_prior)
+        key = _run_key(data, mrdag_prior, allowed_edges)
         dagslam = _load_or_run_dagslam(
             cache,
             key,
@@ -2699,9 +3265,7 @@ def run_pipeline() -> PipelineResult:
             "[mcmc] accept_overall=%.3f accept_mh=%.3f max_rhat_skel=%.3f min_ess=%.1f",
             float(mcmc_diagnostics["accept_rate"].get("overall", float("nan"))),
             float(
-                mcmc_diagnostics["accept_rate"].get(
-                    "metropolis_hastings", float("nan")
-                )
+                mcmc_diagnostics["accept_rate"].get("metropolis_hastings", float("nan"))
             ),
             float(mcmc_diagnostics.get("max_rhat_skeleton", float("nan"))),
             float(mcmc_diagnostics.get("min_ess", float("nan"))),
@@ -2773,9 +3337,7 @@ def run_pipeline() -> PipelineResult:
     )
     logger.info(
         "[summary] timings: %s",
-        ", ".join(
-            f"{k}={_format_seconds(float(v))}" for k, v in timings.items()
-        ),
+        ", ".join(f"{k}={_format_seconds(float(v))}" for k, v in timings.items()),
     )
     logger.info(
         "[summary] mrdag: max_rhat=%.3f candidate_edges=%d",
@@ -2792,11 +3354,7 @@ def run_pipeline() -> PipelineResult:
         "[summary] mcmc: accept=%.3f accept_mh=%.3f max_rhat_skel=%.3f min_ess=%.1f "
         "edges_above_%.2f=%d/%d",
         float(mcmc_diagnostics["accept_rate"].get("overall", float("nan"))),
-        float(
-            mcmc_diagnostics["accept_rate"].get(
-                "metropolis_hastings", float("nan")
-            )
-        ),
+        float(mcmc_diagnostics["accept_rate"].get("metropolis_hastings", float("nan"))),
         float(mcmc_diagnostics.get("max_rhat_skeleton", float("nan"))),
         float(mcmc_diagnostics.get("min_ess", float("nan"))),
         float(THRESHOLD_DEFAULT),
@@ -2995,9 +3553,7 @@ def _log_mcmc_diagnostics(
     )
 
 
-def _log_validation_metrics(
-    logger: logging.Logger, validation: dict[str, Any]
-) -> None:
+def _log_validation_metrics(logger: logging.Logger, validation: dict[str, Any]) -> None:
     if not validation or "auroc" not in validation:
         logger.info("[validation] no known-edge ground truth available")
         return
@@ -3018,12 +3574,21 @@ def _log_validation_metrics(
     rec_p = validation.get("recovery_pvalue") or {}
     mcc = validation.get("mcc") or {}
     mcc_p = validation.get("mcc_pvalue") or {}
+
+    def _threshold_value(table: Any, threshold: float) -> float:
+        if not isinstance(table, dict):
+            return float("nan")
+        for key in (threshold, str(threshold), f"{threshold:g}"):
+            if key in table:
+                return float(table[key])
+        return float("nan")
+
     for thr in thresholds:
         key = float(thr)
-        rec = float(recovery.get(key, float("nan")))
-        rp = float(rec_p.get(key, float("nan")))
-        mc = float(mcc.get(key, float("nan")))
-        mp = float(mcc_p.get(key, float("nan")))
+        rec = _threshold_value(recovery, key)
+        rp = _threshold_value(rec_p, key)
+        mc = _threshold_value(mcc, key)
+        mp = _threshold_value(mcc_p, key)
         logger.info(
             "[validation] thr=%.2f recovery=%.3f (p=%.3f)  MCC=%.3f (p=%.3f)",
             key,
@@ -3036,9 +3601,11 @@ def _log_validation_metrics(
     if per_edge:
         rows = sorted(
             per_edge.items(),
-            key=lambda kv: -float(kv[1].get("probability", 0.0))
-            if not kv[1].get("masked", False)
-            else 1.0,
+            key=lambda kv: (
+                -float(kv[1].get("probability", 0.0))
+                if not kv[1].get("masked", False)
+                else 1.0
+            ),
         )
         preview = ", ".join(
             f"{p}->{c}={float(d['probability']):.2f}"
@@ -3048,9 +3615,7 @@ def _log_validation_metrics(
         logger.info("[validation] known_edges: %s", preview)
 
 
-def _log_survival_metrics(
-    logger: logging.Logger, diagnostics: dict[str, Any]
-) -> None:
+def _log_survival_metrics(logger: logging.Logger, diagnostics: dict[str, Any]) -> None:
     def _values(obj: Any) -> list[Any]:
         if obj is None:
             return []
@@ -3114,9 +3679,7 @@ def _log_causal_pathways(
         )
 
 
-def _adj_to_edge_list(
-    adj: np.ndarray, columns: Sequence[str]
-) -> list[tuple[str, str]]:
+def _adj_to_edge_list(adj: np.ndarray, columns: Sequence[str]) -> list[tuple[str, str]]:
     rows: list[tuple[str, str]] = []
     for i, parent in enumerate(columns):
         for j, child in enumerate(columns):
@@ -3318,6 +3881,7 @@ def save_result(
         "dagslam_n_edges": result.dagslam_n_edges,
         "mcmc_diagnostics": diagnostics,
         "threshold": result.threshold,
+        "target_node": SURVIVAL_TARGET_COLUMN,
         "survival_parent_columns": list(result.survival_parent_columns),
         "survival_diagnostics": result.survival_diagnostics,
         "causal_pathways": result.causal_pathways,
@@ -3327,7 +3891,9 @@ def save_result(
     }
     paths["summary_json"] = str(out / "summary.json")
     with open(paths["summary_json"], "w") as fh:
-        json.dump(_json_sanitise(summary), fh, indent=2, sort_keys=True, allow_nan=False)
+        json.dump(
+            _json_sanitise(summary), fh, indent=2, sort_keys=True, allow_nan=False
+        )
 
     config = _pipeline_config() if run_config is None else run_config
     paths["run_config_json"] = str(out / "run_config.json")

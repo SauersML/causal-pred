@@ -59,6 +59,10 @@ def _skeleton_edges(adj: np.ndarray):
     return edges
 
 
+def _survival_hyper(data) -> dict:
+    return {"survival_time": data.time, "survival_event": data.event}
+
+
 # ---------------------------------------------------------------------------
 # 1. Output is a DAG
 # ---------------------------------------------------------------------------
@@ -73,6 +77,7 @@ def test_output_is_dag(small_data):
         max_iter=300,
         restarts=2,
         rng=rng,
+        **_survival_hyper(small_data),
     )
     assert isinstance(res, DAGSLAMResult)
     A = res.adjacency
@@ -193,8 +198,8 @@ def test_beats_empty_on_synthetic_data(medium_data):
     adj_truth = medium_data.ground_truth_adj
     adj_empty = np.zeros_like(adj_truth)
 
-    s_truth = float(score_dag(adj_truth, X, nt))
-    s_empty = float(score_dag(adj_empty, X, nt))
+    s_truth = float(score_dag(adj_truth, X, nt, **_survival_hyper(medium_data)))
+    s_empty = float(score_dag(adj_empty, X, nt, **_survival_hyper(medium_data)))
 
     t0 = time.perf_counter()
     res = run_dagslam(
@@ -204,6 +209,7 @@ def test_beats_empty_on_synthetic_data(medium_data):
         max_iter=500,
         restarts=3,
         rng=rng,
+        **_survival_hyper(medium_data),
     )
     elapsed = time.perf_counter() - t0
 
@@ -244,6 +250,7 @@ def test_recovers_majority_of_canonical_edges(medium_data):
         max_iter=500,
         restarts=3,
         rng=rng,
+        **_survival_hyper(medium_data),
     )
     A = res.adjacency
     hits = 0
@@ -281,6 +288,7 @@ def test_restart_improves_over_single(small_data):
         max_iter=300,
         restarts=1,
         rng=rng1,
+        **_survival_hyper(small_data),
     )
     r5 = run_dagslam(
         small_data.X,
@@ -289,6 +297,7 @@ def test_restart_improves_over_single(small_data):
         max_iter=300,
         restarts=5,
         rng=rng5,
+        **_survival_hyper(small_data),
     )
     assert r5.log_score >= r1.log_score - 1e-6, (
         f"multi-restart score {r5.log_score:.3f} worse than "
@@ -310,6 +319,7 @@ def test_respects_max_parents(small_data):
         max_iter=200,
         restarts=2,
         rng=rng,
+        **_survival_hyper(small_data),
     )
     in_degree = res.adjacency.sum(axis=0)
     assert in_degree.max() <= 2, f"found node with {in_degree.max()} parents (cap=2)"
@@ -330,6 +340,7 @@ def test_runtime_budget(medium_data):
         max_iter=500,
         restarts=3,
         rng=rng,
+        **_survival_hyper(medium_data),
     )
     elapsed = time.perf_counter() - t0
     assert elapsed < 120.0, f"DAGSLAM too slow: {elapsed:.1f}s"
@@ -349,6 +360,7 @@ def test_score_cache_is_usable_downstream(small_data):
         max_iter=200,
         restarts=2,
         rng=rng,
+        **_survival_hyper(small_data),
     )
     cache = res.score_cache
     assert isinstance(cache, dict) and len(cache) > 0
@@ -363,7 +375,13 @@ def test_score_cache_is_usable_downstream(small_data):
     # (A may still be a DAG either way.)
 
     t0 = time.perf_counter()
-    s = score_dag(A, small_data.X, small_data.node_types, cache=cache)
+    s = score_dag(
+        A,
+        small_data.X,
+        small_data.node_types,
+        cache=cache,
+        **_survival_hyper(small_data),
+    )
     elapsed = time.perf_counter() - t0
     assert np.isfinite(s)
     assert elapsed < 0.1, (

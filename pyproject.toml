@@ -19,9 +19,8 @@ dependencies = [
     "google-cloud-bigquery>=3.25",
     "google-cloud-bigquery-storage>=2.25",
     "db-dtypes>=1.2",
-    # GAM backend -- Python bindings for SauersML/gam's Rust engine,
-    # published on PyPI as ``gamfit``.
-    "gamfit",
+    "gamfit>=0.1.19",
+    "torch>=2.3",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +28,14 @@ dev = ["pytest>=8", "pytest-xdist>=3", "ruff>=0.6"]
 
 [dependency-groups]
 dev = ["pytest>=8", "pytest-xdist>=3", "ruff>=0.6"]
+
+[tool.uv.sources]
+# Local-build pin until gamfit 0.1.19 ships on PyPI: ``predict_table``
+# now honors ``with_uncertainty`` for survival models and the
+# :class:`SurvivalPrediction` dataclass exposes ``survival_se`` /
+# ``eta_se`` (delta-method standard errors on the survival surface and
+# linear predictor).  See /Users/user/gam for the source.
+gamfit = { path = "/tmp/gamfit-wheels/gamfit-0.1.19-cp310-abi3-macosx_11_0_arm64.whl" }
 
 [build-system]
 requires = ["hatchling"]

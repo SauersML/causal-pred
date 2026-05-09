@@ -337,7 +337,7 @@ def load_real_gwas(
         z = betas / ses
         pvals = 2.0 * (1.0 - norm.cdf(np.abs(z)))
 
-    return RealGWASSummary(
+    summary = RealGWASSummary(
         exposures=exposures,
         outcomes=outcomes,
         betas=betas,
@@ -347,6 +347,12 @@ def load_real_gwas(
         citations=citations,
         circular_pairs=tuple(circular),
     )
+    summary.source_metadata = {
+        "source": "literature",
+        "drop_circular": bool(drop_circular),
+        "published_mr_entries": len(PUBLISHED_MR),
+    }
+    return summary
 
 
 __all__ = [

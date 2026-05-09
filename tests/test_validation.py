@@ -94,6 +94,8 @@ def test_known_edge_recovery_scores_only_eligible_edges():
 
     assert out["n_valid_ground_truth_edges"] == 1
     assert out["null_model"]["n_usable_cells"] == 3
+    assert out["null_model"]["type"] == "eligible_value_permutation"
+    assert "degree" not in out["null_model"]["type"]
     assert out["observed_recovery"][0.5] == pytest.approx(1.0)
     assert out["per_edge"][("c", "d")]["masked"]
 

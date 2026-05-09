@@ -46,10 +46,9 @@ Score forms (peer-review quality)
       *Ann. Stat.* 42(4), 1689--1691, Equation 2 (this paper fixes a
       constant in the G&H 2002 formula; we use the corrected form).
 
-* **Binary node** (and **survival** node, on the event indicator) with
-  parent set Pa is scored with a **Laplace approximation** to the
-  logistic-regression log marginal likelihood under a Gaussian prior
-  on the coefficients, N(0, tau^2 I):
+* **Binary node** with parent set Pa is scored with a **Laplace
+  approximation** to the logistic-regression log marginal likelihood
+  under a Gaussian prior on the coefficients, N(0, tau^2 I):
 
       log p(y | X) ~= log p(y | X, beta_MAP)
                      + log N(beta_MAP | 0, tau^2 I)
@@ -74,17 +73,26 @@ Score forms (peer-review quality)
       Bayesian networks", *Machine Learning* 50, 95--125 -- uses the
       same Laplace-around-MAP construction for discrete local scores.
 
+* **Survival node** with parent set Pa is scored as an explicit
+  fixed-horizon endpoint with censoring handled by IPCW.  Cases are
+  observed events before ``survival_horizon``; controls are rows known
+  event-free beyond the horizon; rows censored before the horizon are
+  not treated as non-events.  The weighted binary endpoint is then
+  scored by the same Laplace logistic marginal likelihood.
+
 Caching
 -------
-Scores are deterministic in ``(j, frozenset(parents))`` and are
-memoised in a user-supplied ``cache`` dict.  Calling ``score_dag``
-once warms the cache; the delta functions then only recompute the
-affected child(ren).  This is the hot path for structure MCMC.
+Scores are deterministic in the data matrix, node types, scoring
+hyperparameters, ``j``, and ``frozenset(parents)``.  A user-supplied
+``cache`` dict is private to that exact context; reusing it with a
+different dataset or hyperparameter set raises instead of returning stale
+local scores.
 """
 
 from __future__ import annotations
 
-from typing import Iterable, MutableMapping, Optional, Sequence, Tuple
+import hashlib
+from typing import Any, Iterable, MutableMapping, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.linalg import cho_solve
@@ -99,6 +107,7 @@ _ALPHA_MU_DEFAULT = 1.0
 # tau^2 = 10.0 ==> tau ~ 3.16; weakly informative on standardised features
 # but enough to tame separation.
 _TAU2_DEFAULT = 10.0
+_SURVIVAL_HORIZON_DEFAULT = 10.0
 # Numerical stability
 _RIDGE_XX = 1e-8  # added to X'X for BGe-adjacent computations
 _JITTER_TRIES = (1e-8, 1e-6, 1e-4)
@@ -114,6 +123,76 @@ _NEWTON_MAX_ITER = 100
 def _parents_key(parents: Iterable[int]) -> frozenset:
     """Canonical, hashable key for a parent set."""
     return frozenset(int(p) for p in parents)
+
+
+def _array_hash(arr: np.ndarray) -> str:
+    a = np.ascontiguousarray(arr)
+    h = hashlib.sha256()
+    h.update(str(a.shape).encode("utf-8"))
+    h.update(str(a.dtype).encode("utf-8"))
+    h.update(a.tobytes())
+    return h.hexdigest()
+
+
+def _score_cache_context_key(
+    data: np.ndarray,
+    node_types: Sequence[str],
+    hyper: dict[str, Any],
+    cache: Optional[MutableMapping],
+) -> str:
+    alpha_mu = float(hyper.get("alpha_mu", _ALPHA_MU_DEFAULT))
+    tau2 = float(hyper.get("tau2", _TAU2_DEFAULT))
+    horizon = float(hyper.get("survival_horizon", _SURVIVAL_HORIZON_DEFAULT))
+    survival_time = hyper.get("survival_time")
+    survival_event = hyper.get("survival_event")
+
+    identity = (
+        id(data),
+        data.shape,
+        str(data.dtype),
+        tuple(str(t) for t in node_types),
+        alpha_mu,
+        tau2,
+        horizon,
+        id(survival_time) if survival_time is not None else None,
+        id(survival_event) if survival_event is not None else None,
+    )
+    if cache is not None:
+        existing = cache.get("__score_cache_context__")
+        if existing is not None and existing.get("identity") == identity:
+            return str(existing["key"])
+
+    payload = {
+        "data_shape": tuple(int(x) for x in data.shape),
+        "data_dtype": str(data.dtype),
+        "data_sha256": _array_hash(data),
+        "node_types": tuple(str(t) for t in node_types),
+        "alpha_mu": alpha_mu,
+        "tau2": tau2,
+        "survival_horizon": horizon,
+        "survival_time_sha256": None
+        if survival_time is None
+        else _array_hash(np.asarray(survival_time, dtype=np.float64)),
+        "survival_event_sha256": None
+        if survival_event is None
+        else _array_hash(np.asarray(survival_event, dtype=np.int8)),
+    }
+    context_key = _array_hash(
+        np.frombuffer(repr(payload).encode("utf-8"), dtype=np.uint8)
+    )
+    if cache is not None:
+        existing = cache.get("__score_cache_context__")
+        if existing is not None and existing.get("payload") != payload:
+            raise ValueError(
+                "score cache was reused with different data, node types, or "
+                "scoring hyperparameters"
+            )
+        cache["__score_cache_context__"] = {
+            "identity": identity,
+            "payload": payload,
+            "key": context_key,
+        }
+    return context_key
 
 
 def _safe_logdet_chol(M: np.ndarray) -> Tuple[float, np.ndarray]:
@@ -248,12 +327,15 @@ class _BGeWorkspace:
 
 
 def _get_bge_workspace(
-    data: np.ndarray, alpha_mu: float, cache: Optional[MutableMapping] = None
+    data: np.ndarray,
+    alpha_mu: float,
+    context_key: str,
+    cache: Optional[MutableMapping] = None,
 ) -> _BGeWorkspace:
     if cache is not None:
         # Namespaced key so it cannot collide with a ``(j, frozenset)``
         # local-score key.
-        ws_key = ("__bge_workspace__", data.shape, float(alpha_mu))
+        ws_key = ("__bge_workspace__", context_key, float(alpha_mu))
         ws = cache.get(ws_key)
         if ws is None:
             ws = _BGeWorkspace(data, alpha_mu=alpha_mu)
@@ -287,6 +369,7 @@ def _logistic_laplace(
     y: np.ndarray,
     X: np.ndarray,
     tau2: float = _TAU2_DEFAULT,
+    sample_weight: Optional[np.ndarray] = None,
 ) -> float:
     """Laplace-approximated log marginal likelihood for logistic reg.
 
@@ -304,6 +387,12 @@ def _logistic_laplace(
     """
     y = y.astype(np.float64, copy=False)
     n, k = X.shape
+    if sample_weight is None:
+        sw = np.ones(n, dtype=np.float64)
+    else:
+        sw = np.asarray(sample_weight, dtype=np.float64).reshape(n)
+        if not np.all(np.isfinite(sw)) or np.any(sw < 0.0) or float(sw.sum()) <= 0.0:
+            raise ValueError("sample_weight must be finite, non-negative, and non-zero")
 
     # Prior precision (diagonal): zero on the intercept, 1/tau^2 elsewhere.
     prec = np.zeros(k, dtype=np.float64)
@@ -322,9 +411,9 @@ def _logistic_laplace(
         w = p * (1.0 - p)
         # Gradient of negative joint log-posterior:
         #   -g = X^T (p - y) + prec * beta
-        grad = X.T @ (p - y) + prec * beta
+        grad = X.T @ (sw * (p - y)) + prec * beta
         # Hessian:  H = X^T diag(w) X + diag(prec)
-        Xw = X * w[:, None]
+        Xw = X * (sw * w)[:, None]
         H = X.T @ Xw
         H[np.diag_indices_from(H)] += prec
         # Solve H delta = grad
@@ -335,11 +424,11 @@ def _logistic_laplace(
             # Very rare; fall back to pinv-based solve.
             delta = np.linalg.lstsq(H, grad, rcond=None)[0]
         # Backtracking line search on the negative log-posterior.
-        neg_log_post = _neg_log_posterior(beta, X, y, prec)
+        neg_log_post = _neg_log_posterior(beta, X, y, prec, sw)
         step = 1.0
         for _ls in range(30):
             new_beta = beta - step * delta
-            new_loss = _neg_log_posterior(new_beta, X, y, prec)
+            new_loss = _neg_log_posterior(new_beta, X, y, prec, sw)
             if new_loss < neg_log_post - 1e-12:
                 break
             step *= 0.5
@@ -355,7 +444,7 @@ def _logistic_laplace(
     # ---- evaluate Laplace log marginal ----
     z = X @ beta
     # log-lik = sum [y_i z_i - log(1 + exp(z_i))]  via logaddexp for stability
-    log_lik = float(np.sum(y * z - np.logaddexp(0.0, z)))
+    log_lik = float(np.sum(sw * (y * z - np.logaddexp(0.0, z))))
 
     # Gaussian prior log pdf on penalised coefs:
     #   log N(beta_pen | 0, tau^2 I) = - (k_pen / 2) log(2 pi tau^2)
@@ -373,7 +462,7 @@ def _logistic_laplace(
     # Hessian at MAP
     p = np.where(z >= 0, 1.0 / (1.0 + np.exp(-z)), np.exp(z) / (1.0 + np.exp(z)))
     w = p * (1.0 - p)
-    Xw = X * w[:, None]
+    Xw = X * (sw * w)[:, None]
     H = X.T @ Xw
     H[np.diag_indices_from(H)] += prec
     # For the intercept, prec is 0 and if n is tiny H can be singular; the
@@ -385,26 +474,35 @@ def _logistic_laplace(
     return float(log_marg)
 
 
-def _neg_log_posterior(beta, X, y, prec) -> float:
+def _neg_log_posterior(beta, X, y, prec, sample_weight) -> float:
     z = X @ beta
     # -log-lik:  sum logaddexp(0, z) - y*z
-    neg_ll = float(np.sum(np.logaddexp(0.0, z)) - float(y @ z))
+    neg_ll = float(np.sum(sample_weight * (np.logaddexp(0.0, z) - y * z)))
     # -log-prior (Gaussian, excluding constants since we only compare):
     neg_lp = 0.5 * float(np.sum(prec * beta * beta))
     return neg_ll + neg_lp
 
 
-def _bernoulli_bic_fallback(y: np.ndarray, X: np.ndarray) -> float:
+def _bernoulli_bic_fallback(
+    y: np.ndarray,
+    X: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
+) -> float:
     """BIC fallback for binary nodes when n < 2 k (Laplace unstable)."""
     from sklearn.linear_model import LogisticRegression
 
     n, k = X.shape
-    if k == 1 or y.sum() == 0 or y.sum() == n:
-        s = float(y.sum())
-        p = s / n
+    if sample_weight is None:
+        sw = np.ones(n, dtype=np.float64)
+    else:
+        sw = np.asarray(sample_weight, dtype=np.float64).reshape(n)
+    n_eff = max(float(sw.sum()), 1.0)
+    s = float(sw @ y)
+    if k == 1 or s <= 0.0 or s >= n_eff:
+        p = s / n_eff
         p_c = min(max(p, 1e-12), 1.0 - 1e-12)
-        log_lik = s * np.log(p_c) + (n - s) * np.log1p(-p_c)
-        return float(log_lik - 0.5 * 1 * np.log(n))
+        log_lik = s * np.log(p_c) + (n_eff - s) * np.log1p(-p_c)
+        return float(log_lik - 0.5 * np.log(n_eff))
     # A tiny L2 (large C) for numerical stability only; intercept is in X[:,0]
     # so we disable sklearn's own intercept.
     model = LogisticRegression(
@@ -413,11 +511,69 @@ def _bernoulli_bic_fallback(y: np.ndarray, X: np.ndarray) -> float:
         solver="lbfgs",
         max_iter=500,
         tol=1e-8,
-    ).fit(X, y.astype(int))
+    ).fit(X, y.astype(int), sample_weight=sw)
     w = model.coef_[0]
     z = X @ w
-    log_lik = float(np.sum(y * z - np.logaddexp(0.0, z)))
-    return float(log_lik - 0.5 * k * np.log(n))
+    log_lik = float(np.sum(sw * (y * z - np.logaddexp(0.0, z))))
+    return float(log_lik - 0.5 * k * np.log(n_eff))
+
+
+def _km_estimator(time: np.ndarray, event: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    order = np.argsort(time, kind="mergesort")
+    t_s = time[order]
+    e_s = event[order].astype(int)
+    uniq, inv = np.unique(t_s, return_inverse=True)
+    d = np.zeros(uniq.size, dtype=float)
+    np.add.at(d, inv, e_s.astype(float))
+    counts = np.bincount(inv, minlength=uniq.size).astype(float)
+    cum_before = np.concatenate([[0.0], np.cumsum(counts)[:-1]])
+    n_at = time.size - cum_before
+    with np.errstate(divide="ignore", invalid="ignore"):
+        factors = np.where(n_at > 0, 1.0 - d / n_at, 1.0)
+    return uniq, np.cumprod(factors)
+
+
+def _km_eval(times: np.ndarray, survival: np.ndarray, t: np.ndarray) -> np.ndarray:
+    idx = np.searchsorted(times, t, side="right") - 1
+    out = np.ones_like(t, dtype=float)
+    mask = idx >= 0
+    out[mask] = survival[idx[mask]]
+    return out
+
+
+def _survival_horizon_ipcw_endpoint(
+    time: np.ndarray,
+    event: np.ndarray,
+    horizon: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    t = np.asarray(time, dtype=np.float64).ravel()
+    e = np.asarray(event, dtype=np.int8).ravel()
+    if t.shape != e.shape:
+        raise ValueError("survival_time and survival_event must have the same shape")
+    if not np.all(np.isfinite(t)) or np.any(t <= 0.0):
+        raise ValueError("survival_time must contain finite positive follow-up times")
+    if not set(np.unique(e).tolist()).issubset({0, 1}):
+        raise ValueError("survival_event must contain only 0/1 values")
+    if not np.isfinite(horizon) or horizon <= 0.0:
+        raise ValueError("survival_horizon must be finite and positive")
+
+    case = (t <= horizon) & (e == 1)
+    control = t > horizon
+    keep = case | control
+    if not np.any(keep):
+        raise ValueError("no rows have determined survival status at the horizon")
+
+    cens = 1 - e
+    km_t, km_s = _km_estimator(t, cens)
+    g_t_minus = _km_eval(km_t, km_s, np.nextafter(t, -np.inf))
+    g_horizon = float(_km_eval(km_t, km_s, np.asarray([horizon]))[0])
+    weights = np.zeros_like(t, dtype=np.float64)
+    eps = 1e-8
+    weights[case] = 1.0 / np.clip(g_t_minus[case], eps, 1.0)
+    weights[control] = 1.0 / np.clip(g_horizon, eps, 1.0)
+    y = case[keep].astype(np.float64)
+    w = weights[keep]
+    return y, w, keep
 
 
 # ---------------------------------------------------------------------------
@@ -437,33 +593,56 @@ def score_node(
 
     Routing by ``node_types[j]``:
       * ``"continuous"``: exact BGe (see module docstring).
-      * ``"binary"`` / ``"survival"``: Laplace approximation to logistic
-        regression marginal likelihood (see module docstring).
+      * ``"binary"``: Laplace approximation to logistic regression.
+      * ``"survival"``: fixed-horizon IPCW logistic local likelihood using
+        ``survival_time`` and ``survival_event`` from ``hyper``.
     """
-    key = (int(j), _parents_key(parents))
+    data_arr = np.ascontiguousarray(np.asarray(data, dtype=np.float64))
+    context_key = _score_cache_context_key(data_arr, node_types, hyper, cache)
+    parent_key = _parents_key(parents)
+    key = ("local_score", context_key, int(j), parent_key)
     if cache is not None and key in cache:
         return cache[key]
 
     kind = node_types[j]
-    parents_list = sorted(key[1])
+    parents_list = sorted(parent_key)
 
     if kind == "continuous":
         alpha_mu = float(hyper.get("alpha_mu", _ALPHA_MU_DEFAULT))
         ws = _get_bge_workspace(
-            np.asarray(data, dtype=np.float64),
+            data_arr,
             alpha_mu,
+            context_key,
             cache=cache,
         )
         s = ws.local_score(j, parents_list)
-    elif kind in ("binary", "survival"):
-        y = np.asarray(data[:, j], dtype=np.float64)
-        X = _design_matrix(data, parents_list)
+    elif kind == "binary":
+        y = np.asarray(data_arr[:, j], dtype=np.float64)
+        X = _design_matrix(data_arr, parents_list)
         tau2 = float(hyper.get("tau2", _TAU2_DEFAULT))
         n, k = X.shape
         if n < 2 * k:
             s = _bernoulli_bic_fallback(y, X)
         else:
             s = _logistic_laplace(y, X, tau2=tau2)
+    elif kind == "survival":
+        if "survival_time" not in hyper or "survival_event" not in hyper:
+            raise ValueError(
+                "survival node scoring requires survival_time and survival_event"
+            )
+        horizon = float(hyper.get("survival_horizon", _SURVIVAL_HORIZON_DEFAULT))
+        y, weights, keep = _survival_horizon_ipcw_endpoint(
+            np.asarray(hyper["survival_time"], dtype=np.float64),
+            np.asarray(hyper["survival_event"], dtype=np.int8),
+            horizon,
+        )
+        X = _design_matrix(data_arr, parents_list)[keep]
+        tau2 = float(hyper.get("tau2", _TAU2_DEFAULT))
+        n, k = X.shape
+        if n < 2 * k:
+            s = _bernoulli_bic_fallback(y, X, sample_weight=weights)
+        else:
+            s = _logistic_laplace(y, X, tau2=tau2, sample_weight=weights)
     else:
         raise ValueError(f"Unknown node_type {kind!r} for node {j}")
 

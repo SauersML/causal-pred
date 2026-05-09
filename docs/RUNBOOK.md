@@ -117,10 +117,11 @@ Results are written to `outputs/benchmark.json`.
 ## Report generation
 
 ```sh
-uv run python scripts/generate_report.py
+uv run python scripts/generate_figures.py
 ```
 
-This renders a short HTML/Markdown report from `outputs/summary.json`.
+This renders standalone PNG/PDF figures from `outputs/summary.json` and the
+saved NumPy artefacts into `outputs/plots/`.
 
 ## Polygenic scoring via `gnomon`
 

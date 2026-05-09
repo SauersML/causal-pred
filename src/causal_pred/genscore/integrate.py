@@ -34,6 +34,7 @@ import pandas as pd
 from ..data.cohort import EhrPanel
 from ..data.synthetic import SyntheticDataset
 from .crosscoder import (
+    BANK_SHARED,
     TopKCrosscoder,
     encode,
     feature_stream_share,
@@ -57,6 +58,9 @@ class AlignedPanels:
     A: np.ndarray              # (n, m_G)
     B: np.ndarray              # (n, m_E)
     person_id: np.ndarray      # (n,) string
+    genome_feature_names: Tuple[str, ...]
+    ehr_feature_names: Tuple[str, ...]
+    ehr_feature_kinds: Tuple[str, ...]
 
 
 def align_panels_by_iid(
@@ -107,6 +111,9 @@ def align_panels_by_iid(
         A=np.ascontiguousarray(A, dtype=np.float64),
         B=np.ascontiguousarray(B, dtype=np.float64),
         person_id=np.asarray(keep_pids),
+        genome_feature_names=tuple(str(c) for c in prs_df.columns),
+        ehr_feature_names=tuple(str(c) for c in ehr_panel.feature_names),
+        ehr_feature_kinds=tuple(str(k) for k in ehr_panel.feature_kinds),
     )
 
 
@@ -132,9 +139,15 @@ def fit_panel_crosscoder(
     checkpoint_every: Optional[int] = None,
     checkpoint_callback: Optional[Callable[[Path, int], None]] = None,
     train_dtype: str | np.dtype = "float32",
-    stream_dropout_prob: float = 0.0,
-    cross_stream_align_coef: float = 0.0,
-    decoder_balance_coef: float = 0.0,
+    device: str = "auto",
+    activation_kind: str = "batch_topk",
+    row_cap_multiplier: float = 4.0,
+    shared_fraction: float = 0.5,
+    cross_reconstruction_coef: float = 0.35,
+    shared_alignment_coef: float = 0.05,
+    contrastive_coef: float = 0.02,
+    validation_fraction: float = 0.1,
+    mixed_likelihood: bool = True,
 ) -> TopKCrosscoder:
     """Train the TopK crosscoder on aligned panels, with biobank-friendly
     defaults (longer schedule, smaller learning rate). Thin wrapper around
@@ -156,9 +169,16 @@ def fit_panel_crosscoder(
         checkpoint_every=checkpoint_every,
         checkpoint_callback=checkpoint_callback,
         train_dtype=train_dtype,
-        stream_dropout_prob=stream_dropout_prob,
-        cross_stream_align_coef=cross_stream_align_coef,
-        decoder_balance_coef=decoder_balance_coef,
+        device=device,
+        activation_kind=activation_kind,
+        row_cap_multiplier=row_cap_multiplier,
+        shared_fraction=shared_fraction,
+        cross_reconstruction_coef=cross_reconstruction_coef,
+        shared_alignment_coef=shared_alignment_coef,
+        contrastive_coef=contrastive_coef,
+        validation_fraction=validation_fraction,
+        mixed_likelihood=mixed_likelihood,
+        ehr_feature_kinds=panels.ehr_feature_kinds,
     )
 
 
@@ -176,6 +196,11 @@ class FeatureSelection:
     genome_share: np.ndarray        # (k_promote,) float, in [0, 1]
     activation_rate: np.ndarray     # (k_promote,) float, fraction of
                                     # participants with z[:, j] > 0
+    score: np.ndarray
+    cross_reconstruction_gain: np.ndarray
+    bootstrap_stability: np.ndarray
+    negative_control_margin: np.ndarray
+    redundancy_penalty: np.ndarray
 
 
 def _feature_activation_rate(z: np.ndarray) -> np.ndarray:
@@ -192,6 +217,7 @@ def select_shared_features(
     genome_share_max: float = 0.8,
     min_activation_rate: float = 0.01,
     name_prefix: str = "feat",
+    max_abs_corr: float = 0.95,
 ) -> FeatureSelection:
     """Pick the most promotable features for downstream DAG inference.
 
@@ -205,11 +231,10 @@ def select_shared_features(
         drops features that fire so rarely they are useless as DAG
         covariates and would push the BGe / Laplace marginal-likelihood
         scores into a degenerate regime.
-      * **Top by joint strength**: among the survivors, take the
-        ``n_promote`` features whose product
-        ``r_G[j] * (1 - r_G[j]) * activation_rate[j]`` is largest. This
-        favours features that are simultaneously well-balanced across
-        streams *and* often-active.
+      * **Top by causal-promotion score**: among the survivors, rank by a
+        product of decoder balance, activation rate, single-stream
+        cross-reconstruction gain, split-half stability, shuffled-pair
+        margin, and a greedy redundancy penalty.
 
     Parameters
     ----------
@@ -235,10 +260,15 @@ def select_shared_features(
         )
 
     z = encode(model, panels.A, panels.B)
+    z_g = encode(model, panels.A, panels.B, view="genome")
+    z_e = encode(model, panels.A, panels.B, view="ehr")
     rates = _feature_activation_rate(z)
     r_G = feature_stream_share(model)
+    shared_bank = model.latent_bank == BANK_SHARED
 
     eligible = (
+        shared_bank
+        &
         (r_G >= genome_share_min)
         & (r_G <= genome_share_max)
         & (rates >= min_activation_rate)
@@ -250,12 +280,63 @@ def select_shared_features(
             "consider relaxing thresholds or training longer"
         )
 
-    score = r_G * (1.0 - r_G) * rates
-    eligible_score = score[eligible_idx]
-    order = np.argsort(eligible_score)[::-1]
-    take = min(n_promote, eligible_idx.size)
-    chosen = eligible_idx[order[:take]]
-    chosen_sorted = np.sort(chosen)
+    decoder_balance = 4.0 * r_G * (1.0 - r_G)
+    g_norm = np.linalg.norm(model.W_d_G, axis=1)
+    e_norm = np.linalg.norm(model.W_d_E, axis=1)
+    cross_gain = (
+        _feature_activation_rate(z_g) * e_norm
+        + _feature_activation_rate(z_e) * g_norm
+    )
+
+    split = z.shape[0] // 2
+    if split > 0 and split < z.shape[0]:
+        rate_a = _feature_activation_rate(z[:split])
+        rate_b = _feature_activation_rate(z[split:])
+        stability = np.minimum(rate_a, rate_b) / np.maximum(
+            np.maximum(rate_a, rate_b), 1e-12
+        )
+    else:
+        stability = np.ones(model.d, dtype=float)
+
+    matched = np.mean(z_g * z_e, axis=0)
+    shuffled = np.mean(z_g * z_e[::-1], axis=0)
+    neg_margin = np.maximum(matched - shuffled, 0.0)
+    if np.nanmax(neg_margin) > 0:
+        neg_margin = neg_margin / np.nanmax(neg_margin)
+
+    raw_score = (
+        decoder_balance
+        * rates
+        * np.maximum(cross_gain, 0.0)
+        * np.maximum(stability, 0.0)
+        * np.maximum(neg_margin, 0.0)
+    )
+
+    order = eligible_idx[np.argsort(raw_score[eligible_idx])[::-1]]
+    chosen: list[int] = []
+    penalties = np.ones(model.d, dtype=float)
+    z_centered = z - z.mean(axis=0, keepdims=True)
+    z_norm = np.linalg.norm(z_centered, axis=0)
+    for idx in order.tolist():
+        penalty = 1.0
+        if chosen:
+            denom = np.maximum(z_norm[idx] * z_norm[np.asarray(chosen)], 1e-12)
+            corr = np.abs(z_centered[:, idx] @ z_centered[:, np.asarray(chosen)] / denom)
+            max_corr = float(np.max(corr))
+            if max_corr >= max_abs_corr:
+                continue
+            penalty = max(0.0, 1.0 - max_corr)
+        penalties[idx] = penalty
+        chosen.append(int(idx))
+        if len(chosen) >= n_promote:
+            break
+
+    if not chosen:
+        raise RuntimeError(
+            "all eligible shared features were removed by the redundancy filter; "
+            "relax max_abs_corr or train with a wider shared bank"
+        )
+    chosen_sorted = np.sort(np.asarray(chosen, dtype=np.int64))
 
     names = tuple(f"{name_prefix}_{int(j):04d}" for j in chosen_sorted)
     return FeatureSelection(
@@ -263,6 +344,11 @@ def select_shared_features(
         names=names,
         genome_share=r_G[chosen_sorted].astype(np.float64),
         activation_rate=rates[chosen_sorted].astype(np.float64),
+        score=(raw_score[chosen_sorted] * penalties[chosen_sorted]).astype(np.float64),
+        cross_reconstruction_gain=cross_gain[chosen_sorted].astype(np.float64),
+        bootstrap_stability=stability[chosen_sorted].astype(np.float64),
+        negative_control_margin=neg_margin[chosen_sorted].astype(np.float64),
+        redundancy_penalty=penalties[chosen_sorted].astype(np.float64),
     )
 
 
