@@ -105,7 +105,8 @@ per-exposure GWAS summary statistics using the MrDAG model (Zuber et al.
 Mixed-type marginal likelihoods for scoring a DAG against data. Gaussian
 nodes use the BGe score (Geiger-Heckerman 2002, Kuipers-Moffa-Heckerman
 2014). Binary nodes use a Laplace-approximated logistic marginal. Survival
-nodes defer to `gam/` for an EB / NUTS approximation to the marginal.
+nodes use a fixed-horizon IPCW logistic local likelihood during graph scoring;
+the full `gam/` survival model is fit after structure sampling.
 
 ### `dagslam/`
 Hill-climbing search through DAG space given a score function and an edge
@@ -122,10 +123,11 @@ uses the same structural edge mask as DAGSLAM, so posterior samples stay in
 the biologically admissible graph space.
 
 ### `gam/`
-Distributional survival GAM wrappers around the `gamfit` Python bindings for
-the `SauersML/gam` Rust engine. The production pipeline fits gamfit survival
-models on posterior parent sets sampled by structure MCMC plus the target's
-median-probability parent model, then averages per-person survival curves by
+Survival GAM wrappers around the `gamfit` Python bindings for the
+`SauersML/gam` Rust engine. The production pipeline fits gamfit location-scale
+survival models on posterior parent sets sampled by structure MCMC plus the
+target's median-probability parent model, queries gamfit survival curves and
+response-scale standard errors, then averages per-person survival curves by
 parent-set posterior probability.
 
 ### `validation/`
@@ -181,12 +183,10 @@ The only supported GAM backend is the `SauersML/gam` Rust engine pinned in
 `pyproject.toml`. Do not reach for the legacy pure-Python library whose
 import name begins with "py" -- it has repeatedly caused regressions and is
 a hard tripwire (see CLAUDE.md). If you genuinely need a new backend:
-1. Implement the two public functions used by `gam/survival.py`
-   (`fit_posterior`, `posterior_predict`) behind a thin adapter module.
-2. Gate the import in `gam/__init__.py` so test collection still works
-   when the new backend is missing.
-3. Add a CI toggle and run the full suite with both backends before
-   making the switch default.
+1. Implement the `SurvivalGAM` methods used by the pipeline behind a thin
+   adapter module.
+2. Replace the required dependency in `pyproject.toml` and update the lockfile.
+3. Run the full suite and a benchmark smoke test before making the switch.
 
 ### How `gnomon` slots in
 `data/polygenic.py` constructs a temporary working directory, writes VCF or
@@ -213,8 +213,8 @@ raises a clear `NotImplementedError` naming the missing binary.
   environment byte-for-byte.
 * Every stage takes an explicit `rng` argument. Children are derived via
   `numpy.random.Generator.spawn`-style splitting; no stage re-seeds.
-* Building `SauersML/gam` requires a working Rust toolchain
-  (`rustup default stable`). The wheel is compiled once per environment.
+* `gamfit` ships wheels for supported platforms. A Rust toolchain is only
+  needed when no compatible wheel exists.
 * `outputs/summary.json` is written through `_json_sanitise` in
   `pipeline.py`. Do not bypass it; numpy scalars and arrays must be
   converted or the file becomes non-round-trippable.

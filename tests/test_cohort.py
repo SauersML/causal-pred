@@ -290,7 +290,7 @@ def test_load_cohort_csv_standardises_continuous(tmp_path):
         "ldl_cholesterol",
         "triglycerides",
     )
-    assert node_types == ("binary", "continuous", "continuous", "continuous", "continuous", "continuous")
+    assert node_types == ("survival", "continuous", "continuous", "continuous", "continuous", "continuous")
     assert X.shape == (10, 6)
     # Binary column stays {0, 1}.
     bin_idx = columns.index("type2_diabetes")

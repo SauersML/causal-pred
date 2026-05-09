@@ -18,7 +18,7 @@
 # Steps:
 #   1. assert AoU workspace variables exist
 #   2. install `uv` if missing
-#   3. install a minimal stable Rust toolchain if missing (`gamfit` builds from source)
+#   3. install a minimal stable Rust toolchain if a compatible `gamfit` wheel is unavailable
 #   4. locate this checkout, or clone it into $HOME/causal-pred on a fresh workbench
 #   5. `uv sync --locked --dev` into the repo-local .venv
 #   6. install `gnomon` if missing

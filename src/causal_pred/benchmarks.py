@@ -99,14 +99,18 @@ def _covariate_matrix(data: SyntheticDataset) -> Tuple[np.ndarray, list]:
     return X, names
 
 
-def _surv_at_times(surv: np.ndarray, t_grid: np.ndarray, times: Sequence[float]) -> np.ndarray:
+def _surv_at_times(
+    surv: np.ndarray, t_grid: np.ndarray, times: Sequence[float]
+) -> np.ndarray:
     S = np.asarray(surv, dtype=float)
     grid = np.asarray(t_grid, dtype=float).ravel()
     eval_times = np.asarray(times, dtype=float).ravel()
     if S.ndim != 2:
         raise ValueError(f"survival matrix must be 2-D, got shape {S.shape}")
     if S.shape[1] != grid.size:
-        raise ValueError(f"survival matrix has {S.shape[1]} columns but grid has {grid.size}")
+        raise ValueError(
+            f"survival matrix has {S.shape[1]} columns but grid has {grid.size}"
+        )
     if grid.size == 0:
         raise ValueError("survival time grid is empty")
     if np.any(np.diff(grid) <= 0.0):
@@ -680,7 +684,7 @@ def run_causal_pred(
             progress=False,
         )
         per_model.append(fit.predict_survival_mean(test_X_ps, t_grid))
-        diag = fit.posterior_summary()
+        diag = fit.uncertainty_summary()
         diag["parent_columns"] = list(cols)
         diag["posterior_parent_set_weight"] = float(weight)
         diag["posterior_parent_set_count"] = int(count)

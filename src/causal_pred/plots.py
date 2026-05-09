@@ -521,8 +521,8 @@ def survival_fan(
     """Uncertainty fan chart for one individual's survival curve.
 
     ``survival_samples`` has shape ``(n_samples, n_t)`` and holds
-    sampled or delta-method quantile slices of S(t).  We draw the median
-    line together with 50% and 90% bands.
+    sampled curves or deterministic point-estimate slices of S(t).  We draw
+    the median line together with 50% and 90% bands.
     """
     t = np.asarray(t_grid, dtype=float).ravel()
     S = np.asarray(survival_samples, dtype=float)

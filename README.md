@@ -3,8 +3,9 @@
 End-to-end implementation of the project proposed in `paper/main.tex`: predict
 disease *and* its causes on biobank-scale individual-level data, with explicit
 structural uncertainty over DAG parent sets. The gamfit survival backend
-reports response-scale delta-method uncertainty, which is combined with
-structural parent-set uncertainty in the delivered survival intervals.
+fits right-censored location-scale survival models and reports gamfit
+delta-method response-scale uncertainty, which is combined with structural
+parent-set uncertainty.
 
 Target disease: **Type 2 Diabetes (T2D)**. T2D has well-characterised causal
 parents (BMI, HbA1c, lifestyle, genetic risk), strong Mendelian-randomisation
@@ -39,7 +40,7 @@ which makes the validation framework meaningful even on synthetic data.
                     posterior parent sets + pathways
                                 |
                                 v
-                    gamfit distributional survival GAM
+                    gamfit survival GAM
                                 |
                                 v
          per-person survival curves + causal pathway probabilities
@@ -54,7 +55,7 @@ src/causal_pred/
   scoring/     mixed-type marginal-likelihood scores (BGe / Laplace)
   dagslam/     DAGSLAM hill-climber for the warm-start DAG
   mcmc/        structure MCMC with MrDAG prior
-  gam/         distributional survival GAM (SauersML/gam backend)
+  gam/         survival GAM (SauersML/gam backend)
   validation/  known-edge checks, Nagelkerke R^2, calibration, time-dep AUC
   plots.py     figure helpers (heatmaps, calibration, survival fans)
   pipeline.py  end-to-end orchestration

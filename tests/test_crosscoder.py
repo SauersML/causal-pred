@@ -230,11 +230,11 @@ def test_mixed_likelihood_ranks_rare_binary_signal_better_than_gaussian_mse():
     )
 
     def _score(model):
-        z = encode(model, A, B)
+        z = encode(model, A, B, view="genome")
         _a_hat, b_hat = reconstruct(model, z)
         return float(np.corrcoef(b_hat[:, 0], B[:, 0])[0, 1])
 
-    assert _score(mixed) > _score(gaussian) + 0.02
+    assert _score(mixed) > _score(gaussian) + 0.2
 
 
 def test_crosscoder_checkpoint_resume_matches_uninterrupted_fit(tmp_path):

@@ -149,9 +149,7 @@ def fit_panel_crosscoder(
     validation_fraction: float = 0.1,
     mixed_likelihood: bool = True,
 ) -> TopKCrosscoder:
-    """Train the TopK crosscoder on aligned panels, with biobank-friendly
-    defaults (longer schedule, smaller learning rate). Thin wrapper around
-    :func:`train_crosscoder`."""
+    """Train the GPU multi-view BatchTopK crosscoder on aligned panels."""
     return train_crosscoder(
         A=panels.A,
         B=panels.B,

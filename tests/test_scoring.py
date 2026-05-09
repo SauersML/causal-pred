@@ -24,6 +24,7 @@ from causal_pred.scoring.mixed import (
     _bernoulli_bic_fallback,
     _design_matrix,
     _logistic_laplace,
+    _survival_horizon_ipcw_endpoint,
     score_dag,
     score_delta_add_edge,
     score_delta_remove_edge,
@@ -35,6 +36,7 @@ from causal_pred.scoring.mixed import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _random_acyclic_adj(p: int, density: float, rng: np.random.Generator) -> np.ndarray:
     A = (rng.random((p, p)) < density).astype(int)
@@ -61,9 +63,22 @@ def _survival_hyper(data) -> dict:
     return {"survival_time": data.time, "survival_event": data.event}
 
 
+def test_survival_horizon_ipcw_excludes_early_censored_rows():
+    time = np.array([3.0, 6.0, 12.0, 14.0])
+    event = np.array([0, 1, 0, 1])
+
+    y, weights, keep = _survival_horizon_ipcw_endpoint(time, event, horizon=10.0)
+
+    np.testing.assert_array_equal(keep, np.array([False, True, True, True]))
+    np.testing.assert_array_equal(y, np.array([1.0, 0.0, 0.0]))
+    assert np.all(np.isfinite(weights))
+    assert np.all(weights > 0.0)
+
+
 # ---------------------------------------------------------------------------
 # 1. BGe reference check
 # ---------------------------------------------------------------------------
+
 
 def test_bge_matches_reference():
     """BGe joint log marginal of a 2-variable set matches a numerical
@@ -99,9 +114,7 @@ def test_bge_matches_reference():
     rng = np.random.default_rng(123)
     N, p = 50, 3
     # Generate a small Gaussian dataset with some correlation structure.
-    Sigma = np.array([[1.0, 0.5, 0.2],
-                      [0.5, 1.0, 0.3],
-                      [0.2, 0.3, 1.0]])
+    Sigma = np.array([[1.0, 0.5, 0.2], [0.5, 1.0, 0.3], [0.2, 0.3, 1.0]])
     L = np.linalg.cholesky(Sigma)
     X = rng.standard_normal((N, p)) @ L.T + np.array([0.2, -0.1, 0.05])
 
@@ -111,7 +124,7 @@ def test_bge_matches_reference():
 
     # (a) our code:
     ws = _BGeWorkspace(X, alpha_mu=alpha_mu)
-    ours = ws.log_marginal([0, 2])        # subset Y = {x0, x2}
+    ours = ws.log_marginal([0, 2])  # subset Y = {x0, x2}
 
     # (b) independent reference:
     idx = [0, 2]
@@ -132,7 +145,9 @@ def test_bge_matches_reference():
         + 0.5 * n_vars * (math.log(alpha_mu) - math.log(alpha_mu + N))
         + 0.5 * (alpha_w + n_vars - 1) * log_det_T
         - 0.5 * (alpha_w + N + n_vars - 1) * log_det_R
-        + sum(math.lgamma(0.5 * (alpha_w + N + n_vars - i)) for i in range(1, n_vars + 1))
+        + sum(
+            math.lgamma(0.5 * (alpha_w + N + n_vars - i)) for i in range(1, n_vars + 1)
+        )
         - sum(math.lgamma(0.5 * (alpha_w + n_vars - i)) for i in range(1, n_vars + 1))
     )
 
@@ -209,10 +224,11 @@ def test_bge_matches_monte_carlo_reference():
     loglik = (
         0.5 * N * np.log(Lambda)
         - 0.5 * N * math.log(2.0 * math.pi)
-        - 0.5 * Lambda * np.sum(diffs ** 2, axis=1)
+        - 0.5 * Lambda * np.sum(diffs**2, axis=1)
     )
     # log p(y) = logsumexp(loglik) - log M
     from scipy.special import logsumexp
+
     bge_mc = float(logsumexp(loglik) - math.log(M))
 
     rel = abs(bge_ours - bge_mc) / max(1.0, abs(bge_mc))
@@ -222,6 +238,7 @@ def test_bge_matches_monte_carlo_reference():
 # ---------------------------------------------------------------------------
 # 2. Laplace vs BIC on a binary child with strong effect
 # ---------------------------------------------------------------------------
+
 
 def test_laplace_better_than_bic():
     """On a small-but-informative binary problem, Laplace and BIC should
@@ -243,8 +260,8 @@ def test_laplace_better_than_bic():
     p = 1.0 / (1.0 + np.exp(-z))
     y = (rng.random(n) < p).astype(float)
 
-    data = np.column_stack([y, x])             # col 0 = y, col 1 = x
-    X_design = _design_matrix(data, [1])       # intercept + x
+    data = np.column_stack([y, x])  # col 0 = y, col 1 = x
+    X_design = _design_matrix(data, [1])  # intercept + x
 
     lap = _logistic_laplace(y, X_design, tau2=10.0)
     bic = _bernoulli_bic_fallback(y, X_design)
@@ -258,19 +275,26 @@ def test_laplace_better_than_bic():
 # 3. Finite / non-empty beats empty
 # ---------------------------------------------------------------------------
 
+
 def test_score_is_finite(small_data):
     rng = np.random.default_rng(0)
     p = small_data.p
     adj = _random_acyclic_adj(p, density=0.15, rng=rng)
-    s = score_dag(adj, small_data.X, small_data.node_types, **_survival_hyper(small_data))
+    s = score_dag(
+        adj, small_data.X, small_data.node_types, **_survival_hyper(small_data)
+    )
     assert np.isfinite(s)
 
 
 def test_true_dag_beats_empty(small_data):
     adj_true = small_data.ground_truth_adj
     adj_empty = np.zeros_like(adj_true)
-    s_true = score_dag(adj_true, small_data.X, small_data.node_types, **_survival_hyper(small_data))
-    s_empty = score_dag(adj_empty, small_data.X, small_data.node_types, **_survival_hyper(small_data))
+    s_true = score_dag(
+        adj_true, small_data.X, small_data.node_types, **_survival_hyper(small_data)
+    )
+    s_empty = score_dag(
+        adj_empty, small_data.X, small_data.node_types, **_survival_hyper(small_data)
+    )
     assert s_true - s_empty > 200.0, (
         f"truth {s_true:.2f} vs empty {s_empty:.2f} gap too small"
     )
@@ -280,10 +304,11 @@ def test_true_dag_beats_empty(small_data):
 # 4. Delta functions to 1e-8
 # ---------------------------------------------------------------------------
 
+
 def _pick_addable_edge(adj):
     p = adj.shape[0]
     for j in range(p):
-        for i in range(j):            # i < j keeps topological order
+        for i in range(j):  # i < j keeps topological order
             if adj[i, j] == 0:
                 return i, j
     raise RuntimeError("no candidate")
@@ -292,11 +317,17 @@ def _pick_addable_edge(adj):
 def test_add_edge_delta_matches_full_rescore(small_data):
     adj = small_data.ground_truth_adj.copy()
     i, j = _pick_addable_edge(adj)
-    s_before = score_dag(adj, small_data.X, small_data.node_types, **_survival_hyper(small_data))
-    delta = score_delta_add_edge(i, j, adj, small_data.X, small_data.node_types, **_survival_hyper(small_data))
+    s_before = score_dag(
+        adj, small_data.X, small_data.node_types, **_survival_hyper(small_data)
+    )
+    delta = score_delta_add_edge(
+        i, j, adj, small_data.X, small_data.node_types, **_survival_hyper(small_data)
+    )
     adj2 = adj.copy()
     adj2[i, j] = 1
-    s_after = score_dag(adj2, small_data.X, small_data.node_types, **_survival_hyper(small_data))
+    s_after = score_dag(
+        adj2, small_data.X, small_data.node_types, **_survival_hyper(small_data)
+    )
     assert abs((s_after - s_before) - delta) < 1e-8
 
 
@@ -304,11 +335,17 @@ def test_remove_edge_delta_matches_full_rescore(small_data):
     adj = small_data.ground_truth_adj.copy()
     idx = np.argwhere(adj == 1)
     i, j = int(idx[0, 0]), int(idx[0, 1])
-    s_before = score_dag(adj, small_data.X, small_data.node_types, **_survival_hyper(small_data))
-    delta = score_delta_remove_edge(i, j, adj, small_data.X, small_data.node_types, **_survival_hyper(small_data))
+    s_before = score_dag(
+        adj, small_data.X, small_data.node_types, **_survival_hyper(small_data)
+    )
+    delta = score_delta_remove_edge(
+        i, j, adj, small_data.X, small_data.node_types, **_survival_hyper(small_data)
+    )
     adj2 = adj.copy()
     adj2[i, j] = 0
-    s_after = score_dag(adj2, small_data.X, small_data.node_types, **_survival_hyper(small_data))
+    s_after = score_dag(
+        adj2, small_data.X, small_data.node_types, **_survival_hyper(small_data)
+    )
     assert abs((s_after - s_before) - delta) < 1e-8
 
 
@@ -321,8 +358,12 @@ def test_reverse_edge_delta_matches_full_rescore(small_data):
     adj_rev[j, i] = 1
     assert _is_dag(adj_rev), "this ground-truth edge can't be cleanly reversed"
 
-    s_before = score_dag(adj, small_data.X, small_data.node_types, **_survival_hyper(small_data))
-    delta = score_delta_reverse_edge(i, j, adj, small_data.X, small_data.node_types, **_survival_hyper(small_data))
+    s_before = score_dag(
+        adj, small_data.X, small_data.node_types, **_survival_hyper(small_data)
+    )
+    delta = score_delta_reverse_edge(
+        i, j, adj, small_data.X, small_data.node_types, **_survival_hyper(small_data)
+    )
     s_after = score_dag(
         adj_rev,
         small_data.X,
@@ -364,6 +405,7 @@ def test_delta_exact_match(small_data):
 # 5. Column-permutation invariance
 # ---------------------------------------------------------------------------
 
+
 def test_insensitive_to_column_order(small_data):
     rng = np.random.default_rng(42)
     adj = small_data.ground_truth_adj
@@ -396,18 +438,31 @@ def test_insensitive_to_column_order(small_data):
 # 6. Cache speedup and runtime budgets
 # ---------------------------------------------------------------------------
 
+
 def test_cache_hit_speeds_up(medium_data):
     adj = medium_data.ground_truth_adj
     cache = {}
     t0 = time.perf_counter()
-    s1 = score_dag(adj, medium_data.X, medium_data.node_types, cache=cache, **_survival_hyper(medium_data))
+    s1 = score_dag(
+        adj,
+        medium_data.X,
+        medium_data.node_types,
+        cache=cache,
+        **_survival_hyper(medium_data),
+    )
     t_cold = time.perf_counter() - t0
     t0 = time.perf_counter()
-    s2 = score_dag(adj, medium_data.X, medium_data.node_types, cache=cache, **_survival_hyper(medium_data))
+    s2 = score_dag(
+        adj,
+        medium_data.X,
+        medium_data.node_types,
+        cache=cache,
+        **_survival_hyper(medium_data),
+    )
     t_warm = time.perf_counter() - t0
     assert s1 == s2
     assert t_warm < 0.05 * t_cold, (
-        f"cache did not speed up: cold={t_cold*1e3:.2f}ms warm={t_warm*1e3:.2f}ms"
+        f"cache did not speed up: cold={t_cold * 1e3:.2f}ms warm={t_warm * 1e3:.2f}ms"
     )
 
 
@@ -426,28 +481,44 @@ def test_score_cache_rejects_different_data_or_hyperparameters(medium_data):
     changed_h = dict(h)
     changed_h["alpha_mu"] = 2.0
     with pytest.raises(ValueError, match="score cache was reused"):
-        score_node(0, [], medium_data.X, medium_data.node_types, cache=cache, **changed_h)
+        score_node(
+            0, [], medium_data.X, medium_data.node_types, cache=cache, **changed_h
+        )
 
 
 def test_runtime_budget(medium_data):
     adj = medium_data.ground_truth_adj
     cache = {}
     t0 = time.perf_counter()
-    score_dag(adj, medium_data.X, medium_data.node_types, cache=cache, **_survival_hyper(medium_data))
+    score_dag(
+        adj,
+        medium_data.X,
+        medium_data.node_types,
+        cache=cache,
+        **_survival_hyper(medium_data),
+    )
     t_cold = time.perf_counter() - t0
     t0 = time.perf_counter()
-    score_dag(adj, medium_data.X, medium_data.node_types, cache=cache, **_survival_hyper(medium_data))
+    score_dag(
+        adj,
+        medium_data.X,
+        medium_data.node_types,
+        cache=cache,
+        **_survival_hyper(medium_data),
+    )
     t_warm = time.perf_counter() - t0
-    assert t_cold < 1.0, f"cold rescore too slow: {t_cold*1e3:.1f}ms"
-    assert t_warm < 0.010, f"warm rescore too slow: {t_warm*1e3:.1f}ms"
+    assert t_cold < 1.0, f"cold rescore too slow: {t_cold * 1e3:.1f}ms"
+    assert t_warm < 0.010, f"warm rescore too slow: {t_warm * 1e3:.1f}ms"
 
 
 # ---------------------------------------------------------------------------
 # 7. Node-type routing
 # ---------------------------------------------------------------------------
 
+
 def test_score_respects_node_types(small_data):
     from causal_pred.data.nodes import NODE_INDEX
+
     j = NODE_INDEX["sex"]
     X = small_data.X
     assert small_data.node_types[j] == "binary"

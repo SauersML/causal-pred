@@ -144,20 +144,21 @@ Citations: Giudici P, Castelo R. (2003). *Improving Markov chain Monte
 Carlo model search for data mining*. Machine Learning 50(1-2). Madigan &
 York (1995).
 
-## 7. Distributional survival GAM
+## 7. Survival GAM
 
-Following Rigby-Stasinopoulos 2005 (GAMLSS), we parameterise the survival
-time `T` conditional on covariates `x` by a distributional form, eg
+We fit right-censored gamfit location-scale survival models conditional on a
+candidate parent set:
 
 ```
-T | x ~ Weibull(mu(x), sigma(x))
-log mu(x)    = sum_k f_k(x_k)
-log sigma(x) = sum_k g_k(x_k),
+Surv(entry, exit, event) ~ sum_k f_k(x_k),
+noise_formula = 1,
 ```
 
-with each `f_k, g_k` a P-spline (Eilers-Marx 1996) basis expansion. The
-posterior over spline coefficients is sampled with NUTS (Hoffman-Gelman
-2014) after an initial REML fit for the smoothing parameters (Wood 2011).
+with each continuous-feature `f_k` a P-spline (Eilers-Marx 1996) basis
+expansion. gamfit selects smoothing penalties by REML (Wood 2011). The
+pipeline queries survival and delta-method response-scale standard errors from
+gamfit at each requested horizon, then combines that within-model uncertainty
+with posterior parent-set averaging.
 
 Citations: Rigby RA, Stasinopoulos DM. (2005). *Generalized additive
 models for location, scale and shape*. Eilers PHC, Marx BD. (1996).

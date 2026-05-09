@@ -56,7 +56,7 @@ def _synthetic_panels(n: int, m_G: int, m_E: int, n_shared: int, rng):
         matrix=B,
         person_id=person_ids,
         feature_names=tuple(f"ehr_{j}" for j in range(m_E)),
-        feature_kinds=tuple("condition" for _ in range(m_E)),
+        feature_kinds=tuple("lab_mean" for _ in range(m_E)),
     )
     return person_ids, prs_df, ehr_panel
 
@@ -97,7 +97,15 @@ def test_full_integration_loop_augments_and_preserves_contract():
         genome_share_min=0.15,
         genome_share_max=0.85,
         min_activation_rate=0.05,
-        crosscoder_kwargs=dict(d=64, k=4, n_steps=1500, batch_size=128, lr=3e-3),
+        crosscoder_kwargs=dict(
+            d=64,
+            k=4,
+            n_steps=700,
+            batch_size=128,
+            lr=3e-3,
+            device="cpu",
+            contrastive_coef=0.0,
+        ),
         rng=np.random.default_rng(0),
     )
 
@@ -174,9 +182,11 @@ def test_augment_handles_partial_overlap_with_base_dataset():
         panels,
         d=32,
         k=3,
-        n_steps=400,
+        n_steps=250,
         batch_size=64,
         lr=3e-3,
+        device="cpu",
+        contrastive_coef=0.0,
         rng=np.random.default_rng(0),
     )
     sel = select_shared_features(

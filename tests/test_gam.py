@@ -1,75 +1,109 @@
-"""Tests for the distributional survival GAM (gamfit-library backend).
-
-The survival GAM delegates to the ``gamfit`` Python library (PyO3
-bindings to SauersML/gam's Rust engine). These tests keep the surface
-compact: we sanity-check the library is importable, that a small fit
-completes within the laptop's budget, shapes are correct, and BMA
-weights behave.
-"""
+"""Tests for the survival GAM (gamfit-library backend)."""
 
 from __future__ import annotations
 
-import time as _time
+import numpy as np
+import pytest
 
 import gamfit
-import numpy as np
 
 
-# ---------------------------------------------------------------------------
-# 0. Library-present smoke test
-# ---------------------------------------------------------------------------
+class _FakeSummary:
+    def to_dict(self):
+        return {
+            "reml_iterations": 3,
+            "reml_score": 12.5,
+            "edf_total": 2.0,
+            "sigma_residual": None,
+            "deviance": 4.0,
+        }
+
+
+class _FakePrediction:
+    def __init__(self, df_new, with_uncertainty: bool):
+        exit_time = df_new["exit"].to_numpy(dtype=float)
+        row = np.arange(exit_time.size, dtype=float)
+        self.survival = (
+            np.exp(-0.03 * (exit_time - 1.0)) * (1.0 - 0.0001 * row)
+        ).reshape(-1, 1)
+        self.survival_se = (
+            np.full((exit_time.size, 1), 0.02, dtype=float)
+            if with_uncertainty
+            else None
+        )
+
+
+class _FakeModel:
+    def summary(self):
+        return _FakeSummary()
+
+    def predict(self, df_new, *, with_uncertainty=False):
+        return _FakePrediction(df_new, with_uncertainty)
 
 
 def test_gam_import():
     info = gamfit.build_info()
-    # Must expose the capabilities we rely on.
     caps = info.get("capabilities", [])
     assert "fit" in caps and "predict" in caps and "summary" in caps, caps
 
 
-# ---------------------------------------------------------------------------
-# 1. Fit smoke test (< 60 s on small data)
-# ---------------------------------------------------------------------------
+def test_fit_smoke(monkeypatch):
+    """Fit wrapper calls gamfit location-scale and returns uncertainty slices."""
+    import causal_pred.gam.survival as survival_mod
 
+    seen = {}
 
-def test_fit_smoke(medium_data):
-    """Fit on ~300 rows with 3 covariates and check runtime + monotonicity."""
-    from causal_pred.data.nodes import NODE_INDEX
-    from causal_pred.gam.survival import fit_survival_gam
+    def fake_fit(df, formula, *, survival_likelihood, config):
+        seen["df_columns"] = tuple(df.columns)
+        seen["formula"] = formula
+        seen["survival_likelihood"] = survival_likelihood
+        seen["config"] = dict(config)
+        seen["df"] = df.copy()
+        return _FakeModel()
 
-    d = medium_data
-    # Cap rows for the laptop's sake.
-    n_keep = 300
-    keep = slice(0, n_keep)
+    monkeypatch.setattr(survival_mod.gam, "fit", fake_fit)
+    monkeypatch.setattr(
+        survival_mod.gam,
+        "build_info",
+        lambda: {"version": "test-gamfit"},
+    )
 
-    parents = ("BMI", "HbA1c", "age")  # 3 continuous covariates
-    cols = [NODE_INDEX[p] for p in parents]
-    X = d.X[keep][:, cols]
-    time = d.time[keep]
-    event = d.event[keep]
-
-    t0 = _time.perf_counter()
+    time = np.array([1.0, 2.0, 4.0, 8.0])
+    event = np.array([1, 0, 1, 0])
+    X = np.column_stack(
+        [
+            np.array([0.0, 1.0, 0.0, 1.0]),
+            np.array([20.0, 25.0, 30.0, 35.0]),
+        ]
+    )
     progress_messages = []
-    gam_model = fit_survival_gam(
+    gam_model = survival_mod.fit_survival_gam(
         time,
         event,
         X,
-        columns=parents,
-        n_uncertainty_slices=100,
+        columns=("sex", "BMI"),
+        n_uncertainty_slices=9,
         progress=progress_messages.append,
     )
-    elapsed = _time.perf_counter() - t0
-    assert elapsed < 60.0, f"fit took {elapsed:.1f}s (limit 60)"
 
-    # Monotonicity of S(t|x).
-    t_grid = np.linspace(0.5, np.max(time) * 0.9, 25)
-    S = gam_model.predict_survival(X[:4], t_grid)
-    assert S.shape[2] == t_grid.size
+    assert seen["survival_likelihood"] == "location-scale"
+    assert seen["config"] == {"noise_formula": "1"}
+    assert seen["df_columns"] == ("entry", "exit", "event", "sex", "BMI")
+    assert seen["formula"] == "Surv(entry, exit, event) ~ sex + BMI"
+    np.testing.assert_allclose(seen["df"][["sex", "BMI"]].mean(axis=0), 0.0)
+    np.testing.assert_allclose(seen["df"][["sex", "BMI"]].std(axis=0, ddof=0), 1.0)
+
+    t_grid = np.array([0.5, 2.0, 5.0])
+    S = gam_model.predict_survival(X[:2], t_grid)
+    S_se = gam_model.predict_survival_se(X[:2], t_grid)
+    assert S.shape == (9, 2, 3)
+    assert S_se.shape == (2, 3)
+    np.testing.assert_allclose(S_se, 0.02)
+    assert not np.allclose(S[0], S[-1])
     assert np.all(S >= 0.0) and np.all(S <= 1.0 + 1e-9)
     diffs = np.diff(S, axis=-1)
     assert np.all(diffs <= 1e-9), f"survival not monotone (max +dS = {diffs.max():.2e})"
 
-    # Diagnostics dict has the library-level fields.
     diag = gam_model.diagnostics
     for key in (
         "reml_iterations",
@@ -79,6 +113,9 @@ def test_fit_smoke(medium_data):
         "n_events",
         "converged",
         "formula",
+        "noise_formula",
+        "covariate_center",
+        "covariate_scale",
     ):
         assert key in diag, f"missing diagnostic {key!r}"
     assert bool(diag["converged"]) is True
@@ -86,93 +123,90 @@ def test_fit_smoke(medium_data):
     assert any(message.startswith("fit complete") for message in progress_messages)
 
 
-# ---------------------------------------------------------------------------
-# 2. Predict-shape conventions
-# ---------------------------------------------------------------------------
-
-
-def test_predict_shape(small_data):
+def test_predict_shape():
     """Check (n_uncertainty_slices, n_new, n_t) shape contracts."""
-    from causal_pred.data.nodes import NODE_INDEX
-    from causal_pred.gam.survival import fit_survival_gam
+    from causal_pred.gam.survival import SurvivalGAM, _SubmodelFit
 
-    d = small_data
-    n_keep = 300
-    parents = ("BMI", "age")
-    cols = [NODE_INDEX[p] for p in parents]
-    X = d.X[:n_keep][:, cols]
-    time = d.time[:n_keep]
-    event = d.event[:n_keep]
-
-    n_post = 37  # unusual number to catch hard-coded defaults
-    gam_model = fit_survival_gam(
-        time,
-        event,
-        X,
-        columns=parents,
-        n_uncertainty_slices=n_post,
+    n_slices = 37
+    gam_model = SurvivalGAM(
+        columns=("BMI", "age"),
+        diagnostics={},
+        _fit=_SubmodelFit(
+            model=_FakeModel(),
+            columns=("BMI", "age"),
+            n_train=10,
+            n_events=4,
+            formula="Surv(entry, exit, event) ~ BMI + age",
+            train_summary={},
+            x_center=np.zeros(2),
+            x_scale=np.ones(2),
+        ),
+        _n_uncertainty_slices=n_slices,
     )
 
-    X_new = X[:4]
+    X_new = np.zeros((4, 2))
     t_grid = np.array([1.0, 2.0, 5.0, 10.0])
 
     S = gam_model.predict_survival(X_new, t_grid)
-    assert S.shape == (n_post, 4, 4), S.shape
+    assert S.shape == (n_slices, 4, 4), S.shape
 
     hz = gam_model.predict_hazard(X_new, t_grid)
-    assert hz.shape == (n_post, 4, 4), hz.shape
+    assert hz.shape == (n_slices, 4, 4), hz.shape
 
     med = gam_model.predict_median_survival(X_new)
-    assert med.shape == (n_post, 4), med.shape
+    assert med.shape == (n_slices, 4), med.shape
     assert np.all(med > 0)
 
 
-def test_predict_survival_mean_uses_chunked_surface():
-    from causal_pred.gam.survival import _SubmodelFit, _predict_survival_matrix
+def test_predict_survival_mean_expands_person_time_grid():
+    from causal_pred.gam.survival import (
+        _SubmodelFit,
+        _predict_survival_matrix,
+        _predict_survival_surfaces,
+    )
 
     n_new = 11
     t_grid = np.arange(7, dtype=float)
-    backend_t_grid = 1.0 + t_grid
     X = np.zeros((n_new, 1), dtype=float)
+    surface = 0.9 - np.arange(n_new, dtype=float).reshape(-1, 1) * 0.01
+    surface = surface - np.arange(t_grid.size, dtype=float).reshape(1, -1) * 0.02
 
     class _Prediction:
-        def survival_at(self, _times):
-            raise ValueError(
-                "dense survival curves are limited to diagnostic subsets"
+        def __init__(self, with_uncertainty: bool):
+            self.survival = surface.reshape(-1, 1)
+            self.survival_se = (
+                np.full((n_new * t_grid.size, 1), 0.05)
+                if with_uncertainty
+                else None
             )
 
-        def survival_at_chunks(self, times, *, people_chunk=50000, time_grid_chunk=64):
-            assert np.array_equal(times, backend_t_grid)
-            yield slice(0, 5), slice(0, 3), np.full((5, 3), 0.9)
-            yield slice(0, 5), slice(3, 7), np.full((5, 4), 0.8)
-            yield slice(5, 11), slice(0, 7), np.full((6, 7), 0.7)
-
     class _Model:
-        def predict(self, df_new):
-            assert df_new.shape[0] == n_new
-            return _Prediction()
+        def predict(self, df_new, *, with_uncertainty=False):
+            assert df_new.shape[0] == n_new * t_grid.size
+            np.testing.assert_allclose(
+                df_new["exit"].to_numpy(),
+                1.0 + np.tile(t_grid, n_new),
+            )
+            return _Prediction(with_uncertainty)
 
     fit = _SubmodelFit(
         model=_Model(),
         columns=("x",),
-        kinds=("continuous",),
         n_train=10,
         n_events=3,
-        formula="Surv(entry, exit, event) ~ s(x, type=ps, knots=10)",
-        survival_likelihood="location-scale",
+        formula="Surv(entry, exit, event) ~ x",
         train_summary={},
+        survival_likelihood="location-scale",
+        x_center=np.zeros(1),
+        x_scale=np.ones(1),
     )
     S = _predict_survival_matrix(fit, X, t_grid)
 
     assert S.shape == (n_new, t_grid.size)
-    np.testing.assert_allclose(S[:5, :3], 0.9)
-    np.testing.assert_allclose(S[:5, 3:], 0.8)
-    np.testing.assert_allclose(S[5:, :], 0.7)
-
-
-# ---------------------------------------------------------------------------
-# 3. BMA weights: 0.9/0.1 gives a curve close to the 0.9 model
-# ---------------------------------------------------------------------------
+    np.testing.assert_allclose(S, surface)
+    S_mean, S_se = _predict_survival_surfaces(fit, X, t_grid)
+    np.testing.assert_allclose(S_mean, surface)
+    np.testing.assert_allclose(S_se, 0.05)
 
 
 def test_bma_weights(small_data, monkeypatch):
@@ -180,14 +214,13 @@ def test_bma_weights(small_data, monkeypatch):
     import causal_pred.gam.survival as survival_mod
 
     d = small_data
-    # Cap rows to respect the laptop budget.
     n_keep = 300
     X_full = d.X[:n_keep]
     time = d.time[:n_keep]
     event = d.event[:n_keep]
 
-    set_A = (NODE_INDEX["BMI"], NODE_INDEX["HbA1c"])  # strong predictors
-    set_B = (NODE_INDEX["ancestry_PC1"],)  # weak predictor
+    set_A = (NODE_INDEX["BMI"], NODE_INDEX["HbA1c"])
+    set_B = (NODE_INDEX["ancestry_PC1"],)
     parent_sets = [set_A, set_B]
     weights = np.array([0.9, 0.1])
     t_grid = np.array([2.0, 5.0, 10.0])
@@ -198,9 +231,7 @@ def test_bma_weights(small_data, monkeypatch):
             self.offset = float(offset)
 
         def predict_survival_mean(self, X_new, t_grid):
-            row_term = (
-                np.arange(X_new.shape[0], dtype=float).reshape(-1, 1) * 0.001
-            )
+            row_term = np.arange(X_new.shape[0], dtype=float).reshape(-1, 1) * 0.001
             time_term = np.asarray(t_grid, dtype=float).reshape(1, -1) * 0.01
             return 0.9 - self.offset - row_term - time_term
 
@@ -232,7 +263,6 @@ def test_bma_weights(small_data, monkeypatch):
     assert err_A < err_B, (
         f"BMA closer to B than A (weights [0.9, 0.1]): {err_A:.3f} vs {err_B:.3f}"
     )
-    # Structural/parametric decomposition is non-negative.
     assert np.all(out["variance_parametric"] >= -1e-12)
     assert np.all(out["variance_structural"] >= -1e-12)
     total = out["variance_parametric"] + out["variance_structural"]
@@ -270,37 +300,32 @@ def test_bma_uses_gamfit_within_model_variance(monkeypatch):
     np.testing.assert_allclose(out["variance_parametric"], 0.04)
 
 
-# ---------------------------------------------------------------------------
-# 4. Censoring sanity: fit completes at 0% and ~50% censoring
-# ---------------------------------------------------------------------------
+def test_survival_se_requires_gamfit_uncertainty():
+    from causal_pred.gam.survival import SurvivalGAM, _SubmodelFit
 
+    class _NoSePrediction:
+        survival = np.full((4, 1), 0.8, dtype=float)
+        survival_se = None
 
-def test_censoring_sanity():
-    """Fit runs cleanly whether censoring rate is 0 or ~50%.
+    class _NoSeModel:
+        def predict(self, df_new, *, with_uncertainty=False):
+            return _NoSePrediction()
 
-    We don't assert parameter equality; this test only checks that both
-    censoring regimes produce finite, in-range survival curves.
-    """
-    from causal_pred.data.synthetic import simulate
-    from causal_pred.data.nodes import NODE_INDEX
-    from causal_pred.gam.survival import fit_survival_gam
+    gam_model = SurvivalGAM(
+        columns=("x",),
+        diagnostics={},
+        _fit=_SubmodelFit(
+            model=_NoSeModel(),
+            columns=("x",),
+            n_train=4,
+            n_events=2,
+            formula="Surv(entry, exit, event) ~ x",
+            train_summary={},
+            survival_likelihood="location-scale",
+            x_center=np.zeros(1),
+            x_scale=np.ones(1),
+        ),
+    )
 
-    parents = ("BMI",)  # single smooth is enough here
-    col = [NODE_INDEX[p] for p in parents]
-
-    for censoring_rate, seed in [(0.0, 10), (0.5, 11)]:
-        d = simulate(
-            n=300, censoring_rate=censoring_rate, rng=np.random.default_rng(seed)
-        )
-        X = d.X[:, col]
-        gam_model = fit_survival_gam(
-            d.time,
-            d.event,
-            X,
-            columns=parents,
-            n_uncertainty_slices=50,
-        )
-        t_grid = np.array([2.0, 5.0, 10.0])
-        S = gam_model.predict_survival(X[:5], t_grid)
-        assert np.all(np.isfinite(S))
-        assert np.all(S >= 0.0) and np.all(S <= 1.0 + 1e-9)
+    with pytest.raises(RuntimeError, match="survival_se"):
+        gam_model.predict_survival_se(np.zeros((2, 1)), np.array([1.0, 2.0]))

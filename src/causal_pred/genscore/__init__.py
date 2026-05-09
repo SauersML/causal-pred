@@ -2,8 +2,8 @@
 
 This subpackage hosts mechanistic-interpretability-style decomposition of
 the high-dimensional participant signals that flow into the rest of the
-causal-pred pipeline. The first (and currently only) tool is a TopK
-crosscoder over paired (genome, EHR) activation streams; see
+causal-pred pipeline. The first (and currently only) tool is a GPU
+multi-view BatchTopK crosscoder over paired (genome, EHR) activation streams; see
 :mod:`causal_pred.genscore.crosscoder`.
 
 The intent is that features discovered here become first-class nodes in

@@ -129,6 +129,7 @@ T2D_CONDITION_CONCEPT_IDS: Tuple[int, ...] = (
 def _coerce_datetime(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce", utc=True).dt.tz_convert(None)
 
+
 # Canonical units after :func:`clean_measurements`:
 #   bmi              kg/m^2
 #   hba1c            percent (NGSP)
@@ -203,7 +204,11 @@ def attach_node_labels(measurement_df: pd.DataFrame) -> pd.DataFrame:
     )
     out["value_as_number"] = pd.to_numeric(out["value_as_number"], errors="coerce")
 
-    for col in ("standard_concept_name", "source_concept_name", "measurement_source_value"):
+    for col in (
+        "standard_concept_name",
+        "source_concept_name",
+        "measurement_source_value",
+    ):
         if col not in out.columns:
             out[col] = ""
         out[col] = out[col].astype(str)
@@ -250,7 +255,9 @@ def clean_measurements(measurement_df: pd.DataFrame) -> pd.DataFrame:
     mask = (df["node"] == "hba1c") & is_mmol_per_mol
     df.loc[mask, "value_clean"] = 0.09148 * df.loc[mask, "value_as_number"] + 2.152
 
-    is_mmol_per_l = df["unit_text"].str.contains("mmol/l|millimole", regex=True, na=False)
+    is_mmol_per_l = df["unit_text"].str.contains(
+        "mmol/l|millimole", regex=True, na=False
+    )
     mask = (df["node"] == "fasting_glucose") & is_mmol_per_l
     df.loc[mask, "value_clean"] = df.loc[mask, "value_as_number"] * 18.0182
 
@@ -316,7 +323,9 @@ def remove_extreme_outliers_iqr(
         )
         cleaned_parts.append(g.loc[keep])
 
-    cleaned = pd.concat(cleaned_parts, ignore_index=True) if cleaned_parts else df.iloc[:0]
+    cleaned = (
+        pd.concat(cleaned_parts, ignore_index=True) if cleaned_parts else df.iloc[:0]
+    )
     return cleaned, pd.DataFrame(summary).sort_values("node").reset_index(drop=True)
 
 
@@ -346,7 +355,9 @@ def collapse_to_wide_median(
 # ---------------------------------------------------------------------------
 
 
-def build_t2d_node(condition_df: pd.DataFrame, person_col: str = "person_id") -> pd.DataFrame:
+def build_t2d_node(
+    condition_df: pd.DataFrame, person_col: str = "person_id"
+) -> pd.DataFrame:
     """Derive the binary T2D node from a condition-occurrence frame.
 
     Every person appearing in ``condition_df`` is assumed to have T2D
@@ -411,9 +422,8 @@ def build_cohort_dataset(
         }
     )
 
-    wide = (
-        all_people.merge(t2d, on="person_id", how="left")
-        .merge(wide_meas, on="person_id", how="left")
+    wide = all_people.merge(t2d, on="person_id", how="left").merge(
+        wide_meas, on="person_id", how="left"
     )
     wide["type2_diabetes"] = wide["type2_diabetes"].fillna(0).astype(int)
 
@@ -549,7 +559,9 @@ def load_cohort_dataset_with_person_ids(
 
     raw = pd.read_csv(path, dtype={"person_id": "string"})
     if "person_id" not in raw.columns:
-        raise ValueError(f"cohort CSV {path!r} must contain person_id for genomic alignment")
+        raise ValueError(
+            f"cohort CSV {path!r} must contain person_id for genomic alignment"
+        )
 
     person_id = raw["person_id"].astype("string").copy()
     time, event, survival_meta = _extract_survival_columns(raw)
@@ -596,15 +608,21 @@ def load_cohort_dataset_with_person_ids(
                 mu = v.mean()
                 sd = v.std(ddof=0)
                 if sd == 0.0:
-                    raise ValueError(f"continuous cohort column has zero variance: {col}")
+                    raise ValueError(
+                        f"continuous cohort column has zero variance: {col}"
+                    )
                 df[col] = (v - mu) / sd
 
     X = df.to_numpy(dtype=np.float64)
     n, p = X.shape
     dataset = SyntheticDataset(
         X=X,
-        time=time.astype(float, copy=False) if survival_meta["has_survival"] else np.zeros(n, dtype=float),
-        event=event.astype(int, copy=False) if survival_meta["has_survival"] else np.zeros(n, dtype=int),
+        time=time.astype(float, copy=False)
+        if survival_meta["has_survival"]
+        else np.zeros(n, dtype=float),
+        event=event.astype(int, copy=False)
+        if survival_meta["has_survival"]
+        else np.zeros(n, dtype=int),
         columns=tuple(present),
         node_types=types,
         ground_truth_adj=np.zeros((p, p), dtype=int),
@@ -741,7 +759,9 @@ def build_survival_outcome(
     prevalent = has_dates & t2d_dt.notna() & (t2d_dt <= baseline)
     incident = has_dates & t2d_dt.notna() & (t2d_dt > baseline) & (t2d_dt <= obs_end)
     end_dt = obs_end.where(~incident, t2d_dt)
-    followup_days = (end_dt - baseline).dt.total_seconds().to_numpy(dtype=float) / 86400.0
+    followup_days = (end_dt - baseline).dt.total_seconds().to_numpy(
+        dtype=float
+    ) / 86400.0
     keep = (
         has_dates.to_numpy(dtype=bool)
         & ~prevalent.to_numpy(dtype=bool)
@@ -774,7 +794,9 @@ def build_survival_outcome(
     if meta["n_kept"] == 0:
         raise ValueError("OMOP survival outcome has no rows with usable follow-up")
     if meta["n_events"] == 0:
-        raise ValueError("OMOP survival outcome has no incident T2D events after baseline")
+        raise ValueError(
+            "OMOP survival outcome has no incident T2D events after baseline"
+        )
 
     return SurvivalOutcome(
         person_id=order.to_numpy(dtype=str),
@@ -872,7 +894,9 @@ def resolve_cohort_csv(
     Raises ``FileNotFoundError`` if no source resolves.
     """
     if name not in CACHE_FILENAMES:
-        raise KeyError(f"unknown cohort name {name!r}; expected one of {list(CACHE_FILENAMES)}")
+        raise KeyError(
+            f"unknown cohort name {name!r}; expected one of {list(CACHE_FILENAMES)}"
+        )
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -896,9 +920,7 @@ def resolve_cohort_csv(
     locations = [str(cache_dir / f) for f in candidates]
     if bucket_uri:
         locations += [_bucket_path(bucket_uri, f) for f in candidates]
-    raise FileNotFoundError(
-        f"cohort CSV {name!r} not found; looked in: {locations}"
-    )
+    raise FileNotFoundError(f"cohort CSV {name!r} not found; looked in: {locations}")
 
 
 def write_cohort_cache(
@@ -1129,7 +1151,7 @@ _RAW_CURATED_OMOP_CONDITION_CATALOG: Tuple[Tuple[str, int], ...] = (
 )
 
 T2D_EHR_CONDITION_BLACKLIST_IDS: Tuple[int, ...] = (
-    201826,   # Type 2 diabetes mellitus
+    201826,  # Type 2 diabetes mellitus
     201820,
     443767,
     443729,
@@ -1138,8 +1160,8 @@ T2D_EHR_CONDITION_BLACKLIST_IDS: Tuple[int, ...] = (
     435216,
     376112,
     4174977,  # Retinopathy due to diabetes mellitus
-    201254,   # Type 1 diabetes mellitus
-    443727,   # Diabetic ketoacidosis
+    201254,  # Type 1 diabetes mellitus
+    443727,  # Diabetic ketoacidosis
     4024659,  # Gestational diabetes mellitus
 )
 
@@ -1167,9 +1189,8 @@ T2D_TREATMENT_DRUG_TERMS: Tuple[str, ...] = (
 
 def _is_t2d_target_condition(name: str, concept_id: int) -> bool:
     lowered = str(name).lower()
-    return (
-        int(concept_id) in set(T2D_EHR_CONDITION_BLACKLIST_IDS)
-        or any(term in lowered for term in T2D_EHR_CONDITION_BLACKLIST_TERMS)
+    return int(concept_id) in set(T2D_EHR_CONDITION_BLACKLIST_IDS) or any(
+        term in lowered for term in T2D_EHR_CONDITION_BLACKLIST_TERMS
     )
 
 
@@ -1177,10 +1198,9 @@ def _is_t2d_treatment_proxy_group(value: object) -> bool:
     text = str(value).strip()
     upper = text.upper()
     lowered = text.lower()
-    return (
-        any(upper.startswith(prefix) for prefix in T2D_TREATMENT_DRUG_PREFIXES)
-        or any(term in lowered for term in T2D_TREATMENT_DRUG_TERMS)
-    )
+    return any(
+        upper.startswith(prefix) for prefix in T2D_TREATMENT_DRUG_PREFIXES
+    ) or any(term in lowered for term in T2D_TREATMENT_DRUG_TERMS)
 
 
 CURATED_OMOP_CONDITION_CATALOG: Tuple[Tuple[str, int], ...] = tuple(
@@ -1206,7 +1226,9 @@ CURATED_OMOP_MEASUREMENT_CATALOG: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
 def _remote_gcloud_size(uri: str, billing_project: str) -> int:
     gc = _gcloud()
     if gc is None:
-        raise RuntimeError("gcloud is not on PATH; cannot inspect the AoU microarray bucket")
+        raise RuntimeError(
+            "gcloud is not on PATH; cannot inspect the AoU microarray bucket"
+        )
     r = subprocess.run(
         [gc, "storage", "ls", "-l", uri, f"--billing-project={billing_project}"],
         check=True,
@@ -1281,7 +1303,9 @@ def resolve_aou_genotypes(
 
 
 def _has_genotype_triple(d: Path) -> bool:
-    return all((d / f).is_file() and (d / f).stat().st_size > 0 for f in AOU_GENOTYPE_FILES)
+    return all(
+        (d / f).is_file() and (d / f).stat().st_size > 0 for f in AOU_GENOTYPE_FILES
+    )
 
 
 def discover_genotype_dir(extra: Sequence[str | os.PathLike] = ()) -> Optional[Path]:
@@ -1555,9 +1579,7 @@ def fetch_omop_long_frames(
     frames: dict[str, pd.DataFrame] = {}
     lookback_filter = ""
     if lookback_days is not None:
-        lookback_filter = (
-            f"AND datetime >= TIMESTAMP_SUB(baseline_dt, INTERVAL {int(lookback_days)} DAY)"
-        )
+        lookback_filter = f"AND datetime >= TIMESTAMP_SUB(baseline_dt, INTERVAL {int(lookback_days)} DAY)"
 
     frames["visit_baseline"] = _query(
         "visit_baseline",
@@ -1624,7 +1646,9 @@ def fetch_omop_long_frames(
         )
         condition_params: list = [person_param]
         if condition_ids:
-            condition_params.append(_array_param("condition_concept_ids", condition_ids))
+            condition_params.append(
+                _array_param("condition_concept_ids", condition_ids)
+            )
         frames["condition_long"] = _query(
             "condition_long",
             f"""
@@ -1651,7 +1675,9 @@ def fetch_omop_long_frames(
             if drug_concept_ids is not None
             else tuple()
         )
-        drug_filter = "AND drug_concept_id IN UNNEST(@drug_concept_ids)" if drug_ids else ""
+        drug_filter = (
+            "AND drug_concept_id IN UNNEST(@drug_concept_ids)" if drug_ids else ""
+        )
         drug_params: list = [person_param]
         if drug_ids:
             drug_params.append(_array_param("drug_concept_ids", drug_ids))
@@ -1767,7 +1793,9 @@ def fetch_omop_long_frames(
     return frames
 
 
-def resolve_baseline_dt(person_ids: Sequence[str], visit_long: pd.DataFrame) -> pd.Series:
+def resolve_baseline_dt(
+    person_ids: Sequence[str], visit_long: pd.DataFrame
+) -> pd.Series:
     """Return each participant's earliest observed visit datetime.
 
     Missing participants are retained with ``NaT`` so downstream
@@ -2065,14 +2093,20 @@ def build_ehr_panel(
         cf[condition_group_col] = cf[condition_group_col].astype(str)
         cf = cf.loc[
             ~cf[condition_group_col].map(
-                lambda value: _is_t2d_target_condition(str(value), int(value))
-                if str(value).isdigit()
-                else _is_t2d_target_condition(str(value), -1)
+                lambda value: (
+                    _is_t2d_target_condition(str(value), int(value))
+                    if str(value).isdigit()
+                    else _is_t2d_target_condition(str(value), -1)
+                )
             )
         ].copy()
         mat, cols = _wide_indicator(
-            cf, person_col, condition_group_col, person_order,
-            min_prevalence, prefix="cond",
+            cf,
+            person_col,
+            condition_group_col,
+            person_order,
+            min_prevalence,
+            prefix="cond",
         )
         _push(mat, cols, "condition")
 
@@ -2082,12 +2116,14 @@ def build_ehr_panel(
         )
         df[person_col] = df[person_col].astype(str)
         df[drug_group_col] = df[drug_group_col].astype(str)
-        df = df.loc[
-            ~df[drug_group_col].map(_is_t2d_treatment_proxy_group)
-        ].copy()
+        df = df.loc[~df[drug_group_col].map(_is_t2d_treatment_proxy_group)].copy()
         mat, cols = _wide_indicator(
-            df, person_col, drug_group_col, person_order,
-            min_prevalence, prefix="drug",
+            df,
+            person_col,
+            drug_group_col,
+            person_order,
+            min_prevalence,
+            prefix="drug",
         )
         _push(mat, cols, "drug")
 

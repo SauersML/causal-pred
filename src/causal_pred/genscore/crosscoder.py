@@ -217,7 +217,7 @@ def reconstruct(
         prior_logit = np.log(prevalence / (1.0 - prevalence))
         b_hat[:, binary] = 1.0 / (1.0 + np.exp(-(b_raw[:, binary] + prior_logit[None, :])))
     if count.any():
-        b_hat[:, count] = np.expm1(np.log1p(np.exp(b_raw[:, count])))
+        b_hat[:, count] = np.expm1(np.logaddexp(0.0, b_raw[:, count]))
     return a_hat, b_hat
 
 

@@ -45,12 +45,7 @@ def _train_tiny_crosscoder():
         A, index=pd.Index(pids, name="IID"),
         columns=[f"PRS_{j}" for j in range(m_g)],
     )
-    kinds = (
-        ["condition"] * 4
-        + ["drug"] * 3
-        + ["lab_mean"] * 3
-        + ["utilisation"] * 2
-    )
+    kinds = ["lab_mean"] * m_e
     ehr = EhrPanel(
         matrix=B,
         person_id=pids,
@@ -61,6 +56,8 @@ def _train_tiny_crosscoder():
     model = fit_panel_crosscoder(
         panels,
         d=48, k=4, n_steps=600, batch_size=64, lr=3e-3,
+        device="cpu",
+        contrastive_coef=0.0,
         rng=np.random.default_rng(0),
     )
     selection = select_shared_features(

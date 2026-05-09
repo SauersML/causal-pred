@@ -84,7 +84,9 @@ def _configure_tiny_pipeline(monkeypatch, tmp_path):
     def _fake_prs(_cache, _cohort_csv, person_ids, _logger):
         prs_path = tmp_path / "aou_prs_panel.csv.gz"
         prs = pipeline._read_prs_panel(prs_path)
-        return prs.reindex(pd.Series(person_ids, dtype="string").astype(str)), str(prs_path)
+        return prs.reindex(pd.Series(person_ids, dtype="string").astype(str)), str(
+            prs_path
+        )
 
     def _fake_mrdag(_cache, _logger):
         p = len(NODE_INDEX)
@@ -117,17 +119,22 @@ def _configure_tiny_pipeline(monkeypatch, tmp_path):
             node_types=tuple(data.node_types) + ("continuous",),
             ground_truth_adj=gt,
         )
-        return dataset, np.asarray(person_ids).astype(str), {
-            "crosscoder_d": 4,
-            "crosscoder_k": 1,
-            "promoted_names": ["feat_0000"],
-            "promoted_indices": [0],
-            "promoted_genome_share": [0.5],
-            "promoted_activation_rate": [1.0],
-            "base_n": int(data.n),
-            "augmented_n": int(data.n),
-            "ehr_feature_count": int(_ehr_panel.m),
-        }, None
+        return (
+            dataset,
+            np.asarray(person_ids).astype(str),
+            {
+                "crosscoder_d": 4,
+                "crosscoder_k": 1,
+                "promoted_names": ["feat_0000"],
+                "promoted_indices": [0],
+                "promoted_genome_share": [0.5],
+                "promoted_activation_rate": [1.0],
+                "base_n": int(data.n),
+                "augmented_n": int(data.n),
+                "ehr_feature_count": int(_ehr_panel.m),
+            },
+            None,
+        )
 
     def _fake_survival(_cache, _key, data, _samples, _logger):
         t_grid = np.linspace(1.0, 12.0, 6)
@@ -299,10 +306,7 @@ def test_log_validation_metrics_uses_threshold_values(caplog):
     with caplog.at_level(logging.INFO, logger=logger.name):
         pipeline._log_validation_metrics(logger, validation)
 
-    assert (
-        "thr=0.50 recovery=0.250 (p=0.125)  MCC=0.375 (p=0.625)"
-        in caplog.text
-    )
+    assert "thr=0.50 recovery=0.250 (p=0.125)  MCC=0.375 (p=0.625)" in caplog.text
 
 
 def test_log_validation_metrics_accepts_json_string_threshold_keys(caplog):
@@ -709,6 +713,54 @@ def test_survival_gam_metrics_use_held_out_refit(tmp_path, monkeypatch):
     assert seen["metrics_shape"][0] == seen["test_idx"].size
 
 
+def test_pipeline_survival_metrics_exclude_early_censoring_and_use_time_specific_auc(
+    monkeypatch,
+):
+    from causal_pred import pipeline
+
+    time_arr = np.array([4.0, 8.0, 12.0, 16.0])
+    event_arr = np.array([0, 1, 0, 0])
+    t_grid = np.array([5.0, 10.0, 15.0])
+    survival = np.array(
+        [
+            [0.96, 0.90, 0.82],
+            [0.92, 0.70, 0.50],
+            [0.98, 0.86, 0.65],
+            [0.99, 0.80, 0.60],
+        ]
+    )
+    seen = {}
+
+    def fake_calibration(y, p, *, n_bins, strategy):
+        seen["cal_y"] = np.asarray(y).copy()
+        seen["cal_p"] = np.asarray(p).copy()
+        return {"ece": 0.0, "mce": 0.0, "bins": []}
+
+    def fake_time_dependent_auc(*, time, event, risk_score, eval_times):
+        seen["auc_risk"] = np.asarray(risk_score).copy()
+        return {
+            "times": list(eval_times),
+            "auc": [0.6, 0.7, 0.8],
+            "integrated_auc": 0.7,
+        }
+
+    def fake_brier_score(*, time, event, survival_pred, eval_times):
+        return {"ibs": 0.1, "ibs_km": 0.2, "scaled_brier": 0.5}
+
+    monkeypatch.setattr(pipeline, "calibration_metrics", fake_calibration)
+    monkeypatch.setattr(pipeline, "nagelkerke_r2", lambda y, p: 0.25)
+    monkeypatch.setattr(pipeline, "time_dependent_auc", fake_time_dependent_auc)
+    monkeypatch.setattr(pipeline, "brier_score", fake_brier_score)
+
+    out = pipeline._survival_metrics(time_arr, event_arr, survival, t_grid)
+
+    np.testing.assert_array_equal(seen["cal_y"], np.array([1, 0, 0]))
+    np.testing.assert_allclose(seen["cal_p"], 1.0 - survival[[1, 2, 3], 1])
+    np.testing.assert_allclose(seen["auc_risk"], 1.0 - survival)
+    assert out["calibration_at_10y_n_used"] == 3
+    assert out["calibration_at_10y_n_indeterminate"] == 1
+
+
 def test_pipeline_determinism(tmp_path, monkeypatch):
     _make_tiny_cohort_csv(tmp_path / "t2d_initial_nodes_complete.csv")
     _make_tiny_prs_csv(tmp_path / "aou_prs_panel.csv.gz")
@@ -764,7 +816,9 @@ def test_dagslam_prior_changes_real_search(tmp_path, monkeypatch):
         np.testing.assert_allclose(z["pi_prior"], strong_prior, equal_nan=True)
 
 
-def test_pipeline_builds_survival_outcome_when_csv_lacks_time_event(tmp_path, monkeypatch):
+def test_pipeline_builds_survival_outcome_when_csv_lacks_time_event(
+    tmp_path, monkeypatch
+):
     _make_tiny_static_cohort_csv(tmp_path / "t2d_initial_nodes_complete.csv")
     _make_tiny_prs_csv(tmp_path / "aou_prs_panel.csv.gz")
 

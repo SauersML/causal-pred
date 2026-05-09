@@ -68,7 +68,7 @@ Mendelian-randomisation-informed structure learning (MrDAG,
 \citealt{Zuber2025}) with a warm-starting hill climber
 (DAGSLAM, \citealt{Zhao2025DAGSLAM}), structure MCMC with a
 Giudici--Castelo neighbourhood correction \citep{GiudiciCastelo2003}, and a
-distributional survival GAM \citep{RigbyStasinopoulos2005, Wood2011}.
+right-censored survival GAM \citep{Wood2011}.
 Applied to an All of Us--shaped synthetic cohort of \nSamples{} subjects
 over \nNodes{} nodes, the pipeline recovers \edgeRecall{} of known causal
 edges, attains a time-dependent AUC of \aurocTen{} at 10 years
@@ -94,8 +94,8 @@ to a single structure \citep{MadiganYork1995, Kuipers2014}. We combine
 the two by using MR summary statistics as a prior on edge inclusion
 \citep{Zuber2025}, warm-starting structure MCMC with DAGSLAM
 \citep{Zhao2025DAGSLAM}, and then composing the posterior parent sets
-with a distributional survival GAM to produce individual-level survival
-curves with both structural and parametric uncertainty.
+with a survival GAM to produce individual-level survival curves with
+structural uncertainty.
 
 \section{Background}
 
@@ -177,14 +177,14 @@ reversal with the Giudici--Castelo neighbourhood correction
 with per-node score caching. Mean acceptance was \mcmcAccept{} and
 $\hat{R}_{\max} = \mcmcRhat{}$.
 
-\subsection{Distributional survival GAM}
+\subsection{Survival GAM}
 
-The survival time $T \mid x$ is modelled distributionally
-\citep{RigbyStasinopoulos2005} with log-location and log-scale each a
-sum of P-spline expansions \citep{EilersMarx1996}. REML selects the
-smoothing penalties \citep{Wood2011} and NUTS
-\citep{HoffmanGelman2014} samples the posterior over spline
-coefficients.
+The survival time $T \mid x$ is modelled with a right-censored Weibull
+GAM. The log scale is a sum of P-spline expansions for continuous parents
+\citep{EilersMarx1996}, and REML selects the smoothing penalties
+\citep{Wood2011}. We use the fitted survival surface as the within-parent-set
+point estimate and reserve uncertainty intervals for posterior parent-set
+averaging.
 
 \subsection{Bayesian model averaging}
 

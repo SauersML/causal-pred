@@ -43,6 +43,8 @@ from .data.cohort import (
     CURATED_OMOP_MEASUREMENT_CATALOG,
     EhrPanel,
     SurvivalOutcome,
+    T2D_EHR_CONDITION_BLACKLIST_IDS,
+    T2D_TREATMENT_DRUG_PREFIXES,
     build_ehr_panel,
     build_survival_outcome,
     discover_genotype_dir,
@@ -81,7 +83,7 @@ PRS_PANEL_CACHE_DIRNAME = "prs_panel_cache"
 GNOMON_OUT_DIRNAME = "gnomon_score"
 GENOTYPE_CACHE_DIR = str(Path.home() / "causal-pred" / "genomes")
 
-PIPELINE_CONFIG_VERSION = "2026-05-09.survival-gamfit-uncertainty.1"
+PIPELINE_CONFIG_VERSION = "2026-05-09.survival-censoring-gamfit-uncertainty.1"
 PIPELINE_SEED = 20260416
 PIPELINE_VERBOSE = False
 
@@ -631,6 +633,8 @@ def _pipeline_config() -> dict[str, Any]:
                 if EHR_CONDITION_CONCEPT_IDS is None
                 else list(EHR_CONDITION_CONCEPT_IDS)
             ),
+            "t2d_condition_blacklist_ids": list(T2D_EHR_CONDITION_BLACKLIST_IDS),
+            "t2d_treatment_drug_prefixes": list(T2D_TREATMENT_DRUG_PREFIXES),
             "measurement_catalog": [
                 {"lab": lab, "loinc_codes": list(codes)}
                 for lab, codes in CURATED_OMOP_MEASUREMENT_CATALOG
@@ -1118,6 +1122,8 @@ def _ehr_panel_key(person_ids: Sequence[str]) -> str:
                 if EHR_CONDITION_CONCEPT_IDS is None
                 else list(EHR_CONDITION_CONCEPT_IDS)
             ),
+            "t2d_condition_blacklist_ids": list(T2D_EHR_CONDITION_BLACKLIST_IDS),
+            "t2d_treatment_drug_prefixes": list(T2D_TREATMENT_DRUG_PREFIXES),
             "measurement_catalog": [
                 {"lab": lab, "loinc_codes": list(codes)}
                 for lab, codes in CURATED_OMOP_MEASUREMENT_CATALOG
@@ -2804,7 +2810,7 @@ def _load_or_run_survival_parent_fit(
     mean = fit.predict_survival_mean(X, t_grid)
     variance = fit.predict_survival_variance(X, t_grid)
     runtime_s = time.time() - t0
-    diag = fit.posterior_summary()
+    diag = fit.uncertainty_summary()
     diag["parent_columns"] = list(cols)
     _atomic_npz(
         path,
@@ -2848,7 +2854,7 @@ def _fit_survival_parent_set_holdout(
             message,
         ),
     )
-    diag = fit.posterior_summary()
+    diag = fit.uncertainty_summary()
     diag["parent_columns"] = list(cols)
     return fit.predict_survival_mean(X_test, t_grid), diag
 
@@ -3004,7 +3010,7 @@ def _load_or_run_survival_gam(
             "n_test": int(test_idx.size),
             "test_fraction": float(test_idx.size / data.n),
         },
-        "interval_uncertainty": "gamfit_delta_method_plus_structural_parent_set",
+        "interval_uncertainty": "structural_parent_set_only",
         "interval_level": 0.90,
         "variance_parametric_mean": float(np.mean(variance_parametric)),
         "variance_structural_mean": float(np.mean(variance_structural)),

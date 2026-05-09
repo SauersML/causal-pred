@@ -19,6 +19,7 @@ if SRC not in sys.path:
 from causal_pred.data.synthetic import simulate  # noqa: E402
 from causal_pred.benchmarks import (  # noqa: E402
     _surv_at_times,
+    _surv_metrics,
     _train_test_indices,
     run_kaplan_meier,
     run_cox_ph,
@@ -115,6 +116,53 @@ def test_survival_interpolation_uses_exact_requested_times():
     out = _surv_at_times(surv, grid, [5.0, 15.0])
 
     np.testing.assert_allclose(out, [[0.9, 0.5], [0.8, 0.3]])
+
+
+def test_survival_metrics_exclude_early_censoring_and_use_time_specific_auc(
+    monkeypatch,
+):
+    from causal_pred import benchmarks
+
+    time_arr = np.array([4.0, 8.0, 12.0, 16.0])
+    event_arr = np.array([0, 1, 0, 0])
+    t_grid = np.array([5.0, 10.0, 15.0])
+    survival = np.array(
+        [
+            [0.96, 0.90, 0.82],
+            [0.92, 0.70, 0.50],
+            [0.98, 0.86, 0.65],
+            [0.99, 0.80, 0.60],
+        ]
+    )
+    seen = {}
+
+    def fake_nagelkerke(y, p):
+        seen["r2_y"] = np.asarray(y).copy()
+        seen["r2_p"] = np.asarray(p).copy()
+        return 0.25
+
+    def fake_time_dependent_auc(*, time, event, risk_score, eval_times):
+        seen["auc_risk"] = np.asarray(risk_score).copy()
+        return {
+            "times": list(eval_times),
+            "auc": [0.6, 0.7, 0.8],
+            "integrated_auc": 0.7,
+        }
+
+    def fake_brier_score(*, time, event, survival_pred, eval_times):
+        return {"ibs": 0.1, "ibs_km": 0.2, "scaled_brier": 0.5}
+
+    monkeypatch.setattr(benchmarks, "nagelkerke_r2", fake_nagelkerke)
+    monkeypatch.setattr(benchmarks, "time_dependent_auc", fake_time_dependent_auc)
+    monkeypatch.setattr(benchmarks, "brier_score", fake_brier_score)
+
+    out = _surv_metrics(time_arr, event_arr, survival, t_grid)
+
+    np.testing.assert_array_equal(seen["r2_y"], np.array([1, 0, 0]))
+    np.testing.assert_allclose(seen["r2_p"], 1.0 - survival[[1, 2, 3], 1])
+    np.testing.assert_allclose(seen["auc_risk"], 1.0 - survival)
+    assert out["nagelkerke_n_used"] == 3
+    assert out["nagelkerke_n_indeterminate"] == 1
 
 
 def test_mr_ivw_runs():
