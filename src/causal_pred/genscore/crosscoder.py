@@ -165,7 +165,16 @@ def encode(
     ``view`` is one of ``"both"``, ``"genome"``, or ``"ehr"`` and mirrors the
     training views. Single-stream views can only activate the shared bank plus
     that stream's private bank.
+
+    Routes through the GPU when CUDA is available. The full panel encode
+    materialises ``pre = (n, d)`` float64 plus an equally-sized ``scores``
+    intermediate inside batch_topk - around 5-7 GB host RAM in the AoU
+    cohort - which OOM-killed the notebook when ``select_shared_features``
+    called this three times in a row. On the T4 the same allocations live
+    in 15 GB VRAM and only the final ``z`` returns to host RAM.
     """
+    if torch.cuda.is_available():
+        return _encode_torch(model, A, B, view=view, device=torch.device("cuda"))
     a_z = (np.asarray(A, dtype=np.float64) - model.mean_G) / model.std_G
     b_z = (np.asarray(B, dtype=np.float64) - model.mean_E) / model.std_E
     if view == "genome":
@@ -186,6 +195,101 @@ def encode(
         allowed=allowed,
     )
     return z
+
+
+def _encode_torch(
+    model: TopKCrosscoder,
+    A: np.ndarray,
+    B: np.ndarray,
+    *,
+    view: str,
+    device: torch.device,
+) -> np.ndarray:
+    import math
+
+    A_t = torch.from_numpy(np.ascontiguousarray(A, dtype=np.float64)).to(device)
+    B_t = torch.from_numpy(np.ascontiguousarray(B, dtype=np.float64)).to(device)
+    mean_G = torch.from_numpy(np.ascontiguousarray(model.mean_G, dtype=np.float64)).to(device)
+    std_G = torch.from_numpy(np.ascontiguousarray(model.std_G, dtype=np.float64)).to(device)
+    mean_E = torch.from_numpy(np.ascontiguousarray(model.mean_E, dtype=np.float64)).to(device)
+    std_E = torch.from_numpy(np.ascontiguousarray(model.std_E, dtype=np.float64)).to(device)
+    W_e = torch.from_numpy(np.ascontiguousarray(model.W_e, dtype=np.float64)).to(device)
+    b_enc = torch.from_numpy(np.ascontiguousarray(model.b_enc, dtype=np.float64)).to(device)
+
+    a_z = (A_t - mean_G) / std_G
+    b_z = (B_t - mean_E) / std_E
+    del A_t, B_t
+
+    if view == "genome":
+        b_z = torch.zeros_like(b_z)
+        latent_bank = torch.from_numpy(np.ascontiguousarray(model.latent_bank)).to(device)
+        allowed = latent_bank != BANK_EHR_PRIVATE
+    elif view == "ehr":
+        a_z = torch.zeros_like(a_z)
+        latent_bank = torch.from_numpy(np.ascontiguousarray(model.latent_bank)).to(device)
+        allowed = latent_bank != BANK_GENOME_PRIVATE
+    elif view == "both":
+        allowed = None
+    else:
+        raise ValueError(f"unknown encode view {view!r}")
+
+    pre = torch.cat([a_z, b_z], dim=1) @ W_e + b_enc
+    del a_z, b_z, W_e, b_enc, mean_G, std_G, mean_E, std_E
+
+    n, d = int(pre.shape[0]), int(pre.shape[1])
+    k = int(model.k)
+    activation_kind = str(model.activation_kind)
+
+    if allowed is not None:
+        pre = torch.where(
+            allowed.unsqueeze(0), pre, torch.full_like(pre, float("-inf"))
+        )
+
+    if activation_kind == "topk":
+        if k >= d:
+            mask = pre > 0
+        else:
+            topk_vals, topk_idx = torch.topk(pre, k, dim=1)
+            mask = torch.zeros_like(pre, dtype=torch.bool)
+            mask.scatter_(1, topk_idx, topk_vals > 0)
+        z = torch.where(mask, pre, torch.zeros_like(pre))
+    elif activation_kind == "batch_topk":
+        scores = torch.relu(pre)
+        if allowed is not None:
+            scores = torch.where(
+                allowed.unsqueeze(0), scores, torch.zeros_like(scores)
+            )
+        take = min(scores.numel(), max(1, n * k))
+        flat = scores.flatten()
+        if take >= flat.numel():
+            mask = scores > 0
+        else:
+            topk_vals, topk_idx = torch.topk(flat, take, sorted=False)
+            keep_idx = topk_idx[topk_vals > 0]
+            mask_flat = torch.zeros_like(flat, dtype=torch.bool)
+            mask_flat[keep_idx] = True
+            mask = mask_flat.view(n, d)
+        del flat
+        row_cap_multiplier = 4.0
+        cap = min(d, max(k, int(math.ceil(k * row_cap_multiplier))))
+        if cap < d and bool(mask.any()):
+            row_scores = torch.where(mask, scores, torch.zeros_like(scores))
+            _, cap_idx = torch.topk(row_scores, cap, dim=1)
+            cap_mask = torch.zeros_like(mask)
+            cap_mask.scatter_(1, cap_idx, True)
+            mask &= cap_mask
+            del row_scores, cap_idx, cap_mask
+        z = torch.where(mask, pre, torch.zeros_like(pre))
+        del scores, mask
+    else:
+        raise ValueError(f"unknown activation_kind {activation_kind!r}")
+
+    del pre
+    out = z.cpu().numpy()
+    del z
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return out
 
 
 def _ehr_kind_masks(kinds: Sequence[str], m_E: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

@@ -23,13 +23,30 @@ through the DAG.
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+
+def _log_rss(label: str) -> None:
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    logger.info(
+                        "[mem] %s rss=%s", label, line.split(":", 1)[1].strip()
+                    )
+                    return
+    except OSError:
+        pass
 
 from ..data.cohort import EhrPanel
 from ..data.synthetic import SyntheticDataset
@@ -257,12 +274,37 @@ def select_shared_features(
             f"got {genome_share_min} and {genome_share_max}"
         )
 
+    n_full = int(panels.A.shape[0])
+    d_full = int(model.d)
+    logger.info(
+        "[select] encoding view=both n=%d d=%d", n_full, d_full
+    )
+    _log_rss("select before encode(both)")
+    t_e = time.time()
     z = encode(model, panels.A, panels.B)
-    z_g = encode(model, panels.A, panels.B, view="genome")
-    z_e = encode(model, panels.A, panels.B, view="ehr")
+    logger.info(
+        "[select] encode(both) elapsed=%.1fs shape=%s",
+        time.time() - t_e, tuple(z.shape),
+    )
+    _log_rss("select after encode(both)")
     rates = _feature_activation_rate(z)
     r_G = feature_stream_share(model)
     shared_bank = model.latent_bank == BANK_SHARED
+
+    t_e = time.time()
+    z_g = encode(model, panels.A, panels.B, view="genome")
+    logger.info(
+        "[select] encode(genome) elapsed=%.1fs shape=%s",
+        time.time() - t_e, tuple(z_g.shape),
+    )
+    _log_rss("select after encode(genome)")
+    t_e = time.time()
+    z_e = encode(model, panels.A, panels.B, view="ehr")
+    logger.info(
+        "[select] encode(ehr) elapsed=%.1fs shape=%s",
+        time.time() - t_e, tuple(z_e.shape),
+    )
+    _log_rss("select after encode(ehr)")
 
     eligible = (
         shared_bank
@@ -296,8 +338,11 @@ def select_shared_features(
     else:
         stability = np.ones(model.d, dtype=float)
 
-    matched = np.mean(z_g * z_e, axis=0)
-    shuffled = np.mean(z_g * z_e[::-1], axis=0)
+    # Reduce z_g, z_e column-wise without materialising full (n, d) products.
+    matched = np.einsum("ij,ij->j", z_g, z_e) / float(z_g.shape[0])
+    shuffled = np.einsum("ij,ij->j", z_g, z_e[::-1]) / float(z_g.shape[0])
+    del z_g, z_e
+    _log_rss("select after free z_g,z_e")
     neg_margin = np.maximum(matched - shuffled, 0.0)
     if np.nanmax(neg_margin) > 0:
         neg_margin = neg_margin / np.nanmax(neg_margin)
@@ -314,6 +359,8 @@ def select_shared_features(
     chosen: list[int] = []
     penalties = np.ones(model.d, dtype=float)
     z_centered = z - z.mean(axis=0, keepdims=True)
+    del z
+    _log_rss("select after free z (kept z_centered)")
     z_norm = np.linalg.norm(z_centered, axis=0)
     for idx in order.tolist():
         penalty = 1.0
@@ -441,8 +488,20 @@ def augment_dataset_with_features(
     # columns to use as new design-matrix columns.
     A_keep = panels.A[keep_panel_arr]
     B_keep = panels.B[keep_panel_arr]
+    logger.info(
+        "[augment] encoding kept panel rows n=%d", int(A_keep.shape[0])
+    )
+    _log_rss("augment before encode")
+    t_e = time.time()
     z = encode(model, A_keep, B_keep)
+    logger.info(
+        "[augment] encode elapsed=%.1fs shape=%s",
+        time.time() - t_e, tuple(z.shape),
+    )
+    _log_rss("augment after encode")
     feat = z[:, selection.indices].astype(np.float64, copy=False)
+    del z
+    _log_rss("augment after free z")
 
     X_keep = base_dataset.X[keep_base_arr]
     X_aug = np.concatenate([X_keep, feat], axis=1)
