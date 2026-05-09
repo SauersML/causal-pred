@@ -2246,7 +2246,12 @@ def _load_or_run_genscore_features(
         crosscoder_checkpoint_every=GENSCORE_CROSSCODER_CHECKPOINT_EVERY,
         crosscoder_checkpoint_callback=_store_crosscoder_checkpoint,
     )
+    logger.info("[genscore] crosscoder training done; flushing final checkpoint upload")
     checkpoint_uploader.flush()
+    logger.info(
+        "[genscore] post-training: computing top genome/EHR loadings for %d promoted features",
+        len(aug_result.feature_selection.indices),
+    )
     sel = aug_result.feature_selection
     top_genome_loadings: dict[str, list[dict[str, float]]] = {}
     top_ehr_loadings: dict[str, list[dict[str, float]]] = {}
@@ -2313,6 +2318,13 @@ def _load_or_run_genscore_features(
         "runtime_s": time.time() - t0,
     }
     dataset = aug_result.dataset
+    logger.info(
+        "[genscore] writing genscore bundle to %s (n=%d, d=%d, ehr_m=%d)",
+        path,
+        int(dataset.X.shape[0]),
+        int(model.d),
+        int(ehr_panel.m),
+    )
     _atomic_npz(
         path,
         X=dataset.X,
@@ -2338,7 +2350,13 @@ def _load_or_run_genscore_features(
         cc_device=np.array(str(model.device)),
         cc_promoted_indices=sel.indices.astype(np.int64, copy=False),
     )
+    logger.info(
+        "[genscore] bundle written %s size=%.1fMiB; uploading to bucket",
+        path,
+        _path_size_mib(path),
+    )
     cache.store(path)
+    logger.info("[genscore] bundle uploaded; computing post-training summary metrics")
     model_bundle: dict[str, Any] | None = {
         "W_e": np.asarray(model.W_e),
         "b_enc": np.asarray(model.b_enc),
@@ -2361,8 +2379,15 @@ def _load_or_run_genscore_features(
     from .genscore.integrate import align_panels_by_iid
 
     r_G = feature_stream_share(model)
+    logger.info("[genscore] aligning full panels for post-training encode")
     panels_aligned = align_panels_by_iid(person_ids, prs_df, ehr_panel)
+    logger.info(
+        "[genscore] encoding full panel through crosscoder (n=%d) on %s",
+        int(panels_aligned.A.shape[0]),
+        str(model.device),
+    )
     z_full = encode(model, panels_aligned.A, panels_aligned.B)
+    logger.info("[genscore] encode complete; computing reconstruction metrics")
     activation_rate_all = (z_full > 0).mean(axis=0)
     dead_mask_all = activation_rate_all == 0.0
     genome_only = (~dead_mask_all) & (r_G > GENSCORE_GENOME_SHARE_MAX)
