@@ -330,7 +330,7 @@ def _post_training_reconstruction_stats(
     model: Any,
     panels_aligned: Any,
     logger: logging.Logger,
-) -> tuple[np.ndarray, float, float, float, float]:
+) -> tuple[np.ndarray, dict[str, float]]:
     """Encode the full panel through the trained crosscoder and return
     (activation_rate_per_feature, ss_res_a, ss_tot_a, ss_res_b, ss_tot_b).
 
@@ -413,17 +413,39 @@ def _post_training_reconstruction_stats(
 
     a_hat = z @ W_d_G
     b_hat = z @ W_d_E
-    del W_d_G, W_d_E
-
     activation_count = (z > 0).sum(dim=0)
+    del z, W_d_G, W_d_E
+
+    # Genome side: a_hat is in z-score space; standard R^2 is well-defined.
     ss_res_a = float(((a_z - a_hat) ** 2).sum().item())
-    ss_tot_a = float((a_z ** 2).sum().item())
-    ss_res_b = float(((b_z - b_hat) ** 2).sum().item())
-    ss_tot_b = float((b_z ** 2).sum().item())
+    a_z_mean = a_z.mean(dim=0, keepdim=True)
+    ss_tot_a = float(((a_z - a_z_mean) ** 2).sum().item())
+    r2_g = 1.0 - ss_res_a / ss_tot_a if ss_tot_a > 0 else float("nan")
+
+    # EHR side: b_hat is in mixed natural-parameter space (z-score for
+    # gaussian columns, logit for binary, log-rate for count). Compute
+    # one metric per kind in its native space; aggregating into a single
+    # R^2 is meaningless because most columns are binary.
+    metrics: dict[str, float] = {"r2_genome": r2_g}
+    B_raw_np = panels_aligned.B
+    b_hat_np = b_hat.cpu().numpy()
+    b_z_np = b_z.cpu().numpy()
+    from .genscore.crosscoder import _ehr_kind_masks, _ehr_recon_metrics
+
+    gaussian_e, binary_e, count_e = _ehr_kind_masks(
+        tuple(model.ehr_feature_kinds), int(model.m_E)
+    )
+    metrics.update(
+        _ehr_recon_metrics(
+            b_z_np, B_raw_np, b_hat_np,
+            gaussian=gaussian_e, binary=binary_e, count=count_e,
+            mean_E=model.mean_E,
+        )
+    )
     activation_rate = (
         activation_count.to(torch.float64) / float(n_full)
     ).cpu().numpy()
-    return activation_rate, ss_res_a, ss_tot_a, ss_res_b, ss_tot_b
+    return activation_rate, metrics
 
 
 class _AsyncUploader:
@@ -2136,9 +2158,26 @@ def _render_genscore_plots_async(
                     genscore_meta.get("ever_active_count_history", [])
                 ),
                 "r2_genome_val": list(genscore_meta.get("r2_genome_val_history", [])),
-                "r2_ehr_val": list(genscore_meta.get("r2_ehr_val_history", [])),
-                "cross_r2_ehr_from_genome_val": list(
-                    genscore_meta.get("cross_r2_ehr_from_genome_val_history", [])
+                "r2_ehr_gaussian_val": list(
+                    genscore_meta.get("r2_ehr_gaussian_val_history", [])
+                ),
+                "brier_ehr_binary_val": list(
+                    genscore_meta.get("brier_ehr_binary_val_history", [])
+                ),
+                "brier_lift_vs_prior_val": list(
+                    genscore_meta.get("brier_lift_vs_prior_val_history", [])
+                ),
+                "r2_ehr_count_logspace_val": list(
+                    genscore_meta.get("r2_ehr_count_logspace_val_history", [])
+                ),
+                "cross_r2_ehr_gaussian_from_genome_val": list(
+                    genscore_meta.get("cross_r2_ehr_gaussian_from_genome_val_history", [])
+                ),
+                "cross_brier_ehr_binary_from_genome_val": list(
+                    genscore_meta.get("cross_brier_ehr_binary_from_genome_val_history", [])
+                ),
+                "cross_brier_lift_vs_prior_from_genome_val": list(
+                    genscore_meta.get("cross_brier_lift_vs_prior_from_genome_val_history", [])
                 ),
                 "cross_r2_genome_from_ehr_val": list(
                     genscore_meta.get("cross_r2_genome_from_ehr_val_history", [])
@@ -2440,9 +2479,26 @@ def _load_or_run_genscore_features(
         "frac_active_batch_history": list(model.history.get("frac_active_batch", [])),
         "ever_active_count_history": list(model.history.get("ever_active_count", [])),
         "r2_genome_val_history": list(model.history.get("r2_genome_val", [])),
-        "r2_ehr_val_history": list(model.history.get("r2_ehr_val", [])),
-        "cross_r2_ehr_from_genome_val_history": list(
-            model.history.get("cross_r2_ehr_from_genome_val", [])
+        "r2_ehr_gaussian_val_history": list(
+            model.history.get("r2_ehr_gaussian_val", [])
+        ),
+        "brier_ehr_binary_val_history": list(
+            model.history.get("brier_ehr_binary_val", [])
+        ),
+        "brier_lift_vs_prior_val_history": list(
+            model.history.get("brier_lift_vs_prior_val", [])
+        ),
+        "r2_ehr_count_logspace_val_history": list(
+            model.history.get("r2_ehr_count_logspace_val", [])
+        ),
+        "cross_r2_ehr_gaussian_from_genome_val_history": list(
+            model.history.get("cross_r2_ehr_gaussian_from_genome_val", [])
+        ),
+        "cross_brier_ehr_binary_from_genome_val_history": list(
+            model.history.get("cross_brier_ehr_binary_from_genome_val", [])
+        ),
+        "cross_brier_lift_vs_prior_from_genome_val_history": list(
+            model.history.get("cross_brier_lift_vs_prior_from_genome_val", [])
         ),
         "cross_r2_genome_from_ehr_val_history": list(
             model.history.get("cross_r2_genome_from_ehr_val", [])
@@ -2523,8 +2579,8 @@ def _load_or_run_genscore_features(
     panels_aligned = align_panels_by_iid(person_ids, prs_df, ehr_panel)
     n_full = int(panels_aligned.A.shape[0])
     d_full = int(model.d)
-    activation_rate_all, ss_res_a, ss_tot_a, ss_res_b, ss_tot_b = (
-        _post_training_reconstruction_stats(model, panels_aligned, logger)
+    activation_rate_all, recon_metrics = _post_training_reconstruction_stats(
+        model, panels_aligned, logger
     )
     logger.info("[genscore] encode complete; computing reconstruction metrics")
     _log_rss(logger, "after post-training reconstruction")
@@ -2536,8 +2592,11 @@ def _load_or_run_genscore_features(
         & (r_G >= GENSCORE_GENOME_SHARE_MIN)
         & (r_G <= GENSCORE_GENOME_SHARE_MAX)
     )
-    r2_g = 1.0 - ss_res_a / ss_tot_a if ss_tot_a > 0 else float("nan")
-    r2_e = 1.0 - ss_res_b / ss_tot_b if ss_tot_b > 0 else float("nan")
+    r2_g = float(recon_metrics["r2_genome"])
+    r2_e_gauss = float(recon_metrics["r2_ehr_gaussian"])
+    brier_e_bin = float(recon_metrics["brier_ehr_binary"])
+    brier_lift = float(recon_metrics["brier_lift_vs_prior"])
+    r2_e_count = float(recon_metrics["r2_ehr_count_logspace"])
 
     rg_q = np.quantile(r_G, [0.0, 0.25, 0.5, 0.75, 1.0])
     rate_alive = activation_rate_all[~dead_mask_all]
@@ -2546,15 +2605,25 @@ def _load_or_run_genscore_features(
     else:
         rate_q = np.zeros(5)
 
-    cross_e_hist = model.history.get("cross_r2_ehr_from_genome_val", [])
     cross_g_hist = model.history.get("cross_r2_genome_from_ehr_val", [])
+    cross_brier_hist = model.history.get(
+        "cross_brier_ehr_binary_from_genome_val", []
+    )
+    cross_brier_lift_hist = model.history.get(
+        "cross_brier_lift_vs_prior_from_genome_val", []
+    )
     logger.info(
-        "[genscore] reconstruction R^2 genome=%.4f ehr=%.4f "
-        "cross_ehr_from_genome=%.4f cross_genome_from_ehr=%.4f",
-        r2_g,
-        r2_e,
-        float(cross_e_hist[-1]) if cross_e_hist else float("nan"),
+        "[genscore] reconstruction R^2 genome=%.4f | EHR per-kind: "
+        "gauss_R^2=%.4f binary_brier=%.4f (lift_vs_prior=%+.4f) "
+        "count_R^2_logspace=%.4f",
+        r2_g, r2_e_gauss, brier_e_bin, brier_lift, r2_e_count,
+    )
+    logger.info(
+        "[genscore] cross-modal: genome_from_ehr_R^2=%.4f "
+        "ehr_binary_from_genome_brier=%.4f (lift=%+.4f)",
         float(cross_g_hist[-1]) if cross_g_hist else float("nan"),
+        float(cross_brier_hist[-1]) if cross_brier_hist else float("nan"),
+        float(cross_brier_lift_hist[-1]) if cross_brier_lift_hist else float("nan"),
     )
     logger.info(
         "[genscore] feature counts d=%d alive=%d dead=%d "

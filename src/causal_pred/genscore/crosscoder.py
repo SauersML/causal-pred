@@ -546,6 +546,65 @@ def _r2(y: np.ndarray, y_hat: np.ndarray) -> float:
     return 1.0 - ss_res / ss_tot if ss_tot > 0.0 else float("nan")
 
 
+def _ehr_recon_metrics(
+    b_z: np.ndarray,
+    b_raw: np.ndarray,
+    b_hat: np.ndarray,
+    *,
+    gaussian: np.ndarray,
+    binary: np.ndarray,
+    count: np.ndarray,
+    mean_E: np.ndarray,
+) -> dict[str, float]:
+    """Per-kind reconstruction quality.
+
+    ``b_hat`` is the model's raw decoder output ``z @ W_d_E``. In mixed-
+    likelihood mode that's a z-score for Gaussian columns, a logit for
+    binary columns, and a log-rate for count columns. Comparing it
+    directly against the z-scored target with a single R^2 is meaningless
+    when most columns are binary - the binary z-scores are huge spikes
+    (~1/sqrt(prevalence)) while the logits are O(1), so the residuals
+    explode and drive R^2 deeply negative even when classification is
+    perfect.
+
+    Compute each kind in its own native space:
+      * Gaussian: standard R^2 on z-scored values.
+      * Binary: Brier score against the actual {0,1} target after
+        sigmoid(logit + prior_logit). Lower is better; 0.0 = perfect,
+        prevalence*(1-prevalence) = predicting the prior.
+      * Count: R^2 in log1p(rate) space against log1p(target), since
+        that's what the loss already uses.
+    """
+    out: dict[str, float] = {}
+    if gaussian.any():
+        out["r2_ehr_gaussian"] = _r2(b_z[:, gaussian], b_hat[:, gaussian])
+    else:
+        out["r2_ehr_gaussian"] = float("nan")
+
+    if binary.any():
+        prevalence = np.clip(mean_E[binary], 1e-4, 1.0 - 1e-4)
+        prior_logit = np.log(prevalence / (1.0 - prevalence))
+        prob = 1.0 / (1.0 + np.exp(-(b_hat[:, binary] + prior_logit[None, :])))
+        target = b_raw[:, binary]
+        out["brier_ehr_binary"] = float(np.mean((prob - target) ** 2))
+        prior_brier = float(
+            np.mean((prevalence[None, :] - target) ** 2)
+        )
+        out["brier_lift_vs_prior"] = prior_brier - out["brier_ehr_binary"]
+    else:
+        out["brier_ehr_binary"] = float("nan")
+        out["brier_lift_vs_prior"] = float("nan")
+
+    if count.any():
+        target = np.log1p(np.clip(b_raw[:, count], 0.0, None))
+        pred = np.log1p(np.clip(np.expm1(np.logaddexp(0.0, b_hat[:, count])), 0.0, None))
+        out["r2_ehr_count_logspace"] = _r2(target, pred)
+    else:
+        out["r2_ehr_count_logspace"] = float("nan")
+
+    return out
+
+
 def train_crosscoder(
     A: np.ndarray,
     B: np.ndarray,
@@ -705,8 +764,13 @@ def train_crosscoder(
             "frac_active_batch": [],
             "ever_active_count": [],
             "r2_genome_val": [],
-            "r2_ehr_val": [],
-            "cross_r2_ehr_from_genome_val": [],
+            "r2_ehr_gaussian_val": [],
+            "brier_ehr_binary_val": [],
+            "brier_lift_vs_prior_val": [],
+            "r2_ehr_count_logspace_val": [],
+            "cross_r2_ehr_gaussian_from_genome_val": [],
+            "cross_brier_ehr_binary_from_genome_val": [],
+            "cross_brier_lift_vs_prior_from_genome_val": [],
             "cross_r2_genome_from_ehr_val": [],
             "frac_shared_decoder": [],
             "negative_control_margin_val": [],
@@ -898,12 +962,28 @@ def train_crosscoder(
             margin = (matched - shuffled).detach().cpu().item()
         else:
             margin = float("nan")
+        b_raw_np = b_raw.detach().cpu().numpy()
+        ehr_metrics = _ehr_recon_metrics(
+            b_np, b_raw_np, b_hat_np,
+            gaussian=gaussian_e_np, binary=binary_e_np, count=count_e_np,
+            mean_E=mean_E,
+        )
+        cross_ehr = _ehr_recon_metrics(
+            b_np, b_raw_np, b_from_a_np,
+            gaussian=gaussian_e_np, binary=binary_e_np, count=count_e_np,
+            mean_E=mean_E,
+        )
         return {
             "loss": float(val_loss.detach().cpu().item()),
             "r2_genome": _r2(a_np, a_hat_np),
-            "r2_ehr": _r2(b_np, b_hat_np),
-            "cross_r2_ehr_from_genome": _r2(b_np, b_from_a_np),
             "cross_r2_genome_from_ehr": _r2(a_np, a_from_b_np),
+            "r2_ehr_gaussian": float(ehr_metrics["r2_ehr_gaussian"]),
+            "brier_ehr_binary": float(ehr_metrics["brier_ehr_binary"]),
+            "brier_lift_vs_prior": float(ehr_metrics["brier_lift_vs_prior"]),
+            "r2_ehr_count_logspace": float(ehr_metrics["r2_ehr_count_logspace"]),
+            "cross_r2_ehr_gaussian_from_genome": float(cross_ehr["r2_ehr_gaussian"]),
+            "cross_brier_ehr_binary_from_genome": float(cross_ehr["brier_ehr_binary"]),
+            "cross_brier_lift_vs_prior_from_genome": float(cross_ehr["brier_lift_vs_prior"]),
             "negative_control_margin": float(margin),
         }
 
@@ -1036,8 +1116,13 @@ def train_crosscoder(
             history["frac_active_batch"].append(frac_active_batch)
             history["ever_active_count"].append(int(ever_active.sum()))
             history["r2_genome_val"].append(float(eval_metrics["r2_genome"]))
-            history["r2_ehr_val"].append(float(eval_metrics["r2_ehr"]))
-            history["cross_r2_ehr_from_genome_val"].append(float(eval_metrics["cross_r2_ehr_from_genome"]))
+            history["r2_ehr_gaussian_val"].append(float(eval_metrics["r2_ehr_gaussian"]))
+            history["brier_ehr_binary_val"].append(float(eval_metrics["brier_ehr_binary"]))
+            history["brier_lift_vs_prior_val"].append(float(eval_metrics["brier_lift_vs_prior"]))
+            history["r2_ehr_count_logspace_val"].append(float(eval_metrics["r2_ehr_count_logspace"]))
+            history["cross_r2_ehr_gaussian_from_genome_val"].append(float(eval_metrics["cross_r2_ehr_gaussian_from_genome"]))
+            history["cross_brier_ehr_binary_from_genome_val"].append(float(eval_metrics["cross_brier_ehr_binary_from_genome"]))
+            history["cross_brier_lift_vs_prior_from_genome_val"].append(float(eval_metrics["cross_brier_lift_vs_prior_from_genome"]))
             history["cross_r2_genome_from_ehr_val"].append(float(eval_metrics["cross_r2_genome_from_ehr"]))
             history["frac_shared_decoder"].append(frac_shared_decoder)
             history["negative_control_margin_val"].append(float(eval_metrics["negative_control_margin"]))
@@ -1049,8 +1134,9 @@ def train_crosscoder(
                     f"loss_cross={history['loss_cross'][-1]:.5f} "
                     f"loss_align={history['loss_align'][-1]:.5f} "
                     f"r2_G={history['r2_genome_val'][-1]:.3f} "
-                    f"r2_E={history['r2_ehr_val'][-1]:.3f} "
-                    f"cross_r2_E_from_G={history['cross_r2_ehr_from_genome_val'][-1]:.3f} "
+                    f"r2_E_gauss={history['r2_ehr_gaussian_val'][-1]:.3f} "
+                    f"brier_E_bin={history['brier_ehr_binary_val'][-1]:.4f} "
+                    f"brier_lift={history['brier_lift_vs_prior_val'][-1]:+.4f} "
                     f"cross_r2_G_from_E={history['cross_r2_genome_from_ehr_val'][-1]:.3f} "
                     f"avg_l0={avg_l0:.2f} dead={history['frac_dead'][-1]:.3f} "
                     f"neg_margin={history['negative_control_margin_val'][-1]:.5f} "

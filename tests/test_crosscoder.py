@@ -191,8 +191,10 @@ def test_multiview_trainer_enforces_private_decoder_masks_and_logs_cross_metrics
     assert np.allclose(model.W_d_G[model.latent_bank == BANK_EHR_PRIVATE], 0.0)
     assert model.activation_kind == "batch_topk"
     assert "loss_val" in model.history
-    assert "cross_r2_ehr_from_genome_val" in model.history
+    assert "cross_brier_ehr_binary_from_genome_val" in model.history
     assert "cross_r2_genome_from_ehr_val" in model.history
+    assert "r2_ehr_gaussian_val" in model.history
+    assert "brier_ehr_binary_val" in model.history
     assert "negative_control_margin_val" in model.history
 
 
