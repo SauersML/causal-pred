@@ -91,7 +91,14 @@ fi
 log "using repo at $REPO_DIR"
 cd "$REPO_DIR"
 
-# 4. python deps -------------------------------------------------------------
+# 4. pull latest -------------------------------------------------------------
+# Fast-forward only so a dirty / diverged checkout fails loudly instead of
+# silently running stale code (which previously masked fixes that had been
+# pushed to main between bootstrap invocations).
+log "git pull --ff-only"
+git pull --ff-only
+
+# 5. python deps -------------------------------------------------------------
 log "uv sync --locked --dev"
 uv sync --locked --dev
 
