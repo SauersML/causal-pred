@@ -22,22 +22,28 @@ class Node:
     name: str
     kind: str  # "continuous" | "binary" | "survival"
     description: str
+    exogenous: bool = False
 
 
 # Ordered so that any topological sort of the synthetic DAG will respect it.
 # Genetic/demographic roots first, then mediators, then the T2D outcome.
 NODES: Tuple[Node, ...] = (
     # --- genetic roots (continuous, standardised polygenic scores) ---
-    Node("PGS_T2D", "continuous", "Polygenic score for T2D"),
-    Node("PGS_BMI", "continuous", "Polygenic score for body-mass index"),
-    Node("PGS_LDL", "continuous", "Polygenic score for LDL cholesterol"),
-    Node("PGS_HbA1c", "continuous", "Polygenic score for HbA1c"),
+    Node("PGS_T2D", "continuous", "Polygenic score for T2D", exogenous=True),
+    Node("PGS_BMI", "continuous", "Polygenic score for body-mass index", exogenous=True),
+    Node("PGS_LDL", "continuous", "Polygenic score for LDL cholesterol", exogenous=True),
+    Node("PGS_HbA1c", "continuous", "Polygenic score for HbA1c", exogenous=True),
     # --- demographic roots ---
-    Node("age", "continuous", "Current age (years)"),
-    Node("sex", "binary", "1 = male, 0 = female"),
-    Node("ancestry_PC1", "continuous", "Genetic-ancestry PC1"),
+    Node("age", "continuous", "Current age (years)", exogenous=True),
+    Node("sex", "binary", "1 = male, 0 = female", exogenous=True),
+    Node("ancestry_PC1", "continuous", "Genetic-ancestry PC1", exogenous=True),
     # --- family history ---
-    Node("family_history_T2D", "binary", "Any first-degree relative with T2D"),
+    Node(
+        "family_history_T2D",
+        "binary",
+        "Any first-degree relative with T2D",
+        exogenous=True,
+    ),
     # --- lifestyle / environment ---
     Node("years_smoking", "continuous", "Cumulative years of smoking"),
     Node("physical_activity", "continuous", "Average MET-hours per week"),

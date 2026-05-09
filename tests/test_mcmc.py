@@ -76,6 +76,38 @@ def test_acyclic_always(small_data):
     assert np.all(np.diag(res.edge_probs) == 0.0)
 
 
+def test_allowed_edges_are_structural():
+    p = 4
+    allowed = np.zeros((p, p), dtype=bool)
+    allowed[0, 1] = True
+    pi = np.full((p, p), 0.999, dtype=float)
+    np.fill_diagonal(pi, np.nan)
+    X = np.zeros((40, p), dtype=float)
+
+    res = run_structure_mcmc(
+        X,
+        ("continuous",) * p,
+        np.zeros((p, p), dtype=np.int64),
+        pi,
+        n_samples=20,
+        burn_in=20,
+        thin=1,
+        n_chains=2,
+        rng=np.random.default_rng(12),
+        hybrid_prob=0.4,
+        edge_resample_prob=0.4,
+        max_parents=2,
+        exact_parent_resample=True,
+        allowed_edges=allowed,
+    )
+
+    forbidden = ~allowed
+    np.fill_diagonal(forbidden, False)
+    assert np.all(res.edge_probs[forbidden] == 0.0)
+    for sample in res.samples:
+        assert np.all(sample[forbidden] == 0)
+
+
 # ---------------------------------------------------------------------------
 # 2. Detailed balance on a 4-node toy target
 #

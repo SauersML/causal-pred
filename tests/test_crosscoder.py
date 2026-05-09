@@ -148,6 +148,59 @@ def test_decoder_normalisation_unit_norm():
     np.testing.assert_allclose(norms, np.ones(d), atol=1e-10)
 
 
+def test_crosscoder_checkpoint_resume_matches_uninterrupted_fit(tmp_path):
+    rng = np.random.default_rng(123)
+    A = rng.normal(size=(160, 5))
+    B = rng.normal(size=(160, 7))
+    kwargs = dict(
+        d=12,
+        k=3,
+        batch_size=32,
+        lr=1e-3,
+        aux_k=4,
+        n_steps=24,
+        log_every=6,
+        train_dtype="float32",
+    )
+
+    full = train_crosscoder(
+        A=A,
+        B=B,
+        rng=np.random.default_rng(0),
+        **kwargs,
+    )
+
+    checkpoint = tmp_path / "crosscoder-fit.npz"
+    seen_steps: list[int] = []
+    train_crosscoder(
+        A=A,
+        B=B,
+        rng=np.random.default_rng(0),
+        n_steps=12,
+        checkpoint_path=checkpoint,
+        checkpoint_every=6,
+        checkpoint_callback=lambda _path, step: seen_steps.append(step),
+        **{k: v for k, v in kwargs.items() if k != "n_steps"},
+    )
+    assert checkpoint.is_file()
+    assert seen_steps == [6, 12]
+
+    resumed = train_crosscoder(
+        A=A,
+        B=B,
+        rng=np.random.default_rng(999),
+        checkpoint_path=checkpoint,
+        checkpoint_every=6,
+        **kwargs,
+    )
+
+    np.testing.assert_allclose(resumed.W_e, full.W_e, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(resumed.b_enc, full.b_enc, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(resumed.W_d_G, full.W_d_G, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(resumed.W_d_E, full.W_d_E, rtol=1e-6, atol=1e-6)
+    assert resumed.history["step"] == full.history["step"]
+
+
 def test_topk_crosscoder_recovers_planted_features():
     """Train on planted superposition; check recovery and stream classification."""
     rng = np.random.default_rng(42)

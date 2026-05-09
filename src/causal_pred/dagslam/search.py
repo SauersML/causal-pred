@@ -189,7 +189,26 @@ def _delta_prior_of_move(
 # ---------------------------------------------------------------------------
 
 
-def _random_sparse_dag(p: int, density: float, rng: np.random.Generator) -> np.ndarray:
+def _prepare_allowed_edges(allowed_edges: Optional[np.ndarray], p: int) -> np.ndarray:
+    """Return a boolean structural mask for candidate directed edges."""
+    if allowed_edges is None:
+        allowed = np.ones((p, p), dtype=bool)
+    else:
+        allowed = np.asarray(allowed_edges, dtype=bool).copy()
+        if allowed.shape != (p, p):
+            raise ValueError(
+                f"allowed_edges has shape {allowed.shape}, expected ({p}, {p})"
+            )
+    np.fill_diagonal(allowed, False)
+    return allowed
+
+
+def _random_sparse_dag(
+    p: int,
+    density: float,
+    rng: np.random.Generator,
+    allowed_edges: np.ndarray,
+) -> np.ndarray:
     """Draw a random DAG by fixing a random topological order and
     including each forward edge independently with probability ``density``.
     Acyclic by construction.
@@ -198,9 +217,9 @@ def _random_sparse_dag(p: int, density: float, rng: np.random.Generator) -> np.n
     adj = np.zeros((p, p), dtype=np.int64)
     for a_idx in range(p):
         for b_idx in range(a_idx + 1, p):
-            if rng.random() < density:
-                u = int(order[a_idx])
-                v = int(order[b_idx])
+            u = int(order[a_idx])
+            v = int(order[b_idx])
+            if allowed_edges[u, v] and rng.random() < density:
                 adj[u, v] = 1
     return adj
 
@@ -232,6 +251,7 @@ def _reverse_move(move: Tuple[str, int, int]) -> Tuple[str, int, int]:
 def _enumerate_moves(
     adj: np.ndarray,
     max_parents: int,
+    allowed_edges: np.ndarray,
 ) -> List[Tuple[str, int, int]]:
     """Structurally-legal moves from ``adj``.
 
@@ -256,6 +276,8 @@ def _enumerate_moves(
     for i, j in np.argwhere(adj == 1):
         i = int(i)
         j = int(j)
+        if not allowed_edges[j, i]:
+            continue
         if parent_counts[i] >= max_parents:
             continue
         adj[i, j] = 0
@@ -274,6 +296,8 @@ def _enumerate_moves(
             if adj[i, j] or adj[j, i]:
                 # Skip if the edge already exists (handled above), or the
                 # reverse edge does (handled via "reverse").
+                continue
+            if not allowed_edges[i, j]:
                 continue
             if not _creates_cycle_if_add(adj, i, j):
                 moves.append(("add", i, j))
@@ -337,6 +361,7 @@ def _single_climb(
     hyper: dict,
     verbose: bool,
     edge_logit: np.ndarray,
+    allowed_edges: np.ndarray,
 ) -> Tuple[np.ndarray, float, dict]:
     """One hill-climb from ``start_adj``.  Mutates ``cache``.
 
@@ -361,7 +386,7 @@ def _single_climb(
 
     for it in range(max_iter):
         n_iter = it + 1
-        moves = _enumerate_moves(adj, max_parents)
+        moves = _enumerate_moves(adj, max_parents, allowed_edges)
         if not moves:
             if verbose:
                 print(f"[dagslam] iter {it}: no structurally legal move.")
@@ -482,6 +507,7 @@ def run_dagslam(
     rng=None,
     verbose: bool = False,
     pi_prior: Optional[np.ndarray] = None,
+    allowed_edges: Optional[np.ndarray] = None,
     **hyper,
 ) -> DAGSLAMResult:
     """DAGSLAM hill-climbing structure search.
@@ -510,6 +536,9 @@ def run_dagslam(
         Per-edge MrDAG inclusion probabilities.  Finite entries add an
         independent Bernoulli log-odds prior to the greedy search objective;
         non-finite entries are treated as neutral 0.5 probabilities.
+    allowed_edges : array-like, shape (p, p), optional
+        Boolean structural mask. False entries are never proposed as
+        additions or reversals.
     **hyper
         Extra hyperparameters forwarded to the scoring module (e.g.
         ``alpha_mu`` for BGe, ``tau2`` for the Laplace logistic).
@@ -521,6 +550,7 @@ def run_dagslam(
     X = np.ascontiguousarray(np.asarray(data, dtype=np.float64))
     n, p = X.shape
     edge_logit = _prepare_edge_logit_prior(pi_prior, p)
+    allowed = _prepare_allowed_edges(allowed_edges, p)
     if len(node_types) != p:
         raise ValueError(
             f"node_types has length {len(node_types)} but data has {p} columns"
@@ -539,7 +569,12 @@ def run_dagslam(
         if r == 0:
             start_adj = np.zeros((p, p), dtype=np.int64)
         else:
-            start_adj = _random_sparse_dag(p, density=0.1, rng=rng)
+            start_adj = _random_sparse_dag(
+                p,
+                density=0.1,
+                rng=rng,
+                allowed_edges=allowed,
+            )
             # Respect max_parents in the starting state by randomly
             # dropping excess incoming edges.
             for j in range(p):
@@ -563,6 +598,7 @@ def run_dagslam(
             hyper=hyper,
             verbose=verbose,
             edge_logit=edge_logit,
+            allowed_edges=allowed,
         )
 
         info["restart"] = r

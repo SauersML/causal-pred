@@ -181,7 +181,7 @@ def _fit_gam(
 
 
 # ---------------------------------------------------------------------------
-# Predict via gam.Model.predict + SurvivalPrediction.survival_at
+# Predict via gam.Model.predict + SurvivalPrediction.survival_at_chunks
 # ---------------------------------------------------------------------------
 
 
@@ -193,8 +193,9 @@ def _predict_survival_matrix(
     """Return ``(n_new, n_t)`` survival probabilities S(t | x).
 
     The gamfit model returns a :class:`gamfit.SurvivalPrediction` object
-    for the requested rows. Its ``survival_at`` method evaluates each
-    row's fitted survival function on the shared output grid.
+    for the requested rows. Small diagnostic calls use ``survival_at``;
+    full-cohort calls use ``survival_at_chunks`` to stay under gamfit's
+    dense diagnostic-size guard.
     """
     p = len(fit.columns)
     if p > 0:
@@ -223,10 +224,20 @@ def _predict_survival_matrix(
     )
 
     pred = fit.model.predict(df_new)
-    S_mean = np.asarray(pred.survival_at(t_grid), dtype=float)
+    try:
+        S_mean = np.asarray(pred.survival_at(t_grid), dtype=float)
+    except ValueError as exc:
+        if "dense survival curves are limited" not in str(exc) or not hasattr(
+            pred,
+            "survival_at_chunks",
+        ):
+            raise
+        S_mean = np.empty((n_new, n_t), dtype=float)
+        for row_slice, time_slice, block in pred.survival_at_chunks(t_grid):
+            S_mean[row_slice, time_slice] = np.asarray(block, dtype=float)
     if S_mean.shape != (n_new, n_t):
         raise RuntimeError(
-            f"gamfit returned survival_at of shape {S_mean.shape}; "
+            f"gamfit returned survival surface of shape {S_mean.shape}; "
             f"expected ({n_new}, {n_t})"
         )
     # S must be non-increasing in t; enforce by left-to-right cumulative
@@ -290,6 +301,12 @@ class SurvivalGAM:
         S_mean = self._cached_predict(X_new, t_grid)
         S = max(int(self._n_posterior_draws), 1)
         return np.broadcast_to(S_mean, (S,) + S_mean.shape).copy()
+
+    def predict_survival_mean(self, X_new: np.ndarray, t_grid: np.ndarray) -> np.ndarray:
+        """Point-estimate survival surface ``(n_new, n_t)`` without draw expansion."""
+        X_new = self._shape_X_new(X_new)
+        t_grid = np.asarray(t_grid, dtype=float).ravel()
+        return self._cached_predict(X_new, t_grid).copy()
 
     def predict_median_survival(self, X_new: np.ndarray) -> np.ndarray:
         """Posterior draws of the median survival time per row."""
@@ -501,7 +518,8 @@ def bma_survival(
         sub_eval = X_eval_arr[:, list(cols)] if cols else np.zeros((n_eval, 0))
         draws = fit.predict_survival(sub_eval, t_grid)            # (S, n_eval, n_t)
         per_set_mean.append(draws.mean(axis=0))
-        per_set_var.append(draws.var(axis=0, ddof=0))
+        ddof = 1 if draws.shape[0] > 1 else 0
+        per_set_var.append(draws.var(axis=0, ddof=ddof))
 
     stack_mean = np.stack(per_set_mean, axis=0)                   # (K, n_eval, n_t)
     stack_var = np.stack(per_set_var, axis=0)

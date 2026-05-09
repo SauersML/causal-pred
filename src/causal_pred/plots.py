@@ -597,11 +597,11 @@ def _top_paths_to(
     Path weight = product of edge probabilities along the path (i.e. the
     posterior probability that *all* edges on the path are simultaneously
     present, under a factorised marginal approximation).  Paths are built
-    by truncated DFS with a minimum cumulative probability.
+    by truncated DFS over edges whose marginal probability is at least
+    ``min_prob``; cumulative joint probability is *not* further pruned, so
+    long paths through weak edges are still visible (they just rank low).
     """
     p = edge_probs.shape[0]
-    # Successors graph (we walk backwards from target, but build using
-    # ``parents[j] = list of i with P(i->j) >= min_prob``).
     parents = [[] for _ in range(p)]
     for j in range(p):
         for i in range(p):
@@ -613,32 +613,26 @@ def _top_paths_to(
 
     found = []
 
+    # Walk upward from target via predecessors. ``path`` always begins with
+    # ``target`` and grows leftward; every node we visit at depth >= 2 is the
+    # source end of a valid source -> ... -> target chain, so we record at
+    # every step (not just at terminal "no-more-parents" leaves), and let the
+    # outer top_k filter pick the best ones.
     def dfs(node, cum_prob, path):
-        if len(path) > max_depth:
-            return
-        if node == target and len(path) >= 2:
+        if len(path) >= 2:
             found.append((list(path), cum_prob))
+        if len(path) >= max_depth + 1:
             return
-        # Expand via parents of ``node`` (predecessors).
         for par, pr in parents[node]:
             if par in path:
-                continue  # no cycles
-            new_cum = cum_prob * pr
-            if new_cum < min_prob**2:
-                # Heuristic pruning: a whole path below min^2 is unlikely.
                 continue
-            dfs(par, new_cum, path + [par])
+            dfs(par, cum_prob * pr, path + [par])
 
-    # Seed DFS at target: paths end at target, so we walk parents outward.
     for par, pr in parents[target]:
         dfs(par, pr, [target, par])
 
-    # Reverse path direction so it reads source -> ... -> target.
-    out = []
-    for path, prob in found:
-        out.append((list(reversed(path)), prob))
+    out = [(list(reversed(path)), prob) for path, prob in found]
     out.sort(key=lambda x: -x[1])
-    # Dedupe by path tuple.
     seen = set()
     unique = []
     for path, prob in out:
@@ -648,6 +642,45 @@ def _top_paths_to(
         seen.add(key)
         unique.append((path, prob))
     return unique[:top_k]
+
+
+def _auto_paths_to(
+    edge_probs: np.ndarray,
+    target: int,
+    top_k: int,
+    requested_min_prob: float,
+    max_depth: int = 5,
+):
+    """Adaptively choose ``min_prob`` so the sankey actually shows something.
+
+    Tries the caller's ``requested_min_prob`` first; if that yields fewer than
+    ``top_k`` paths, scans descending percentiles of the actual edge-probability
+    distribution down to a tiny floor. Returns the threshold finally used and
+    the best (longest, joint-prob-sorted) path list found.
+    """
+    P = edge_probs
+    finite = P[np.isfinite(P) & (P > 0.0)]
+    if finite.size == 0:
+        return requested_min_prob, []
+    cand = sorted(
+        {
+            float(requested_min_prob),
+            *(float(np.percentile(finite, q)) for q in (90, 80, 65, 50, 35, 20, 10, 1)),
+            float(finite.min()),
+            1e-6,
+        },
+        reverse=True,
+    )
+    best_paths: list = []
+    best_threshold = requested_min_prob
+    for t in cand:
+        paths = _top_paths_to(P, target, top_k, t, max_depth=max_depth)
+        if len(paths) >= top_k:
+            return t, paths
+        if len(paths) > len(best_paths):
+            best_paths = paths
+            best_threshold = t
+    return best_threshold, best_paths
 
 
 def causal_pathway_sankey(
@@ -672,22 +705,58 @@ def causal_pathway_sankey(
         name_to_idx[target_node] if isinstance(target_node, str) else int(target_node)
     )
 
-    paths = _top_paths_to(P, target, top_k_paths, min_prob)
+    used_thr, paths = _auto_paths_to(P, target, top_k_paths, min_prob)
 
-    fig, ax = _new_fig(ax, (8.0, 4.5))
+    fig, ax = _new_fig(ax, (8.5, 4.8))
 
     if not paths:
-        ax.text(
-            0.5,
-            0.5,
-            f"no paths with min_prob >= {min_prob:.2f}",
-            ha="center",
-            va="center",
-            transform=ax.transAxes,
+        # No multi-hop ancestor paths exist. Fall back to a clean bar of the
+        # strongest direct (1-hop) parents — much more informative than text.
+        incoming = []
+        for i in range(P.shape[0]):
+            if i == target:
+                continue
+            v = P[i, target]
+            if np.isfinite(v) and v > 0:
+                incoming.append((i, float(v)))
+        incoming.sort(key=lambda iv: -iv[1])
+        incoming = incoming[: max(top_k_paths, 5)]
+
+        if not incoming:
+            ax.text(
+                0.5,
+                0.5,
+                f"no incoming edges into {node_names[target]}",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                fontsize=10,
+                color="#555555",
+            )
+            ax.set_axis_off()
+            return fig
+
+        names = [node_names[i] for i, _ in incoming]
+        vals = [v for _, v in incoming]
+        y = np.arange(len(incoming))[::-1]
+        cmap_obj = matplotlib.colormaps["viridis"]
+        colors = [cmap_obj(0.25 + 0.6 * v) for v in vals]
+        ax.barh(y, vals, color=colors, edgecolor="#222222", linewidth=0.6, height=0.65)
+        for yi, v in zip(y, vals):
+            ax.text(v + 0.01, yi, f"{v:.2f}", va="center", fontsize=8, color="#222222")
+        ax.set_yticks(y)
+        ax.set_yticklabels(names, fontsize=9)
+        ax.set_xlim(0, max(0.05, max(vals) * 1.18))
+        ax.set_xlabel("P(edge -> %s)" % node_names[target], fontsize=9)
+        ax.set_title(
+            f"strongest direct parents of {node_names[target]}\n"
+            f"(no multi-hop paths; longest chain = 1 edge)",
             fontsize=10,
-            color="#666666",
         )
-        ax.set_axis_off()
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        _faint_grid(ax)
+        fig.tight_layout()
         return fig
 
     # Layout: every node used by any path is laid out in layers (by path
@@ -695,87 +764,130 @@ def causal_pathway_sankey(
     max_len = max(len(pth) for pth, _ in paths)
     layer_of = {}
     for pth, _ in paths:
-        # Align right: place target at the last layer; each path's last
-        # node is target, so layer index = (max_len - 1) - (len(pth)-1 - k).
         for k, nd in enumerate(pth):
             layer = (max_len - 1) - (len(pth) - 1 - k)
             layer_of.setdefault(nd, set()).add(layer)
 
-    # Nodes within a layer are stacked vertically.
     by_layer = {}
     for nd, layers in layer_of.items():
-        best_layer = max(layers)  # prefer rightmost (closer to target).
+        best_layer = max(layers)
         by_layer.setdefault(best_layer, []).append(nd)
-
-    # Stable node ordering within a layer.
     for L in by_layer:
         by_layer[L] = sorted(by_layer[L])
 
     pos = {}
     n_layers = max_len
+    x_left, x_right = 0.08, 0.82
     for L in range(n_layers):
         nodes_in_layer = by_layer.get(L, [])
         n = len(nodes_in_layer)
         if n == 0:
             continue
-        ys = np.linspace(0.1, 0.9, max(n, 2)) if n > 1 else [0.5]
-        x = (L + 0.5) / n_layers
+        ys = np.linspace(0.15, 0.85, max(n, 2)) if n > 1 else [0.5]
+        x = x_left + (x_right - x_left) * (L / max(n_layers - 1, 1))
         for nd, y in zip(nodes_in_layer, ys):
             pos[nd] = (x, y)
 
-    # Draw nodes (small rectangles).
-    for nd, (x, y) in pos.items():
-        ax.add_patch(
-            patches.Rectangle(
-                (x - 0.03, y - 0.025),
-                0.06,
-                0.05,
-                facecolor="#cccccc",
-                edgecolor="#444444",
-                linewidth=0.8,
-            )
-        )
-        ax.text(x, y + 0.045, node_names[nd], ha="center", va="bottom", fontsize=8)
-
-    # Draw each path as a band.  Band thickness scales with joint prob.
+    # Draw paths first so node boxes sit on top.
     max_prob = max(pr for _, pr in paths)
-    cmap_obj = matplotlib.colormaps["cividis"]
+    cmap_obj = matplotlib.colormaps["viridis"]
+    node_w, node_h = 0.07, 0.055
     for pth, joint in paths:
-        thickness = 0.005 + 0.04 * (joint / max_prob)
+        rel = joint / max_prob if max_prob > 0 else 0.0
+        thickness = max(1.2, 1.5 + 7.5 * rel)
         for a, b in zip(pth[:-1], pth[1:]):
             if a not in pos or b not in pos:
                 continue
             x1, y1 = pos[a]
             x2, y2 = pos[b]
             edge_p = P[a, b] if np.isfinite(P[a, b]) else 0.0
-            colour = cmap_obj(0.2 + 0.6 * edge_p)
+            colour = cmap_obj(0.18 + 0.65 * float(np.clip(edge_p, 0.0, 1.0)))
+            xa = x1 + node_w / 2
+            xb = x2 - node_w / 2
+            xs = np.linspace(xa, xb, 64)
+            t = (xs - xa) / max(xb - xa, 1e-9)
+            s = 0.5 - 0.5 * np.cos(np.pi * t)  # smoothstep
+            ys = y1 + (y2 - y1) * s
             ax.plot(
-                [x1 + 0.03, x2 - 0.03],
-                [y1, y2],
+                xs,
+                ys,
                 color=colour,
-                linewidth=max(thickness * 60, 0.8),
-                alpha=0.8,
+                linewidth=thickness,
+                alpha=0.78,
                 solid_capstyle="round",
+                zorder=2,
             )
-        # Label the full path's joint probability at the target end.
-        tx, ty = pos[pth[-1]]
+        # Per-path label: stack vertically next to target so they don't
+        # overplot. Index is appended later once we know each path's slot.
+
+    # Draw nodes on top: rounded boxes with the target highlighted.
+    for nd, (x, y) in pos.items():
+        is_target = nd == target
+        face = "#1f3b73" if is_target else "#f3f4f7"
+        edge = "#0f1f3d" if is_target else "#3a3f48"
+        text_color = "#ffffff" if is_target else "#1a1d22"
+        box = patches.FancyBboxPatch(
+            (x - node_w / 2, y - node_h / 2),
+            node_w,
+            node_h,
+            boxstyle="round,pad=0.004,rounding_size=0.012",
+            facecolor=face,
+            edgecolor=edge,
+            linewidth=1.0,
+            zorder=3,
+        )
+        ax.add_patch(box)
         ax.text(
-            tx + 0.04,
-            ty,
-            f"p={joint:.2f}",
-            ha="left",
+            x,
+            y,
+            node_names[nd],
+            ha="center",
             va="center",
-            fontsize=7,
-            color="#333333",
+            fontsize=8.5,
+            color=text_color,
+            zorder=4,
         )
 
-    ax.set_xlim(0, 1.1)
+    # Stack per-path probability labels next to the target node.
+    if target in pos:
+        tx, ty = pos[target]
+        n = len(paths)
+        spread = 0.018 * max(n - 1, 0)
+        ys_lbl = (
+            np.linspace(ty + spread, ty - spread, n) if n > 1 else np.array([ty])
+        )
+        for (pth, joint), yl in zip(paths, ys_lbl):
+            src_name = node_names[pth[0]]
+            ax.text(
+                tx + node_w / 2 + 0.012,
+                yl,
+                f"{src_name}: p = {joint:.2f}",
+                ha="left",
+                va="center",
+                fontsize=7.5,
+                color="#222222",
+                zorder=4,
+            )
+
+    ax.set_xlim(0, 1.0)
     ax.set_ylim(0, 1)
     ax.set_axis_off()
-    ax.set_title(
-        f"top {len(paths)} causal pathways into {node_names[target]}",
-        fontsize=10,
+    title = f"top {len(paths)} causal pathways into {node_names[target]}"
+    if used_thr < min_prob and not np.isclose(used_thr, min_prob):
+        title += f"   (min P(edge) auto-relaxed to {used_thr:.2g})"
+    elif used_thr > min_prob and not np.isclose(used_thr, min_prob):
+        title += f"   (min P(edge) auto-tightened to {used_thr:.2g})"
+    ax.set_title(title, fontsize=10)
+
+    # Edge-probability colour key.
+    sm = plt.cm.ScalarMappable(
+        cmap=cmap_obj, norm=matplotlib.colors.Normalize(vmin=0.0, vmax=1.0)
     )
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.02, shrink=0.6)
+    cbar.set_label("P(edge)", fontsize=8)
+    cbar.ax.tick_params(labelsize=7)
+
     fig.tight_layout()
     return fig
 

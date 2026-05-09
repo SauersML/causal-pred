@@ -51,7 +51,7 @@ from .data.cohort import (
     resolve_aou_genotypes,
     resolve_cohort_csv,
 )
-from .data.nodes import CANONICAL_EDGES, NODE_INDEX, NODE_NAMES
+from .data.nodes import CANONICAL_EDGES, NODES, NODE_INDEX, NODE_NAMES
 from .data.polygenic import parse_sscore, score_panel
 from .data.opengwas import load_live_gwas
 from .data.real_gwas import load_real_gwas
@@ -135,7 +135,12 @@ GENSCORE_CROSSCODER_KWARGS = {
     "n_steps": 4000,
     "batch_size": 1024,
     "lr": 3e-4,
+    "train_dtype": "float32",
+    "stream_dropout_prob": 0.25,
+    "cross_stream_align_coef": 0.02,
+    "decoder_balance_coef": 0.02,
 }
+GENSCORE_CROSSCODER_CHECKPOINT_EVERY = 100
 
 GAM_N_SAMPLES = 200
 SURVIVAL_TIME_GRID_POINTS = 50
@@ -577,6 +582,10 @@ def _pipeline_config() -> dict[str, Any]:
             "parent_resample_prob": MCMC_PARENT_RESAMPLE_PROB,
             "exact_parent_resample": MCMC_EXACT_PARENT_RESAMPLE,
             "max_parents": DAGSLAM_MAX_PARENTS,
+        },
+        "structural_constraints": {
+            "target_sink": SURVIVAL_TARGET_COLUMN,
+            "exogenous_rule": "node-metadata-or-generated-feature",
         },
         "threshold": THRESHOLD_DEFAULT,
         "gam": {
@@ -1288,13 +1297,25 @@ def _render_genscore_plots_async(
             history = {
                 "step": list(genscore_meta.get("loss_history_step", [])),
                 "loss_main": list(genscore_meta.get("loss_history_main", [])),
+                "loss_eval": list(genscore_meta.get("loss_history_eval", [])),
                 "loss_aux": list(genscore_meta.get("loss_history_aux", [])),
+                "loss_align": list(genscore_meta.get("loss_history_align", [])),
+                "loss_balance": list(genscore_meta.get("loss_history_balance", [])),
                 "frac_dead": list(genscore_meta.get("frac_dead_history", [])),
                 "frac_active_batch": list(
                     genscore_meta.get("frac_active_batch_history", [])
                 ),
                 "ever_active_count": list(
                     genscore_meta.get("ever_active_count_history", [])
+                ),
+                "r2_genome_eval": list(
+                    genscore_meta.get("r2_genome_eval_history", [])
+                ),
+                "r2_ehr_eval": list(
+                    genscore_meta.get("r2_ehr_eval_history", [])
+                ),
+                "frac_shared_decoder": list(
+                    genscore_meta.get("frac_shared_decoder_history", [])
                 ),
             }
 
@@ -1459,6 +1480,24 @@ def _load_or_run_genscore_features(
         GENSCORE_MIN_ACTIVATION_RATE,
         GENSCORE_CROSSCODER_KWARGS,
     )
+    checkpoint_filename = f"crosscoder-fit-{key}.npz"
+    checkpoint_path = cache.fetch(checkpoint_filename)
+    if checkpoint_path.is_file():
+        logger.info(
+            "[crosscoder] using fit checkpoint %s size=%.1fMiB",
+            checkpoint_path,
+            _path_size_mib(checkpoint_path),
+        )
+
+    def _store_crosscoder_checkpoint(local_path: Path, step: int) -> None:
+        logger.info(
+            "[crosscoder] checkpoint step=%d path=%s size=%.1fMiB",
+            int(step),
+            local_path,
+            _path_size_mib(local_path),
+        )
+        cache.store(local_path, checkpoint_filename)
+
     t0 = time.time()
     aug_result, model = run_genscore(
         base_dataset=data,
@@ -1472,6 +1511,9 @@ def _load_or_run_genscore_features(
         crosscoder_kwargs=GENSCORE_CROSSCODER_KWARGS,
         rng=np.random.default_rng(PIPELINE_SEED + 10),
         progress=lambda message: logger.info("%s", message),
+        crosscoder_checkpoint_path=checkpoint_path,
+        crosscoder_checkpoint_every=GENSCORE_CROSSCODER_CHECKPOINT_EVERY,
+        crosscoder_checkpoint_callback=_store_crosscoder_checkpoint,
     )
     sel = aug_result.feature_selection
     top_genome_loadings: dict[str, list[dict[str, float]]] = {}
@@ -1503,13 +1545,25 @@ def _load_or_run_genscore_features(
         "promoted_feature_top_ehr_loadings": top_ehr_loadings,
         "loss_history_step": list(model.history["step"]),
         "loss_history_main": list(model.history["loss_main"]),
+        "loss_history_eval": list(model.history.get("loss_eval", [])),
         "loss_history_aux": list(model.history["loss_aux"]),
+        "loss_history_align": list(model.history.get("loss_align", [])),
+        "loss_history_balance": list(model.history.get("loss_balance", [])),
         "frac_dead_history": list(model.history["frac_dead"]),
         "frac_active_batch_history": list(
             model.history.get("frac_active_batch", [])
         ),
         "ever_active_count_history": list(
             model.history.get("ever_active_count", [])
+        ),
+        "r2_genome_eval_history": list(
+            model.history.get("r2_genome_eval", [])
+        ),
+        "r2_ehr_eval_history": list(
+            model.history.get("r2_ehr_eval", [])
+        ),
+        "frac_shared_decoder_history": list(
+            model.history.get("frac_shared_decoder", [])
         ),
         "runtime_s": time.time() - t0,
     }
@@ -1801,12 +1855,79 @@ def _mrdag_prior_for_data(mrdag_pi: np.ndarray, columns: Sequence[str]) -> np.nd
     return prior
 
 
+def _exogenous_mr_nodes() -> set[str]:
+    return {node.name for node in NODES if node.exogenous}
+
+
+def _is_root_covariate(name: str) -> bool:
+    lowered = str(name).lower()
+    mr_name = COHORT_TO_MR_NODE.get(str(name))
+    if mr_name in _exogenous_mr_nodes():
+        return True
+    return lowered.startswith(("pgs_", "feat_"))
+
+
+def _structural_allowed_edges(
+    columns: Sequence[str],
+    node_types: Sequence[str],
+) -> np.ndarray:
+    """Production structural mask for temporally impossible directions."""
+    p = len(columns)
+    if len(node_types) != p:
+        raise ValueError(
+            f"node_types has length {len(node_types)} but columns has length {p}"
+        )
+    allowed = np.ones((p, p), dtype=bool)
+    np.fill_diagonal(allowed, False)
+
+    target_like = {
+        i
+        for i, (name, kind) in enumerate(zip(columns, node_types))
+        if str(name) == SURVIVAL_TARGET_COLUMN or str(kind) == "survival"
+    }
+    for idx in target_like:
+        allowed[idx, :] = False
+        allowed[idx, idx] = False
+
+    for idx, name in enumerate(columns):
+        if _is_root_covariate(str(name)):
+            allowed[:, idx] = False
+            allowed[idx, idx] = False
+
+    return allowed
+
+
+def _log_structural_constraints(
+    logger: logging.Logger,
+    allowed_edges: np.ndarray,
+    columns: Sequence[str],
+) -> None:
+    p = len(columns)
+    forbidden = int(p * (p - 1) - allowed_edges.sum())
+    root_cols = [str(c) for c in columns if _is_root_covariate(str(c))]
+    sink_cols = [
+        str(c)
+        for c in columns
+        if str(c) == SURVIVAL_TARGET_COLUMN
+    ]
+    logger.info(
+        "[graph] structural constraints allowed_edges=%d/%d forbidden=%d "
+        "roots=%s sinks=%s",
+        int(allowed_edges.sum()),
+        int(p * (p - 1)),
+        forbidden,
+        root_cols,
+        sink_cols,
+    )
+
+
 def _load_or_run_dagslam(
     cache: WorkspaceCache,
     key: str,
     data: SyntheticDataset,
     pi_prior: np.ndarray,
     logger: logging.Logger,
+    allowed_edges: Optional[np.ndarray] = None,
 ) -> dict[str, Any]:
     filename = f"dagslam-{key}.npz"
     path = cache.fetch(filename)
@@ -1831,6 +1952,7 @@ def _load_or_run_dagslam(
         rng=np.random.default_rng(PIPELINE_SEED + 2),
         verbose=PIPELINE_VERBOSE,
         pi_prior=pi_prior,
+        allowed_edges=allowed_edges,
     )
     runtime_s = time.time() - t0
     _atomic_npz(
@@ -1857,6 +1979,7 @@ def _load_or_run_mcmc(
     start_adj: np.ndarray,
     pi_prior: np.ndarray,
     logger: logging.Logger,
+    allowed_edges: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any], float]:
     filename = f"mcmc-{key}.npz"
     path = cache.fetch(filename)
@@ -1889,6 +2012,7 @@ def _load_or_run_mcmc(
         hybrid_prob=MCMC_PARENT_RESAMPLE_PROB,
         exact_parent_resample=MCMC_EXACT_PARENT_RESAMPLE,
         max_parents=DAGSLAM_MAX_PARENTS,
+        allowed_edges=allowed_edges,
     )
     runtime_s = time.time() - t0
     diagnostics = dict(result.diagnostics)
@@ -2024,6 +2148,70 @@ def _survival_metrics(
     }
 
 
+def _survival_gam_fit_filename(key: str, parent_set: tuple[int, ...]) -> str:
+    return "survival-gam-fit-" + _short_hash(
+        {
+            "key": key,
+            "parent_set": list(parent_set),
+            "gam": _pipeline_config()["gam"],
+        }
+    ) + ".npz"
+
+
+def _load_or_run_survival_parent_fit(
+    cache: WorkspaceCache,
+    key: str,
+    data: SyntheticDataset,
+    parent_set: tuple[int, ...],
+    t_grid: np.ndarray,
+    logger: logging.Logger,
+) -> tuple[np.ndarray, dict[str, Any], float]:
+    filename = _survival_gam_fit_filename(key, parent_set)
+    path = cache.fetch(filename)
+    if path.is_file():
+        with np.load(path, allow_pickle=False) as z:
+            logger.info("[gamfit] using fit cache %s", path)
+            return (
+                z["survival_mean"],
+                json.loads(str(z["diagnostics_json"].item())),
+                float(z["runtime_s"].item()),
+            )
+
+    cols = tuple(data.columns[i] for i in parent_set)
+    X = data.X[:, list(parent_set)] if parent_set else np.zeros((data.n, 0))
+    t0 = time.time()
+    fit = fit_survival_gam(
+        data.time,
+        data.event,
+        X,
+        columns=cols,
+        n_samples=GAM_N_SAMPLES,
+        rng=np.random.default_rng(PIPELINE_SEED + 20),
+        progress=lambda message, cols=cols: logger.info(
+            "[gamfit] parents=%s %s",
+            ",".join(cols) if cols else "(intercept)",
+            message,
+        ),
+    )
+    mean = fit.predict_survival_mean(X, t_grid)
+    runtime_s = time.time() - t0
+    diag = fit.posterior_summary()
+    diag["parent_columns"] = list(cols)
+    _atomic_npz(
+        path,
+        survival_mean=mean,
+        diagnostics_json=np.array(json.dumps(_json_sanitise(diag))),
+        runtime_s=np.array(runtime_s),
+    )
+    cache.store(path, filename)
+    logger.info(
+        "[gamfit] cached parent fit %s elapsed=%s",
+        path,
+        _format_seconds(runtime_s),
+    )
+    return mean, diag, runtime_s
+
+
 def _load_or_run_survival_gam(
     cache: WorkspaceCache,
     key: str,
@@ -2070,26 +2258,21 @@ def _load_or_run_survival_gam(
     fit_summaries = []
     t0 = time.time()
     logger.info("[gam] fitting %d gamfit survival parent-set models", len(parent_sets))
-    for parent_set, weight, count in zip(parent_sets, weights, parent_set_counts):
+    for parent_set, weight, count in zip(
+        parent_sets,
+        weights,
+        parent_set_counts,
+    ):
         cols = tuple(data.columns[i] for i in parent_set)
-        X = data.X[:, list(parent_set)] if parent_set else np.zeros((data.n, 0))
-        fit = fit_survival_gam(
-            data.time,
-            data.event,
-            X,
-            columns=cols,
-            n_samples=GAM_N_SAMPLES,
-            rng=np.random.default_rng(PIPELINE_SEED + 20),
-            progress=lambda message, cols=cols: logger.info(
-                "[gamfit] parents=%s %s",
-                ",".join(cols) if cols else "(intercept)",
-                message,
-            ),
+        mean, diag, _fit_runtime_s = _load_or_run_survival_parent_fit(
+            cache,
+            key,
+            data,
+            tuple(parent_set),
+            t_grid,
+            logger,
         )
-        draws = fit.predict_survival(X, t_grid)
-        mean = draws.mean(axis=0)
         per_model.append(mean)
-        diag = fit.posterior_summary()
         diag["posterior_parent_set_weight"] = float(weight)
         diag["posterior_parent_set_count"] = int(count)
         diag["parent_columns"] = list(cols)
@@ -2112,7 +2295,11 @@ def _load_or_run_survival_gam(
                 "weight": float(w),
                 "count": int(c),
             }
-            for ps, w, c in zip(parent_sets, weights, parent_set_counts)
+            for ps, w, c in zip(
+                parent_sets,
+                weights,
+                parent_set_counts,
+            )
         ],
         "fit_summaries": fit_summaries,
         "variance_structural_mean": float(np.mean(variance_structural)),
@@ -2329,9 +2516,19 @@ def run_pipeline() -> PipelineResult:
         _log_mrdag_diagnostics(logger, mrdag_pi, mrdag_diagnostics)
         logger.info("[mrdag] complete elapsed=%s", _format_seconds(timings["mrdag"]))
 
+    allowed_edges = _structural_allowed_edges(data.columns, data.node_types)
+    _log_structural_constraints(logger, allowed_edges, data.columns)
+
     with _phase(logger, "dagslam"):
         key = _run_key(data, mrdag_prior)
-        dagslam = _load_or_run_dagslam(cache, key, data, mrdag_prior, logger)
+        dagslam = _load_or_run_dagslam(
+            cache,
+            key,
+            data,
+            mrdag_prior,
+            logger,
+            allowed_edges=allowed_edges,
+        )
         timings["dagslam"] = float(dagslam["runtime_s"])
         logger.info(
             "[dagslam] log_score=%.3f n_edges=%d",
@@ -2348,6 +2545,7 @@ def run_pipeline() -> PipelineResult:
             np.asarray(dagslam["adjacency"], dtype=int),
             mrdag_prior,
             logger,
+            allowed_edges=allowed_edges,
         )
         timings["mcmc"] = mcmc_runtime
         logger.info(

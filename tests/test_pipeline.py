@@ -239,6 +239,56 @@ def test_acyclic_threshold_skips_cycle_closing_edges():
     )
 
 
+def test_structural_allowed_edges_make_target_sink_and_roots():
+    from causal_pred import pipeline
+
+    columns = (
+        "type2_diabetes",
+        "bmi",
+        "pgs_pgs000013",
+        "feat_0001",
+        "age",
+    )
+    node_types = ("binary", "continuous", "continuous", "continuous", "continuous")
+
+    allowed = pipeline._structural_allowed_edges(columns, node_types)
+
+    target = columns.index("type2_diabetes")
+    pgs = columns.index("pgs_pgs000013")
+    feat = columns.index("feat_0001")
+    age = columns.index("age")
+    bmi = columns.index("bmi")
+
+    assert not allowed[target].any()
+    assert not allowed[:, pgs].any()
+    assert not allowed[:, feat].any()
+    assert not allowed[:, age].any()
+    assert allowed[bmi, target]
+    assert allowed[pgs, target]
+
+
+def test_posterior_parent_sets_use_empirical_sample_weights():
+    from causal_pred import pipeline
+
+    samples = np.zeros((10, 4, 4), dtype=np.int8)
+    target = 3
+    samples[:5, 0, target] = 1
+    samples[:5, 1, target] = 1
+    samples[5:, 0, target] = 1
+    samples[5:, 2, target] = 1
+
+    parent_sets, weights, counts = pipeline._posterior_parent_sets(
+        samples,
+        target,
+        top_k=4,
+    )
+
+    assert parent_sets == [(0, 1), (0, 2)]
+    assert counts == [5, 5]
+    np.testing.assert_allclose(weights, [0.5, 0.5])
+    assert weights.sum() == pytest.approx(1.0)
+
+
 def test_pipeline_determinism(tmp_path, monkeypatch):
     _make_tiny_cohort_csv(tmp_path / "t2d_initial_nodes_complete.csv")
     _make_tiny_prs_csv(tmp_path / "aou_prs_panel.csv.gz")

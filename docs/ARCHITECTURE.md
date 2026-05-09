@@ -109,18 +109,24 @@ nodes defer to `gam/` for an EB / NUTS approximation to the marginal.
 
 ### `dagslam/`
 Hill-climbing search through DAG space given a score function and an edge
-prior. Used to produce the warm-start DAG for MCMC.
+prior. Used to produce the warm-start DAG for MCMC. The production path also
+passes a structural edge mask so fixed roots such as PRS and derived feature
+nodes cannot receive incoming edges, and the T2D outcome cannot point back to
+baseline predictors.
 
 ### `mcmc/`
 Structure MCMC over DAGs with the Giudici-Castelo neighbourhood correction,
 MrDAG edge prior, and BGe/Laplace marginal likelihood. Emits samples that
-are read downstream for parent-set posterior estimates.
+are read downstream for parent-set posterior estimates. Every proposal kernel
+uses the same structural edge mask as DAGSLAM, so posterior samples stay in
+the biologically admissible graph space.
 
 ### `gam/`
 Distributional survival GAM wrappers around the `gamfit` Python bindings for
 the `SauersML/gam` Rust engine. The production pipeline fits gamfit survival
-models on posterior parent sets sampled by structure MCMC, then averages
-per-person survival curves by parent-set posterior probability.
+models on posterior parent sets sampled by structure MCMC plus the target's
+median-probability parent model, then averages per-person survival curves by
+parent-set posterior probability.
 
 ### `validation/`
 Known-edge recall/AUROC, Nagelkerke R-squared, Brier decomposition

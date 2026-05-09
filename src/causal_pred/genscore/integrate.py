@@ -23,7 +23,9 @@ through the DAG.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple
 
 import numpy as np
@@ -126,6 +128,13 @@ def fit_panel_crosscoder(
     dead_steps: int = 200,
     rng: Optional[np.random.Generator] = None,
     progress: Optional[Callable[[str], None]] = None,
+    checkpoint_path: Optional[str | os.PathLike] = None,
+    checkpoint_every: Optional[int] = None,
+    checkpoint_callback: Optional[Callable[[Path, int], None]] = None,
+    train_dtype: str | np.dtype = "float32",
+    stream_dropout_prob: float = 0.0,
+    cross_stream_align_coef: float = 0.0,
+    decoder_balance_coef: float = 0.0,
 ) -> TopKCrosscoder:
     """Train the TopK crosscoder on aligned panels, with biobank-friendly
     defaults (longer schedule, smaller learning rate). Thin wrapper around
@@ -143,6 +152,13 @@ def fit_panel_crosscoder(
         dead_steps=dead_steps,
         rng=rng,
         progress=progress,
+        checkpoint_path=checkpoint_path,
+        checkpoint_every=checkpoint_every,
+        checkpoint_callback=checkpoint_callback,
+        train_dtype=train_dtype,
+        stream_dropout_prob=stream_dropout_prob,
+        cross_stream_align_coef=cross_stream_align_coef,
+        decoder_balance_coef=decoder_balance_coef,
     )
 
 
@@ -397,6 +413,9 @@ def run_genscore(
     crosscoder_kwargs: Optional[dict] = None,
     rng: Optional[np.random.Generator] = None,
     progress: Optional[Callable[[str], None]] = None,
+    crosscoder_checkpoint_path: Optional[str | os.PathLike] = None,
+    crosscoder_checkpoint_every: Optional[int] = None,
+    crosscoder_checkpoint_callback: Optional[Callable[[Path, int], None]] = None,
 ) -> Tuple[AugmentationResult, TopKCrosscoder]:
     """Run the full panel-alignment -> crosscoder -> promotion -> augmentation
     loop and return the augmented dataset together with the trained model.
@@ -411,6 +430,9 @@ def run_genscore(
         panels,
         rng=rng,
         progress=progress,
+        checkpoint_path=crosscoder_checkpoint_path,
+        checkpoint_every=crosscoder_checkpoint_every,
+        checkpoint_callback=crosscoder_checkpoint_callback,
         **(crosscoder_kwargs or {}),
     )
     selection = select_shared_features(

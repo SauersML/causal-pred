@@ -19,7 +19,9 @@ from .crosscoder import (
     classify_features,
     encode,
     feature_stream_share,
+    load_crosscoder_fit_state,
     reconstruct,
+    save_crosscoder_fit_state,
     train_crosscoder,
 )
 from .integrate import (
@@ -53,9 +55,11 @@ __all__ = [
     "encode",
     "feature_stream_share",
     "fit_panel_crosscoder",
+    "load_crosscoder_fit_state",
     "pgs_catalog_url",
     "reconstruct",
     "run_genscore",
+    "save_crosscoder_fit_state",
     "select_shared_features",
     "train_crosscoder",
 ]

@@ -39,11 +39,13 @@ The pipeline is a single fixed path: cohort wide CSV (resolved via the
 local `data/` cache, then `$WORKSPACE_BUCKET/data/`) -> load/build cached
 microarray PRS with `gnomon` -> build a baseline-censored EHR panel -> promote
 shared genome/EHR crosscoder features -> MrDAG priors -> DAGSLAM hill-climb ->
-structure MCMC -> gamfit survival GAM over posterior parent sets -> per-person
-survival curves and causal pathway probabilities under `outputs/`. There are
-no command-line flags and `run_pipeline()` takes no configuration arguments;
-edit the constants in `src/causal_pred/pipeline.py` when the production
-configuration changes.
+structure MCMC -> gamfit survival GAM over posterior parent sets and the
+target's median-probability parent model -> per-person survival curves and
+causal pathway probabilities under `outputs/`. DAGSLAM and MCMC share a
+structural edge mask that keeps PRS and derived feature nodes as roots and
+keeps the T2D outcome as a sink. There are no command-line flags and
+`run_pipeline()` takes no configuration arguments; edit the constants in
+`src/causal_pred/pipeline.py` when the production configuration changes.
 
 Reusable intermediates live under `data/intermediates/causal-pred/` and are
 mirrored to `$WORKSPACE_BUCKET/intermediates/causal-pred/` when the real AoU

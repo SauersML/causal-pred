@@ -129,6 +129,47 @@ def test_predict_shape(small_data):
     assert np.all(med > 0)
 
 
+def test_predict_survival_mean_uses_chunked_surface():
+    from causal_pred.gam.survival import _SubmodelFit, _predict_survival_matrix
+
+    n_new = 11
+    t_grid = np.arange(7, dtype=float)
+    X = np.zeros((n_new, 1), dtype=float)
+
+    class _Prediction:
+        def survival_at(self, _times):
+            raise ValueError(
+                "dense survival curves are limited to diagnostic subsets"
+            )
+
+        def survival_at_chunks(self, times, *, people_chunk=50000, time_grid_chunk=64):
+            assert np.array_equal(times, t_grid)
+            yield slice(0, 5), slice(0, 3), np.full((5, 3), 0.9)
+            yield slice(0, 5), slice(3, 7), np.full((5, 4), 0.8)
+            yield slice(5, 11), slice(0, 7), np.full((6, 7), 0.7)
+
+    class _Model:
+        def predict(self, df_new):
+            assert df_new.shape[0] == n_new
+            return _Prediction()
+
+    fit = _SubmodelFit(
+        model=_Model(),
+        columns=("x",),
+        kinds=("continuous",),
+        n_train=10,
+        n_events=3,
+        formula="Surv(entry, exit, event) ~ s(x, type=ps, knots=10)",
+        train_summary={},
+    )
+    S = _predict_survival_matrix(fit, X, t_grid)
+
+    assert S.shape == (n_new, t_grid.size)
+    np.testing.assert_allclose(S[:5, :3], 0.9)
+    np.testing.assert_allclose(S[:5, 3:], 0.8)
+    np.testing.assert_allclose(S[5:, :], 0.7)
+
+
 # ---------------------------------------------------------------------------
 # 3. BMA weights: 0.9/0.1 gives a curve close to the 0.9 model
 # ---------------------------------------------------------------------------
@@ -197,6 +238,38 @@ def test_bma_weights(small_data, monkeypatch):
     assert np.all(out["var_structural"] >= -1e-12)
     total = out["var_parametric"] + out["var_structural"]
     assert np.allclose(total, out["var_total"], atol=1e-9)
+
+
+def test_bma_uses_unbiased_within_model_variance(monkeypatch):
+    import causal_pred.gam.survival as survival_mod
+
+    class _DrawFit:
+        def predict_survival(self, X_new, t_grid):
+            draws = np.array([0.2, 0.4, 0.6], dtype=float)
+            return np.broadcast_to(
+                draws[:, None, None],
+                (draws.size, X_new.shape[0], len(t_grid)),
+            ).copy()
+
+    monkeypatch.setattr(
+        survival_mod,
+        "fit_survival_gam",
+        lambda *_args, **_kwargs: _DrawFit(),
+    )
+
+    out = survival_mod.bma_survival(
+        [(0,)],
+        np.array([1.0]),
+        np.ones(4),
+        np.ones(4),
+        np.zeros((4, 1)),
+        ("x0",),
+        np.array([1.0, 2.0]),
+        X_eval=np.zeros((2, 1)),
+        n_samples=3,
+    )
+
+    np.testing.assert_allclose(out["variance_parametric"], 0.04)
 
 
 # ---------------------------------------------------------------------------

@@ -228,6 +228,20 @@ def _log_prior(adj: np.ndarray, log_pi: np.ndarray, log_1m: np.ndarray) -> float
     return float(np.where(mask, log_pi, log_1m).sum())
 
 
+def _prepare_allowed_edges(allowed_edges: Optional[np.ndarray], p: int) -> np.ndarray:
+    """Return the boolean structural mask used by every proposal kernel."""
+    if allowed_edges is None:
+        allowed = np.ones((p, p), dtype=bool)
+    else:
+        allowed = np.asarray(allowed_edges, dtype=bool).copy()
+        if allowed.shape != (p, p):
+            raise ValueError(
+                f"allowed_edges has shape {allowed.shape}, expected ({p}, {p})"
+            )
+    np.fill_diagonal(allowed, False)
+    return allowed
+
+
 # ---------------------------------------------------------------------------
 # Neighbourhood size |N(G)|.
 # ---------------------------------------------------------------------------
@@ -250,7 +264,10 @@ def _ancestors_matrix(adj: np.ndarray) -> np.ndarray:
 
 
 def _addable_mask(
-    adj: np.ndarray, reach: np.ndarray, max_parents: Optional[int] = None
+    adj: np.ndarray,
+    reach: np.ndarray,
+    max_parents: Optional[int] = None,
+    allowed_edges: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Boolean (p, p) mask of legal ADD moves.
 
@@ -266,6 +283,8 @@ def _addable_mask(
     off_diag = ~np.eye(p, dtype=bool)
     no_edge = (adj == 0) & (adj.T == 0) & off_diag
     addable = no_edge & (~reach.T)
+    if allowed_edges is not None:
+        addable &= allowed_edges
     if max_parents is not None:
         parent_counts = adj.sum(axis=0)
         addable &= parent_counts[np.newaxis, :] < int(max_parents)
@@ -273,7 +292,10 @@ def _addable_mask(
 
 
 def _reversible_mask(
-    adj: np.ndarray, reach: np.ndarray, max_parents: Optional[int] = None
+    adj: np.ndarray,
+    reach: np.ndarray,
+    max_parents: Optional[int] = None,
+    allowed_edges: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Boolean (p, p) mask of edges (i, j) whose reversal keeps the DAG.
 
@@ -292,6 +314,8 @@ def _reversible_mask(
     A = adj.astype(bool)
     other_path = (A @ reach) > 0
     reversible = A & (~other_path)
+    if allowed_edges is not None:
+        reversible &= allowed_edges.T
     if max_parents is not None:
         parent_counts = adj.sum(axis=0)
         reversible &= parent_counts[:, np.newaxis] < int(max_parents)
@@ -302,6 +326,7 @@ def _count_neighbourhood(
     adj: np.ndarray,
     reach: Optional[np.ndarray] = None,
     max_parents: Optional[int] = None,
+    allowed_edges: Optional[np.ndarray] = None,
 ) -> Tuple[int, int, int, np.ndarray]:
     """Count legal single-edge moves at ``adj``.
 
@@ -316,9 +341,23 @@ def _count_neighbourhood(
     """
     if reach is None:
         reach = _ancestors_matrix(adj)
-    n_add = int(_addable_mask(adj, reach, max_parents=max_parents).sum())
+    n_add = int(
+        _addable_mask(
+            adj,
+            reach,
+            max_parents=max_parents,
+            allowed_edges=allowed_edges,
+        ).sum()
+    )
     n_remove = int(adj.sum())
-    n_reverse = int(_reversible_mask(adj, reach, max_parents=max_parents).sum())
+    n_reverse = int(
+        _reversible_mask(
+            adj,
+            reach,
+            max_parents=max_parents,
+            allowed_edges=allowed_edges,
+        ).sum()
+    )
     return n_add, n_remove, n_reverse, reach
 
 
@@ -327,9 +366,17 @@ def _sample_add_target(
     reach: np.ndarray,
     rng: np.random.Generator,
     max_parents: Optional[int] = None,
+    allowed_edges: Optional[np.ndarray] = None,
 ) -> Tuple[int, int]:
     """Sample (i, j) uniformly from the addable set."""
-    idxs = np.argwhere(_addable_mask(adj, reach, max_parents=max_parents))
+    idxs = np.argwhere(
+        _addable_mask(
+            adj,
+            reach,
+            max_parents=max_parents,
+            allowed_edges=allowed_edges,
+        )
+    )
     k = int(rng.integers(0, idxs.shape[0]))
     return int(idxs[k, 0]), int(idxs[k, 1])
 
@@ -345,9 +392,17 @@ def _sample_reverse_target(
     reach: np.ndarray,
     rng: np.random.Generator,
     max_parents: Optional[int] = None,
+    allowed_edges: Optional[np.ndarray] = None,
 ) -> Optional[Tuple[int, int]]:
     """Uniform sample from reversible edges (or None if none)."""
-    idxs = np.argwhere(_reversible_mask(adj, reach, max_parents=max_parents))
+    idxs = np.argwhere(
+        _reversible_mask(
+            adj,
+            reach,
+            max_parents=max_parents,
+            allowed_edges=allowed_edges,
+        )
+    )
     if idxs.shape[0] == 0:
         return None
     k = int(rng.integers(0, idxs.shape[0]))
@@ -364,6 +419,7 @@ def _perturb_dag(
     n_flips: int,
     rng: np.random.Generator,
     max_parents: Optional[int] = None,
+    allowed_edges: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Return a perturbed acyclic copy of ``start_adj``.
 
@@ -373,6 +429,9 @@ def _perturb_dag(
     """
     adj = np.asarray(start_adj, dtype=np.int64).copy()
     p = adj.shape[0]
+    if allowed_edges is None:
+        allowed_edges = np.ones((p, p), dtype=bool)
+        np.fill_diagonal(allowed_edges, False)
     budget = max(1, 4 * n_flips)
     applied = 0
     tries = 0
@@ -383,6 +442,8 @@ def _perturb_dag(
             i = int(rng.integers(0, p))
             j = int(rng.integers(0, p))
             if i == j or adj[i, j] or adj[j, i]:
+                continue
+            if not allowed_edges[i, j]:
                 continue
             if max_parents is not None and adj[:, j].sum() >= int(max_parents):
                 continue
@@ -407,6 +468,8 @@ def _perturb_dag(
             k = int(rng.integers(0, present.shape[0]))
             i = int(present[k, 0])
             j = int(present[k, 1])
+            if not allowed_edges[j, i]:
+                continue
             if max_parents is not None and adj[:, i].sum() >= int(max_parents):
                 continue
             adj[i, j] = 0
@@ -520,6 +583,7 @@ def _hybrid_resample_parents(
     rng: np.random.Generator,
     hyper: dict,
     max_parents: Optional[int] = None,
+    allowed_edges: Optional[np.ndarray] = None,
 ) -> Tuple[bool, float, float]:
     """Attempt a random parent-set resample at node ``j``.
 
@@ -531,15 +595,22 @@ def _hybrid_resample_parents(
     proposals are rejected (treated as alpha = 0).
     """
     p = adj.shape[0]
+    if allowed_edges is None:
+        allowed_col = np.ones(p, dtype=bool)
+        allowed_col[j] = False
+    else:
+        allowed_col = allowed_edges[:, j].astype(bool, copy=True)
+        allowed_col[j] = False
     # Old parent column of j.
     old_col = adj[:, j].copy()
 
     # Flip each candidate edge with probability resample_flip.
     # Candidates are all i != j; mask out the diagonal.
     flip_draw = rng.random(p) < resample_flip
-    flip_draw[j] = False  # self-loop never a candidate
+    flip_draw &= allowed_col
     new_col = old_col.copy()
     new_col[flip_draw] ^= 1  # XOR flip
+    new_col[~allowed_col] = 0
     if max_parents is not None and int(new_col.sum()) > int(max_parents):
         return False, 0.0, 0.0
 
@@ -594,6 +665,7 @@ def _gibbs_resample_parents(
     cache: dict,
     rng: np.random.Generator,
     hyper: dict,
+    allowed_edges: Optional[np.ndarray] = None,
 ) -> Tuple[bool, float, float]:
     """Exact conditional parent-set update for one node.
 
@@ -611,7 +683,17 @@ def _gibbs_resample_parents(
     base = adj.copy()
     base[:, j] = 0
     reach = _ancestors_matrix(base)
-    candidates = [int(i) for i in range(p) if i != j and not bool(reach[j, i])]
+    if allowed_edges is None:
+        allowed_col = np.ones(p, dtype=bool)
+        allowed_col[j] = False
+    else:
+        allowed_col = allowed_edges[:, j].astype(bool, copy=True)
+        allowed_col[j] = False
+    candidates = [
+        int(i)
+        for i in range(p)
+        if allowed_col[i] and i != j and not bool(reach[j, i])
+    ]
     cap = min(cap, len(candidates))
 
     old_parents = tuple(int(i) for i in np.flatnonzero(old_col))
@@ -666,6 +748,7 @@ def _gibbs_resample_edge_pair(
     cache: dict,
     rng: np.random.Generator,
     hyper: dict,
+    allowed_edges: Optional[np.ndarray] = None,
 ) -> Tuple[bool, float, float]:
     """Exact conditional update for the unordered pair ``{i, j}``.
 
@@ -700,7 +783,10 @@ def _gibbs_resample_edge_pair(
     )
 
     j_parent_count = len(base_j_parents)
-    if not bool(reach[j, i]) and (
+    allow_ij = True if allowed_edges is None else bool(allowed_edges[i, j])
+    allow_ji = True if allowed_edges is None else bool(allowed_edges[j, i])
+
+    if allow_ij and not bool(reach[j, i]) and (
         max_parents is None or j_parent_count < int(max_parents)
     ):
         parents_j = tuple(sorted(base_j_parents + (int(i),)))
@@ -709,7 +795,7 @@ def _gibbs_resample_edge_pair(
         states.append((1, base_i_score + score_j, prior, base_i_parents, parents_j))
 
     i_parent_count = len(base_i_parents)
-    if not bool(reach[i, j]) and (
+    if allow_ji and not bool(reach[i, j]) and (
         max_parents is None or i_parent_count < int(max_parents)
     ):
         parents_i = tuple(sorted(base_i_parents + (int(j),)))
@@ -763,6 +849,7 @@ def _gibbs_resample_node_block(
     cache: dict,
     rng: np.random.Generator,
     hyper: dict,
+    allowed_edges: Optional[np.ndarray] = None,
 ) -> Tuple[bool, float, float]:
     """Exact Gibbs update for all directed edges inside a small node block."""
     block = tuple(int(x) for x in nodes)
@@ -788,9 +875,17 @@ def _gibbs_resample_node_block(
         cand = base.copy()
         for choice, (u, v) in zip(choices, unordered_pairs):
             if choice == 1:
+                if allowed_edges is not None and not bool(allowed_edges[u, v]):
+                    cand = None
+                    break
                 cand[u, v] = 1
             elif choice == 2:
+                if allowed_edges is not None and not bool(allowed_edges[v, u]):
+                    cand = None
+                    break
                 cand[v, u] = 1
+        if cand is None:
+            continue
         if max_parents is not None and int(cand[:, block].sum(axis=0).max()) > int(
             max_parents
         ):
@@ -851,6 +946,7 @@ def _run_chain(
     edge_resample_prob: float = 0.0,
     block_resample_prob: float = 0.0,
     block_size: int = 3,
+    allowed_edges: Optional[np.ndarray] = None,
 ) -> dict:
     """Run one MCMC chain.  Returns a dict of per-chain outputs."""
     data.shape[1]
@@ -858,7 +954,11 @@ def _run_chain(
     # Anchor current log score and prior.
     cur_score = float(score_dag(adj, data, node_types, cache=cache, **hyper))
     cur_prior = _log_prior(adj, log_pi, log_1m)
-    n_add, n_rem, n_rev, _reach = _count_neighbourhood(adj, max_parents=max_parents)
+    n_add, n_rem, n_rev, _reach = _count_neighbourhood(
+        adj,
+        max_parents=max_parents,
+        allowed_edges=allowed_edges,
+    )
     cur_nmoves = n_add + n_rem + n_rev
 
     total_iters = burn_in + n_samples * thin
@@ -905,12 +1005,15 @@ def _run_chain(
                 cache,
                 rng,
                 hyper,
+                allowed_edges=allowed_edges,
             )
             if accepted:
                 cur_score += d_score
                 cur_prior += d_prior
                 n_add, n_rem, n_rev, _reach = _count_neighbourhood(
-                    adj, max_parents=max_parents
+                    adj,
+                    max_parents=max_parents,
+                    allowed_edges=allowed_edges,
                 )
                 cur_nmoves = n_add + n_rem + n_rev
                 accept["block_gibbs"] += 1
@@ -935,12 +1038,15 @@ def _run_chain(
                 cache,
                 rng,
                 hyper,
+                allowed_edges=allowed_edges,
             )
             if accepted:
                 cur_score += d_score
                 cur_prior += d_prior
                 n_add, n_rem, n_rev, _reach = _count_neighbourhood(
-                    adj, max_parents=max_parents
+                    adj,
+                    max_parents=max_parents,
+                    allowed_edges=allowed_edges,
                 )
                 cur_nmoves = n_add + n_rem + n_rev
                 accept["edge_gibbs"] += 1
@@ -972,6 +1078,7 @@ def _run_chain(
                     cache,
                     rng,
                     hyper,
+                    allowed_edges=allowed_edges,
                 )
             else:
                 accepted, d_score, d_prior = _hybrid_resample_parents(
@@ -986,13 +1093,16 @@ def _run_chain(
                     rng,
                     hyper,
                     max_parents=max_parents,
+                    allowed_edges=allowed_edges,
                 )
             if accepted:
                 cur_score += d_score
                 cur_prior += d_prior
                 # Column j changed: refresh neighbourhood & reach.
                 n_add, n_rem, n_rev, _reach = _count_neighbourhood(
-                    adj, max_parents=max_parents
+                    adj,
+                    max_parents=max_parents,
+                    allowed_edges=allowed_edges,
                 )
                 cur_nmoves = n_add + n_rem + n_rev
                 accept["hybrid"] += 1
@@ -1012,13 +1122,25 @@ def _run_chain(
         u = rng.integers(0, cur_nmoves)
         if u < n_add:
             mtype = "add"
-            i, j = _sample_add_target(adj, _reach, rng, max_parents=max_parents)
+            i, j = _sample_add_target(
+                adj,
+                _reach,
+                rng,
+                max_parents=max_parents,
+                allowed_edges=allowed_edges,
+            )
         elif u < n_add + n_rem:
             mtype = "remove"
             i, j = _sample_remove_target(adj, rng)
         else:
             mtype = "reverse"
-            sel = _sample_reverse_target(adj, _reach, rng, max_parents=max_parents)
+            sel = _sample_reverse_target(
+                adj,
+                _reach,
+                rng,
+                max_parents=max_parents,
+                allowed_edges=allowed_edges,
+            )
             # Should always succeed because n_rev > 0 here.
             assert sel is not None, "sampler state inconsistent"
             i, j = sel
@@ -1056,7 +1178,9 @@ def _run_chain(
 
         # Neighbourhood of proposed graph.
         new_add, new_rem, new_rev, new_reach = _count_neighbourhood(
-            adj, max_parents=max_parents
+            adj,
+            max_parents=max_parents,
+            allowed_edges=allowed_edges,
         )
         new_nmoves = new_add + new_rem + new_rev
 
@@ -1132,6 +1256,7 @@ def run_structure_mcmc(
     edge_resample_prob: float = 0.0,
     block_resample_prob: float = 0.0,
     block_size: int = 3,
+    allowed_edges: Optional[np.ndarray] = None,
     **hyper,
 ) -> MCMCResult:
     """Structure MCMC over DAGs with an MrDAG edge-inclusion prior.
@@ -1196,6 +1321,9 @@ def run_structure_mcmc(
         Maximum number of incoming edges per node.  When set, both
         single-edge moves and exact parent-set resampling stay within
         this bounded DAG space.
+    allowed_edges : array-like, optional
+        Boolean ``(p, p)`` structural mask.  False entries are forbidden
+        directed edges across every proposal kernel.
 
     Returns
     -------
@@ -1210,6 +1338,11 @@ def run_structure_mcmc(
         raise ValueError(f"start_adj has shape {start_adj.shape}, expected ({p}, {p})")
     if not _is_dag(start_adj):
         raise ValueError("start_adj is not acyclic")
+    allowed = _prepare_allowed_edges(allowed_edges, p)
+    if np.any((start_adj != 0) & (~allowed)):
+        bad = np.argwhere((start_adj != 0) & (~allowed))
+        i, j = (int(bad[0, 0]), int(bad[0, 1]))
+        raise ValueError(f"start_adj contains forbidden edge ({i}, {j})")
     if max_parents is not None:
         max_parents = int(max_parents)
         if max_parents < 0:
@@ -1279,6 +1412,7 @@ def run_structure_mcmc(
                 perturb_flips,
                 child_rngs[c],
                 max_parents=max_parents,
+                allowed_edges=allowed,
             )
         chain_out = _run_chain(
             X,
@@ -1301,6 +1435,7 @@ def run_structure_mcmc(
             edge_resample_prob=edge_resample_prob,
             block_resample_prob=block_resample_prob,
             block_size=block_size,
+            allowed_edges=allowed,
         )
         # Stack this chain's samples into a (S, p, p) array.
         if chain_out["samples"]:
@@ -1408,6 +1543,7 @@ def run_structure_mcmc(
         "edge_resample_prob": float(edge_resample_prob),
         "block_resample_prob": float(block_resample_prob),
         "block_size": int(block_size),
+        "n_allowed_edges": int(allowed.sum()),
     }
 
     return MCMCResult(
