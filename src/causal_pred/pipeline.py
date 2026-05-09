@@ -522,14 +522,66 @@ _SHA256_PROGRESS_BYTES = 512 * 1024 * 1024  # log every 512 MiB
 _SHA256_PROGRESS_FLOOR_BYTES = 256 * 1024 * 1024  # only log progress for files >256 MiB
 
 
+def _sha256_sidecar_path(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".sha256")
+
+
+def _read_sha256_sidecar(path: Path, size: int, mtime_ns: int) -> Optional[str]:
+    sidecar = _sha256_sidecar_path(path)
+    try:
+        text = sidecar.read_text()
+    except OSError:
+        return None
+    try:
+        record = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(record, dict):
+        return None
+    if int(record.get("size", -1)) != int(size):
+        return None
+    if int(record.get("mtime_ns", -1)) != int(mtime_ns):
+        return None
+    digest = record.get("sha256")
+    if not isinstance(digest, str) or len(digest) != 64:
+        return None
+    return digest
+
+
+def _write_sha256_sidecar(
+    path: Path, size: int, mtime_ns: int, digest: str
+) -> None:
+    sidecar = _sha256_sidecar_path(path)
+    payload = json.dumps(
+        {"size": int(size), "mtime_ns": int(mtime_ns), "sha256": digest}
+    )
+    try:
+        tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
+        tmp.write_text(payload)
+        tmp.replace(sidecar)
+    except OSError:
+        pass
+
+
 def _file_sha256(
     path: Path,
     *,
     logger: Optional[logging.Logger] = None,
     label: Optional[str] = None,
 ) -> str:
+    st = path.stat()
+    size = st.st_size
+    mtime_ns = int(st.st_mtime_ns)
+    cached = _read_sha256_sidecar(path, size, mtime_ns)
+    if cached is not None:
+        if logger is not None and size >= _SHA256_PROGRESS_FLOOR_BYTES:
+            logger.info(
+                "[prs]   sha256 %s reused cached digest from sidecar (%.1f MiB)",
+                label or path.name,
+                size / (1 << 20),
+            )
+        return cached
     h = hashlib.sha256()
-    size = path.stat().st_size
     log_progress = (
         logger is not None and size >= _SHA256_PROGRESS_FLOOR_BYTES
     )
@@ -569,7 +621,9 @@ def _file_sha256(
             label or path.name,
             _format_seconds(time.time() - started),
         )
-    return h.hexdigest()
+    digest = h.hexdigest()
+    _write_sha256_sidecar(path, size, mtime_ns, digest)
+    return digest
 
 
 def _file_stat_fingerprint(
