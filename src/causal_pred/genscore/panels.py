@@ -12,10 +12,11 @@ import concurrent.futures
 import codecs
 import gzip
 import os
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import List, Sequence
+from typing import Callable, List, Optional, Sequence
 
 
 PGS_PANEL: tuple[str, ...] = (
