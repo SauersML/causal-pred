@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import math
 import json
 import logging
 import os
@@ -302,6 +303,106 @@ class WorkspaceCache:
                 uri,
                 _format_seconds(time.time() - t0),
             )
+
+
+def _post_training_reconstruction_stats(
+    model: Any,
+    panels_aligned: Any,
+    logger: logging.Logger,
+) -> tuple[np.ndarray, float, float, float, float]:
+    """Encode the full panel through the trained crosscoder and return
+    (activation_rate_per_feature, ss_res_a, ss_tot_a, ss_res_b, ss_tot_b).
+
+    Runs on the GPU when available - the full z_full = (n, d) float64 tensor
+    fits comfortably in T4 VRAM (~1.7 GiB at 102 k x 2048) and using the
+    full panel preserves batch_topk's global top-k semantics; chunking on
+    CPU would change which features get activated.
+    """
+    import torch
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    n_full = int(panels_aligned.A.shape[0])
+    d_full = int(model.d)
+    k = int(model.k)
+    row_cap_multiplier = float(
+        GENSCORE_CROSSCODER_KWARGS.get("row_cap_multiplier", 4.0)
+    )
+    logger.info(
+        "[genscore] encoding full panel on %s n=%d d=%d k=%d",
+        device,
+        n_full,
+        d_full,
+        k,
+    )
+
+    def _t(x: np.ndarray) -> "torch.Tensor":
+        return torch.from_numpy(np.ascontiguousarray(x, dtype=np.float64)).to(device)
+
+    A = _t(panels_aligned.A)
+    B = _t(panels_aligned.B)
+    mean_G = _t(model.mean_G)
+    std_G = _t(model.std_G)
+    mean_E = _t(model.mean_E)
+    std_E = _t(model.std_E)
+    W_e = _t(model.W_e)
+    b_enc = _t(model.b_enc)
+    W_d_G = _t(model.W_d_G)
+    W_d_E = _t(model.W_d_E)
+
+    a_z = (A - mean_G) / std_G
+    b_z = (B - mean_E) / std_E
+    del A, B
+    pre = torch.cat([a_z, b_z], dim=1) @ W_e + b_enc
+    del W_e, b_enc
+
+    activation_kind = str(model.activation_kind)
+    if activation_kind == "topk":
+        if k >= d_full:
+            mask = pre > 0
+        else:
+            topk_vals, topk_idx = torch.topk(pre, k, dim=1)
+            mask = torch.zeros_like(pre, dtype=torch.bool)
+            mask.scatter_(1, topk_idx, topk_vals > 0)
+    elif activation_kind == "batch_topk":
+        scores = torch.relu(pre)
+        take = min(scores.numel(), max(1, n_full * k))
+        flat = scores.flatten()
+        if take >= flat.numel():
+            mask = scores > 0
+        else:
+            topk_vals, topk_idx = torch.topk(flat, take, sorted=False)
+            keep = topk_idx[topk_vals > 0]
+            mask_flat = torch.zeros_like(flat, dtype=torch.bool)
+            mask_flat[keep] = True
+            mask = mask_flat.view(n_full, d_full)
+        if row_cap_multiplier > 0:
+            cap = min(d_full, max(k, int(math.ceil(k * row_cap_multiplier))))
+            if cap < d_full and bool(mask.any()):
+                row_scores = torch.where(mask, scores, torch.zeros_like(scores))
+                _, cap_idx = torch.topk(row_scores, cap, dim=1)
+                cap_mask = torch.zeros_like(mask)
+                cap_mask.scatter_(1, cap_idx, True)
+                mask &= cap_mask
+        del scores, flat
+    else:
+        raise ValueError(f"unknown activation_kind {activation_kind!r}")
+
+    z = torch.where(mask, pre, torch.zeros_like(pre))
+    del pre, mask
+
+    a_hat = z @ W_d_G
+    b_hat = z @ W_d_E
+    del W_d_G, W_d_E
+
+    activation_count = (z > 0).sum(dim=0)
+    ss_res_a = float(((a_z - a_hat) ** 2).sum().item())
+    ss_tot_a = float((a_z ** 2).sum().item())
+    ss_res_b = float(((b_z - b_hat) ** 2).sum().item())
+    ss_tot_b = float((b_z ** 2).sum().item())
+    activation_rate = (
+        activation_count.to(torch.float64) / float(n_full)
+    ).cpu().numpy()
+    return activation_rate, ss_res_a, ss_tot_a, ss_res_b, ss_tot_b
 
 
 class _AsyncUploader:
@@ -2383,37 +2484,9 @@ def _load_or_run_genscore_features(
     panels_aligned = align_panels_by_iid(person_ids, prs_df, ehr_panel)
     n_full = int(panels_aligned.A.shape[0])
     d_full = int(model.d)
-    # Encode the full panel in chunks to keep peak memory bounded. Materializing
-    # z_full (n_full x d float64) at once was ~1.7 GiB on a 102k x 2048 fit and
-    # OOM-killed the AoU notebook silently after the genscore upload completed.
-    # We only need per-feature activation counts and the four scalar SS terms,
-    # so accumulate batch-wise and drop each z_batch.
-    chunk = 4096
-    activation_count = np.zeros(d_full, dtype=np.int64)
-    ss_res_a = 0.0
-    ss_tot_a = 0.0
-    ss_res_b = 0.0
-    ss_tot_b = 0.0
-    logger.info(
-        "[genscore] encoding full panel through crosscoder n=%d chunks=%d on %s",
-        n_full,
-        (n_full + chunk - 1) // chunk,
-        str(model.device),
+    activation_rate_all, ss_res_a, ss_tot_a, ss_res_b, ss_tot_b = (
+        _post_training_reconstruction_stats(model, panels_aligned, logger)
     )
-    for i in range(0, n_full, chunk):
-        A_batch = panels_aligned.A[i : i + chunk]
-        B_batch = panels_aligned.B[i : i + chunk]
-        z_batch = encode(model, A_batch, B_batch)
-        activation_count += (z_batch > 0).sum(axis=0).astype(np.int64)
-        a_hat_batch = z_batch @ model.W_d_G
-        b_hat_batch = z_batch @ model.W_d_E
-        a_z_batch = (A_batch - model.mean_G) / model.std_G
-        b_z_batch = (B_batch - model.mean_E) / model.std_E
-        ss_res_a += float(np.sum((a_z_batch - a_hat_batch) ** 2))
-        ss_tot_a += float(np.sum(a_z_batch ** 2))
-        ss_res_b += float(np.sum((b_z_batch - b_hat_batch) ** 2))
-        ss_tot_b += float(np.sum(b_z_batch ** 2))
-    activation_rate_all = activation_count / float(n_full)
     logger.info("[genscore] encode complete; computing reconstruction metrics")
     dead_mask_all = activation_rate_all == 0.0
     genome_only = (~dead_mask_all) & (r_G > GENSCORE_GENOME_SHARE_MAX)
