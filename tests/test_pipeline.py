@@ -239,6 +239,38 @@ def test_acyclic_threshold_skips_cycle_closing_edges():
     )
 
 
+def test_acyclic_threshold_respects_allowed_edges():
+    from causal_pred import pipeline
+
+    edge_probs = np.array(
+        [
+            [0.0, 0.9, 0.9],
+            [0.1, 0.0, 0.1],
+            [0.1, 0.1, 0.0],
+        ]
+    )
+    allowed = np.ones((3, 3), dtype=bool)
+    np.fill_diagonal(allowed, False)
+    allowed[0, 1] = False
+
+    adj = pipeline._acyclic_threshold_from_edge_probs(
+        edge_probs,
+        threshold=0.5,
+        allowed_edges=allowed,
+    )
+
+    np.testing.assert_array_equal(
+        adj,
+        np.array(
+            [
+                [0, 0, 1],
+                [0, 0, 0],
+                [0, 0, 0],
+            ]
+        ),
+    )
+
+
 def test_structural_allowed_edges_make_target_sink_and_roots():
     from causal_pred import pipeline
 
@@ -286,6 +318,29 @@ def test_posterior_parent_sets_use_empirical_sample_weights():
     assert parent_sets == [(0, 1), (0, 2)]
     assert counts == [5, 5]
     np.testing.assert_allclose(weights, [0.5, 0.5])
+    assert weights.sum() == pytest.approx(1.0)
+
+
+def test_survival_parent_sets_include_median_probability_model():
+    from causal_pred import pipeline
+
+    samples = np.zeros((10, 4, 4), dtype=np.int8)
+    target = 3
+    samples[:5, 0, target] = 1
+    samples[:5, 1, target] = 1
+    samples[5:, 0, target] = 1
+    samples[5:, 2, target] = 1
+
+    parent_sets, weights, counts, sources = pipeline._survival_parent_sets(
+        samples,
+        target,
+        top_k=4,
+    )
+
+    assert (0, 1, 2) in parent_sets
+    idx = parent_sets.index((0, 1, 2))
+    assert sources[idx] == "median_probability"
+    assert counts[idx] == 5
     assert weights.sum() == pytest.approx(1.0)
 
 

@@ -73,6 +73,31 @@ def test_known_edge_recovery_null():
     assert abs(np.mean(pvals) - 0.5) < 0.15, np.mean(pvals)
 
 
+def test_known_edge_recovery_scores_only_eligible_edges():
+    names = ("a", "b", "c", "d")
+    scores = np.zeros((4, 4), dtype=float)
+    scores[0, 1] = 0.9
+    scores[2, 3] = 0.9
+    eligible = np.zeros((4, 4), dtype=bool)
+    eligible[0, 1] = True
+    eligible[0, 2] = True
+    eligible[1, 2] = True
+
+    out = known_edge_recovery(
+        scores,
+        [("a", "b"), ("c", "d")],
+        names,
+        eligible_edges=eligible,
+        n_permute=20,
+        rng=np.random.default_rng(0),
+    )
+
+    assert out["n_valid_ground_truth_edges"] == 1
+    assert out["null_model"]["n_usable_cells"] == 3
+    assert out["observed_recovery"][0.5] == pytest.approx(1.0)
+    assert out["per_edge"][("c", "d")]["masked"]
+
+
 # ---------------------------------------------------------------------------
 # 3 + 4: Nagelkerke R^2 extremes.
 # ---------------------------------------------------------------------------
@@ -165,6 +190,25 @@ def test_time_dependent_auc_sanity():
     rand_risk = rng.normal(size=d.n)
     out_rand = time_dependent_auc(d.time, d.event, rand_risk, eval_times)
     assert abs(out_rand["auc"][1] - 0.5) < 0.05, out_rand
+
+
+def test_time_dependent_auc_uses_time_specific_scores():
+    time = np.array([1.0, 2.0, 8.0, 9.0])
+    event = np.array([1, 1, 0, 0])
+    eval_times = np.array([3.0, 7.0])
+    scores = np.array(
+        [
+            [0.9, 0.1],
+            [0.8, 0.2],
+            [0.2, 0.9],
+            [0.1, 0.8],
+        ]
+    )
+
+    out = time_dependent_auc(time, event, scores, eval_times)
+
+    assert out["auc"][0] == pytest.approx(1.0)
+    assert out["auc"][1] == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------

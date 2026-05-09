@@ -18,6 +18,7 @@ if SRC not in sys.path:
 
 from causal_pred.data.synthetic import simulate  # noqa: E402
 from causal_pred.benchmarks import (  # noqa: E402
+    _surv_at_times,
     run_kaplan_meier,
     run_cox_ph,
     run_naive_logistic,
@@ -84,6 +85,15 @@ def test_naive_logistic_runs(n500_data):
     td = out["time_dep_auc"]
     idx10 = td["times"].index(10.0)
     assert td["auc"][idx10] > 0.55
+
+
+def test_survival_interpolation_uses_exact_requested_times():
+    grid = np.array([0.0, 10.0, 20.0])
+    surv = np.array([[1.0, 0.8, 0.2], [1.0, 0.6, 0.0]])
+
+    out = _surv_at_times(surv, grid, [5.0, 15.0])
+
+    np.testing.assert_allclose(out, [[0.9, 0.5], [0.8, 0.3]])
 
 
 def test_mr_ivw_runs():

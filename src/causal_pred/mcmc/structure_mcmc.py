@@ -541,11 +541,17 @@ def _rhat_edgewise(chain_samples: Sequence[np.ndarray]) -> np.ndarray:
     W = X.var(axis=1, ddof=1).mean(axis=0)
     var_hat = ((S - 1.0) / S) * W + B / S
     with np.errstate(invalid="ignore", divide="ignore"):
-        rhat = np.sqrt(var_hat / np.where(W > 0, W, 1.0))
-    rhat = np.where(np.isfinite(rhat), rhat, 1.0)
-    # Edges that are constant in every chain cannot have R-hat; set to 1.
-    const_edge = W == 0.0
-    rhat = np.where(const_edge, 1.0, rhat)
+        rhat = np.sqrt(var_hat / W)
+    # If every chain is internally constant and the chain means agree, the
+    # edge is deterministically sampled and R-hat is 1.  If internally
+    # constant chains disagree with one another, within-chain variance is zero
+    # but between-chain variance is positive, which is non-convergence; report
+    # infinity instead of hiding it as 1.
+    const_within = W == 0.0
+    means_disagree = np.ptp(chain_means, axis=0) > 0.0
+    rhat = np.where(const_within & ~means_disagree, 1.0, rhat)
+    rhat = np.where(const_within & means_disagree, np.inf, rhat)
+    rhat = np.where(np.isnan(rhat), 1.0, rhat)
     return rhat
 
 
@@ -1474,6 +1480,18 @@ def run_structure_mcmc(
     total_prop = sum(prop_totals.values())
     total_accept = sum(accept_totals.values())
     accept_rate["overall"] = total_accept / total_prop if total_prop > 0 else 0.0
+    # ``overall`` mixes Metropolis-Hastings single-edge moves with Gibbs
+    # blocks; Gibbs steps record an "accept" whenever the resampled state
+    # is taken (no MH reject), so a high overall accept rate mostly
+    # reflects the Gibbs share rather than MH efficiency.  Report the
+    # MH-only rate alongside it -- this is the diagnostic users want for
+    # tuning.
+    mh_keys = ("add", "remove", "reverse")
+    mh_prop = sum(prop_totals[k] for k in mh_keys)
+    mh_acc = sum(accept_totals[k] for k in mh_keys)
+    accept_rate["metropolis_hastings"] = (
+        mh_acc / mh_prop if mh_prop > 0 else 0.0
+    )
 
     # R-hat and ESS diagnostics.
     # We compute R-hat both on the directed-edge indicators and on the
@@ -1507,15 +1525,27 @@ def run_structure_mcmc(
         max_rhat_dir = 1.0
         max_rhat_skel = 1.0
 
-    # Per-edge ESS (across all chains concatenated).
-    if flat.shape[0] >= 4:
+    # Per-edge ESS: sum the per-chain ESS rather than computing on the
+    # concatenated trace.  Concatenating chains that occupy different
+    # posterior modes inserts a step at each chain boundary which inflates
+    # the empirical autocorrelation and collapses the IPS estimator's ESS
+    # toward O(n_modes).  The sum of independent per-chain ESS is the
+    # standard practice (Vehtari et al. 2021, "Rank-normalization,
+    # folding, and localization").
+    eligible_chains = [c for c in all_chain_samples if c.shape[0] >= 4]
+    if eligible_chains:
         ess_mat = np.zeros((p, p), dtype=float)
         for i in range(p):
             for j in range(p):
                 if i == j:
                     ess_mat[i, j] = float(flat.shape[0])
                     continue
-                ess_mat[i, j] = _ess_ips(flat[:, i, j].astype(float))
+                ess_mat[i, j] = float(
+                    sum(
+                        _ess_ips(c[:, i, j].astype(float))
+                        for c in eligible_chains
+                    )
+                )
         off = ~np.eye(p, dtype=bool)
         min_ess = float(np.min(ess_mat[off])) if off.any() else float(flat.shape[0])
     else:

@@ -52,10 +52,12 @@ def _json_sanitise(obj: Any) -> Any:
     if isinstance(obj, (list, tuple)):
         return [_json_sanitise(v) for v in obj]
     if isinstance(obj, np.ndarray):
-        return obj.tolist()
+        return _json_sanitise(obj.tolist())
     if isinstance(obj, (np.floating, np.integer)):
-        return obj.item()
-    if isinstance(obj, float) and (obj != obj):  # NaN
+        obj = obj.item()
+    if isinstance(obj, float):
+        if np.isfinite(obj):
+            return obj
         return None
     return obj
 
@@ -212,7 +214,7 @@ def main(argv: list | None = None) -> int:
 
     json_path = os.path.join(args.output_dir, "benchmarks.json")
     with open(json_path, "w") as fh:
-        json.dump(_json_sanitise(report), fh, indent=2)
+        json.dump(_json_sanitise(report), fh, indent=2, allow_nan=False)
 
     if not args.no_plots:
         _bar_chart(baselines, os.path.join(args.output_dir, "benchmarks.png"))

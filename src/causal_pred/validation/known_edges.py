@@ -10,11 +10,11 @@ literature for T2D), we measure
     classifier for the ground-truth adjacency,
   * Matthews correlation coefficient at each threshold.
 
-Significance is assessed against a *degree-preserving* permutation null:
-the off-diagonal, non-NaN entries of ``edge_probs`` are shuffled across
-positions, which preserves the overall density (marginal mass) of the
-probability matrix.  This is the right null for this test -- a dense
-probability matrix will trivially ``recover`` any ground-truth edge set.
+Significance is assessed against an eligible-cell value-permutation null:
+the off-diagonal, non-NaN entries of ``edge_probs`` that were structurally
+eligible for the sampler are shuffled across eligible positions.  This
+preserves the marginal score distribution while testing whether known
+edges are enriched near the top of that distribution.
 
 NaN entries in ``edge_probs`` mean ``no Mendelian-randomisation evidence
 available`` and are *masked out*: they are neither scored as predictions
@@ -127,6 +127,7 @@ def known_edge_recovery(
     n_permute: int = 1000,
     rng: Optional[np.random.Generator] = None,
     thresholds: Sequence[float] = (0.3, 0.5, 0.7, 0.9),
+    eligible_edges=None,
 ) -> dict:
     """Known-edge recovery of a posterior edge-inclusion probability matrix.
 
@@ -142,6 +143,11 @@ def known_edge_recovery(
     n_permute : permutation replicates for the null.
     rng : optional ``np.random.Generator``.
     thresholds : probabilities at which recovery rates are evaluated.
+    eligible_edges : optional (p, p) boolean mask.
+        Directed edges that the structure learner was allowed to propose.
+        Forbidden cells are excluded from AUROC/AUPRC, threshold metrics,
+        and the permutation null.  If omitted, every off-diagonal cell is
+        eligible.
 
     Returns
     -------
@@ -154,6 +160,14 @@ def known_edge_recovery(
     p = P.shape[0]
     if P.shape != (p, p):
         raise ValueError("edge_probs must be a square (p, p) matrix")
+    if eligible_edges is None:
+        eligible = np.ones((p, p), dtype=bool)
+    else:
+        eligible = np.asarray(eligible_edges, dtype=bool)
+        if eligible.shape != (p, p):
+            raise ValueError(
+                f"eligible_edges must have shape {(p, p)}, got {eligible.shape}"
+            )
     name_to_idx = {name: i for i, name in enumerate(node_names)}
 
     # Build ground-truth adjacency in the same index space.
@@ -171,12 +185,14 @@ def known_edge_recovery(
     # values only.
     off = ~np.eye(p, dtype=bool)
     nan_mask = np.isnan(P)
-    usable = off & ~nan_mask
+    usable = off & eligible & ~nan_mask
 
     # Scored classification targets (only over usable cells).
     scores_all = P[usable]
     labels_all = A[usable]
     n_usable = int(usable.sum())
+    if n_usable == 0:
+        raise ValueError("known-edge recovery has no usable eligible cells")
 
     # AUROC / AUPRC over the usable cells.
     auroc = _auroc(scores_all, labels_all)
@@ -188,7 +204,8 @@ def known_edge_recovery(
     # edges with probability >= tau.  Ground-truth edges whose entry is
     # NaN (no MR info) are excluded from both numerator and denominator.
     gt_probs = np.array([P[i, j] for _, _, i, j in gt_pairs], dtype=float)
-    valid_gt = ~np.isnan(gt_probs)
+    gt_eligible = np.array([bool(usable[i, j]) for _, _, i, j in gt_pairs], dtype=bool)
+    valid_gt = gt_eligible & ~np.isnan(gt_probs)
     n_valid_gt = int(valid_gt.sum())
 
     observed_rate = {}
@@ -250,23 +267,25 @@ def known_edge_recovery(
         auroc_null[b] = _auroc(perm, labels_all)
         auprc_null[b] = _auprc(perm, labels_all)
 
-    # Two-sided permutation p-values.  Two-sided via the centred |.| stat
-    # (p = mean[|T* - E[T*]| >= |T_obs - E[T*]|]).
-    def _two_sided_p(obs: float, draws: np.ndarray) -> float:
+    # Upper-tail permutation p-values.  Recovery, MCC, AUROC, AUPRC, and
+    # per-edge probabilities are enrichment statistics: the relevant
+    # alternative is "larger than expected under the null".
+    def _upper_tail_p(obs: float, draws: np.ndarray) -> float:
+        if np.isnan(obs):
+            return float("nan")
         draws = draws[~np.isnan(draws)]
         if draws.size == 0:
             return float("nan")
-        mu = float(np.mean(draws))
         # +1 smoothing so an observation never has p = 0 exactly.
-        num = 1 + int(np.sum(np.abs(draws - mu) >= np.abs(obs - mu) - 1e-12))
+        num = 1 + int(np.sum(draws >= obs - 1e-12))
         den = draws.size + 1
         return num / den
 
     recov_pvals = {}
     mcc_pvals = {}
     for k, tau in enumerate(thresholds):
-        recov_pvals[tau] = _two_sided_p(observed_rate[tau], recov_null[:, k])
-        mcc_pvals[tau] = _two_sided_p(observed_mcc[tau], mcc_null[:, k])
+        recov_pvals[tau] = _upper_tail_p(observed_rate[tau], recov_null[:, k])
+        mcc_pvals[tau] = _upper_tail_p(observed_mcc[tau], mcc_null[:, k])
 
     # Per-edge p-values: how extreme is the observed probability at this
     # cell vs.  what would be expected under a random shuffle?
@@ -276,19 +295,20 @@ def known_edge_recovery(
         draws = per_edge_null_vals[:, idx_e]
         per_edge[(parent, child)] = {
             "probability": obs,
-            "p_value": _two_sided_p(obs, draws) if not np.isnan(obs) else float("nan"),
-            "masked": bool(np.isnan(obs)),
+            "p_value": _upper_tail_p(obs, draws) if not np.isnan(obs) else float("nan"),
+            "masked": bool((not gt_eligible[idx_e]) or np.isnan(obs)),
         }
 
     null_model = {
-        "type": "degree_preserving_label_permutation",
+        "type": "eligible_value_permutation",
         "description": (
-            "Permute the non-NaN off-diagonal values of edge_probs across "
-            "non-NaN off-diagonal positions; preserves the marginal mass "
-            "(total probability and value multiset) of the matrix."
+            "Permute the non-NaN eligible off-diagonal values of edge_probs "
+            "across eligible off-diagonal positions; preserves the value "
+            "multiset of the scored matrix."
         ),
         "n_permute": int(n_permute),
         "n_usable_cells": n_usable,
+        "alternative": "greater",
     }
 
     return {
@@ -301,6 +321,8 @@ def known_edge_recovery(
         "auprc": float(auprc),
         "auroc_null_mean": float(np.nanmean(auroc_null)),
         "auprc_null_mean": float(np.nanmean(auprc_null)),
+        "auroc_pvalue": _upper_tail_p(float(auroc), auroc_null),
+        "auprc_pvalue": _upper_tail_p(float(auprc), auprc_null),
         "per_edge": per_edge,
         "null_model": null_model,
         "n_ground_truth_edges": len(gt_pairs),

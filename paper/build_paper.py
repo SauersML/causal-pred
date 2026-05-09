@@ -135,6 +135,8 @@ def _fmt(value: Any, fmt: str) -> str:
     """Format ``value`` with ``fmt``; fall back to TBD for nan/None."""
     if value is None:
         return TBD
+    if isinstance(value, str) and value in {"NaN", "Infinity", "-Infinity"}:
+        return TBD
     try:
         if isinstance(value, float) and math.isnan(value):
             return TBD
@@ -200,6 +202,71 @@ def _merge(dst: dict, src: Mapping[str, Any]) -> dict:
     return dst
 
 
+def _normalise_pipeline_summary(summary: dict) -> None:
+    """Expose pipeline summary.json under the compact paper macro schema."""
+    data = summary.get("data_summary")
+    if isinstance(data, Mapping):
+        dataset = summary.setdefault("dataset", {})
+        dataset.setdefault("n", data.get("n"))
+        dataset.setdefault("p", data.get("p"))
+        dataset.setdefault("event_rate", data.get("event_rate"))
+
+    validation = summary.get("validation")
+    if isinstance(validation, Mapping):
+        survival = validation.get("survival") or {}
+        edge = validation.get("known_edge_recovery") or {}
+        metrics = summary.setdefault("metrics", {})
+        if isinstance(survival, Mapping):
+            metrics.setdefault("nagelkerke_r2", survival.get("nagelkerke_r2_at_10y"))
+            cal = survival.get("calibration_at_10y") or {}
+            if isinstance(cal, Mapping):
+                metrics.setdefault("brier", cal.get("brier"))
+                metrics.setdefault("ece", cal.get("ece"))
+            br = survival.get("brier") or {}
+            if isinstance(br, Mapping):
+                metrics.setdefault("ibs", br.get("ibs"))
+            td = survival.get("time_dependent_auc") or {}
+            if isinstance(td, Mapping):
+                times = td.get("times") or []
+                aucs = td.get("auc") or []
+                by_time = {}
+                for t, a in zip(times, aucs):
+                    try:
+                        by_time[str(int(round(float(t))))] = a
+                    except (TypeError, ValueError):
+                        continue
+                metrics.setdefault("time_dep_auc", by_time)
+                metrics.setdefault("auroc", td.get("integrated_auc"))
+        if isinstance(edge, Mapping):
+            metrics.setdefault("edge_auroc", edge.get("auroc"))
+            metrics.setdefault("edge_auprc", edge.get("auprc"))
+            recovery = edge.get("observed_recovery") or {}
+            if isinstance(recovery, Mapping):
+                metrics.setdefault("edge_recall", recovery.get("0.5") or recovery.get(0.5))
+
+    mcmc_diag = summary.get("mcmc_diagnostics")
+    if isinstance(mcmc_diag, Mapping):
+        mcmc = summary.setdefault("mcmc", {})
+        per_chain = mcmc_diag.get("n_samples_per_chain") or []
+        if per_chain:
+            mcmc.setdefault("n_samples", per_chain[0])
+        mcmc.setdefault("n_chains", mcmc_diag.get("n_chains"))
+        mcmc.setdefault("max_rhat", mcmc_diag.get("max_rhat"))
+        accept = mcmc_diag.get("accept_rate") or {}
+        if isinstance(accept, Mapping):
+            mcmc.setdefault("mean_accept", accept.get("overall"))
+
+    timings = summary.get("timings")
+    if isinstance(timings, Mapping):
+        vals = [
+            float(v)
+            for v in timings.values()
+            if isinstance(v, (int, float)) and math.isfinite(float(v))
+        ]
+        if vals:
+            summary.setdefault("runtime_seconds", sum(vals))
+
+
 def main(argv: list[str] | None = None) -> int:
     repo_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -239,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
         with path.open() as fh:
             _merge(summary, json.load(fh))
         loaded.append(str(path))
+    _normalise_pipeline_summary(summary)
 
     tex_source = args.tex.read_text()
     stamped = stamp_tex(tex_source, summary)

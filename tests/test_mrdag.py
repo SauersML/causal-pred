@@ -24,6 +24,7 @@ from causal_pred.mrdag.pipeline import (
     _compute_T,
     _creates_cycle_if_add,
     _is_reachable,
+    _rhat_per_edge,
 )
 
 
@@ -126,6 +127,17 @@ def test_rhat_bound(mrdag_result):
     assert diag["max_rhat_on_allowed"] <= 1.2, (
         f"max R-hat = {diag['max_rhat_on_allowed']:.3f}"
     )
+
+
+def test_rhat_detects_constant_chain_disagreement():
+    c0 = np.zeros((8, 3, 3), dtype=np.int8)
+    c1 = np.zeros((8, 3, 3), dtype=np.int8)
+    c1[:, 0, 1] = 1
+
+    rhat = _rhat_per_edge([c0, c1])
+
+    assert np.isinf(rhat[0, 1])
+    assert rhat[1, 2] == pytest.approx(1.0)
 
 
 def test_diagnostics_present(mrdag_result):

@@ -286,7 +286,10 @@ def time_dependent_auc(time, event, risk_score, eval_times) -> dict:
     Parameters
     ----------
     time, event : (n,) observed time and 0/1 event indicators.
-    risk_score : (n,) higher values mean higher risk (earlier event).
+    risk_score : (n,) or (n, n_times).
+        Higher values mean higher risk (earlier event).  A matrix supplies
+        the time-specific risk score for each evaluation time; a vector is
+        reused for every evaluation time.
     eval_times : sequence of tau at which to evaluate AUC(tau).
 
     Returns
@@ -297,10 +300,30 @@ def time_dependent_auc(time, event, risk_score, eval_times) -> dict:
     """
     t = np.asarray(time, dtype=float).ravel()
     e = np.asarray(event, dtype=int).ravel()
-    s = np.asarray(risk_score, dtype=float).ravel()
     taus = np.asarray(eval_times, dtype=float).ravel()
-    if not (t.shape == e.shape == s.shape):
-        raise ValueError("time, event, risk_score must be the same length")
+    scores = np.asarray(risk_score, dtype=float)
+    if t.shape != e.shape:
+        raise ValueError("time and event must be the same length")
+    if scores.ndim == 1:
+        if scores.shape[0] != t.shape[0]:
+            raise ValueError("risk_score must have length n")
+        score_matrix = np.broadcast_to(scores[:, None], (t.shape[0], taus.size))
+    elif scores.ndim == 2:
+        if scores.shape != (t.shape[0], taus.size):
+            raise ValueError(
+                "2-D risk_score must have shape (n, n_times) = "
+                f"({t.shape[0]}, {taus.size}); got {scores.shape}"
+            )
+        score_matrix = scores
+    else:
+        raise ValueError("risk_score must be 1-D or 2-D")
+    if not (
+        np.all(np.isfinite(t))
+        and np.all(np.isfinite(e))
+        and np.all(np.isfinite(taus))
+        and np.all(np.isfinite(score_matrix))
+    ):
+        raise ValueError("time, event, eval_times, and risk_score must be finite")
 
     # KM of the censoring distribution: swap event.
     cens = 1 - e
@@ -316,6 +339,7 @@ def time_dependent_auc(time, event, risk_score, eval_times) -> dict:
 
     aucs = np.zeros_like(taus)
     for idx, tau in enumerate(taus):
+        s = score_matrix[:, idx]
         is_case = (t <= tau) & (e == 1)
         is_ctrl = t > tau
         if not (np.any(is_case) and np.any(is_ctrl)):
@@ -349,22 +373,26 @@ def time_dependent_auc(time, event, risk_score, eval_times) -> dict:
         den = float(np.sum(w_case) * W_tot)
         aucs[idx] = num / den if den > 0 else float("nan")
 
-    # Integrated AUC: trapezoidal average over eval_times (time-weighted).
-    if taus.size >= 2 and np.all(np.isfinite(aucs)):
-        width = taus[-1] - taus[0]
+    # Integrated AUC: trapezoidal average over finite eval_times.
+    finite = np.isfinite(aucs) & np.isfinite(taus)
+    if int(finite.sum()) >= 2:
+        taus_f = taus[finite]
+        aucs_f = aucs[finite]
+        width = taus_f[-1] - taus_f[0]
         if width > 0:
-            integrated = _trapz(aucs, taus) / width
+            integrated = _trapz(aucs_f, taus_f) / width
         else:
-            integrated = float(np.mean(aucs))
-    elif taus.size == 1 and np.isfinite(aucs[0]):
-        integrated = float(aucs[0])
+            integrated = float(np.mean(aucs_f))
+    elif int(finite.sum()) == 1:
+        integrated = float(aucs[finite][0])
     else:
-        integrated = float(np.nanmean(aucs))
+        integrated = float("nan")
 
     return {
         "times": taus,
         "auc": aucs,
         "integrated_auc": integrated,
+        "n_valid_times": int(finite.sum()),
     }
 
 
@@ -400,6 +428,10 @@ def brier_score(time, event, survival_pred, eval_times) -> dict:
     e = np.asarray(event, dtype=int).ravel()
     taus = np.asarray(eval_times, dtype=float).ravel()
     n = t.size
+    if e.shape != t.shape:
+        raise ValueError("time and event must be the same length")
+    if not (np.all(np.isfinite(t)) and np.all(np.isfinite(e)) and np.all(np.isfinite(taus))):
+        raise ValueError("time, event, and eval_times must be finite")
 
     S_pred = np.asarray(survival_pred, dtype=float)
     if S_pred.ndim == 1:
@@ -409,13 +441,20 @@ def brier_score(time, event, survival_pred, eval_times) -> dict:
             f"survival_pred must have shape (n, n_times) = "
             f"({n}, {taus.size}); got {S_pred.shape}"
         )
+    if not np.all(np.isfinite(S_pred)):
+        raise ValueError("survival_pred must be finite")
+    if np.any((S_pred < -1e-12) | (S_pred > 1.0 + 1e-12)):
+        raise ValueError("survival_pred must contain probabilities in [0, 1]")
+    S_pred = np.clip(S_pred, 0.0, 1.0)
 
     # KM of censoring distribution.
     cens = 1 - e
     km_t, km_S = _km_estimator(t, cens)
     t_minus = np.nextafter(t, -np.inf)
-    G_at_T = np.clip(_km_eval(km_t, km_S, t_minus), _EPS, 1.0)
-    G_at_tau = np.clip(_km_eval(km_t, km_S, taus), _EPS, 1.0)
+    G_at_T_raw = _km_eval(km_t, km_S, t_minus)
+    G_at_tau_raw = _km_eval(km_t, km_S, taus)
+    G_at_T = np.clip(G_at_T_raw, _EPS, 1.0)
+    G_at_tau = np.clip(G_at_tau_raw, _EPS, 1.0)
 
     # KM baseline (of the event distribution, for the Scaled Brier Score).
     km_e_t, km_e_S = _km_estimator(t, e)
@@ -427,6 +466,9 @@ def brier_score(time, event, survival_pred, eval_times) -> dict:
         for j, tau in enumerate(taus):
             case = (t <= tau) & (e == 1)
             ctrl = t > tau
+            if G_at_tau_raw[j] <= _EPS or np.any(G_at_T_raw[case] <= _EPS):
+                bs[j] = float("nan")
+                continue
             term_case = np.where(case, (0.0 - S_hat[:, j]) ** 2 / G_at_T, 0.0)
             term_ctrl = np.where(ctrl, (1.0 - S_hat[:, j]) ** 2 / G_at_tau[j], 0.0)
             bs[j] = float(np.mean(term_case + term_ctrl))
@@ -436,16 +478,22 @@ def brier_score(time, event, survival_pred, eval_times) -> dict:
     bs_km = _bs_at_grid(S_km_pred)
 
     def _integrate(vals: np.ndarray) -> float:
-        if taus.size < 2:
-            return float(vals[0]) if vals.size else 0.0
-        width = taus[-1] - taus[0]
+        finite = np.isfinite(vals) & np.isfinite(taus)
+        if int(finite.sum()) == 0:
+            return float("nan")
+        if int(finite.sum()) == 1:
+            return float(vals[finite][0])
+        taus_f = taus[finite]
+        vals_f = vals[finite]
+        width = taus_f[-1] - taus_f[0]
         if width <= 0:
-            return float(np.mean(vals))
-        return _trapz(vals, taus) / width
+            return float(np.mean(vals_f))
+        return _trapz(vals_f, taus_f) / width
 
     ibs = _integrate(bs)
     ibs_km = _integrate(bs_km)
     scaled = ibs / ibs_km if ibs_km > 0 else float("nan")
+    finite = np.isfinite(bs) & np.isfinite(bs_km) & np.isfinite(taus)
 
     return {
         "times": taus,
@@ -454,6 +502,8 @@ def brier_score(time, event, survival_pred, eval_times) -> dict:
         "ibs": ibs,
         "ibs_km": ibs_km,
         "scaled_brier": scaled,
+        "n_valid_times": int(finite.sum()),
+        "n_dropped_times": int(taus.size - finite.sum()),
     }
 
 

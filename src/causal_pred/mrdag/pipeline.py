@@ -453,7 +453,11 @@ def _rhat_per_edge(chain_samples: List[np.ndarray]) -> np.ndarray:
     var_hat = ((S - 1.0) / S) * Wv + B / S
     with np.errstate(invalid="ignore", divide="ignore"):
         rhat = np.sqrt(var_hat / Wv)
-    rhat = np.where(np.isfinite(rhat), rhat, 1.0)
+    const_within = Wv == 0.0
+    means_disagree = np.ptp(chain_means, axis=0) > 0.0
+    rhat = np.where(const_within & ~means_disagree, 1.0, rhat)
+    rhat = np.where(const_within & means_disagree, np.inf, rhat)
+    rhat = np.where(np.isnan(rhat), 1.0, rhat)
     return rhat
 
 

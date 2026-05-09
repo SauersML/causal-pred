@@ -82,7 +82,7 @@ PGS_PANEL_DIRNAME = "pgs_panel"
 GNOMON_OUT_DIRNAME = "gnomon_score"
 GENOTYPE_CACHE_DIR = str(Path.home() / "causal-pred" / "genomes")
 
-PIPELINE_CONFIG_VERSION = "2026-05-08.single-path.6"
+PIPELINE_CONFIG_VERSION = "2026-05-09.metrics-eligible-cache.1"
 PIPELINE_SEED = 20260416
 PIPELINE_VERBOSE = False
 
@@ -146,6 +146,8 @@ GAM_N_SAMPLES = 200
 SURVIVAL_TIME_GRID_POINTS = 50
 SURVIVAL_EVAL_TIMES = (5.0, 10.0, 15.0)
 SURVIVAL_TARGET_COLUMN = "type2_diabetes"
+SURVIVAL_GAM_MAX_PARENTS = 6
+SURVIVAL_GAM_MIN_EDGE_PROB = 0.5
 
 CAUSAL_PATH_TARGET = "type2_diabetes"
 CAUSAL_PATH_TOP_K = 20
@@ -453,22 +455,28 @@ def _json_sanitise(obj: Any) -> Any:
         return [_json_sanitise(v) for v in obj]
     if isinstance(obj, np.ndarray):
         if obj.size <= 400:
-            return obj.tolist()
+            return _json_sanitise(obj.tolist())
         return {
             "__omitted_ndarray__": True,
             "shape": list(obj.shape),
             "dtype": str(obj.dtype),
         }
     if isinstance(obj, (np.floating, np.integer)):
-        return obj.item()
-    if isinstance(obj, (bool, int, float, str)) or obj is None:
+        obj = obj.item()
+    if isinstance(obj, float):
+        if np.isfinite(obj):
+            return obj
+        if np.isnan(obj):
+            return "NaN"
+        return "Infinity" if obj > 0 else "-Infinity"
+    if isinstance(obj, (bool, int, str)) or obj is None:
         return obj
     return str(obj)
 
 
 def _json_bytes(obj: Any) -> bytes:
     return json.dumps(
-        _json_sanitise(obj), sort_keys=True, separators=(",", ":")
+        _json_sanitise(obj), sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
 
 
@@ -593,6 +601,8 @@ def _pipeline_config() -> dict[str, Any]:
             "time_grid_points": SURVIVAL_TIME_GRID_POINTS,
             "eval_times": list(SURVIVAL_EVAL_TIMES),
             "target_column": SURVIVAL_TARGET_COLUMN,
+            "max_parents": SURVIVAL_GAM_MAX_PARENTS,
+            "min_edge_prob": SURVIVAL_GAM_MIN_EDGE_PROB,
         },
         "causal_paths": {
             "target": CAUSAL_PATH_TARGET,
@@ -931,7 +941,7 @@ def _load_or_build_survival_outcome(
         baseline_dt=outcome.baseline_dt,
         end_dt=outcome.end_dt,
         t2d_dt=outcome.t2d_dt,
-        meta_json=np.array(json.dumps(_json_sanitise(outcome.meta))),
+        meta_json=np.array(json.dumps(_json_sanitise(outcome.meta), allow_nan=False)),
     )
     cache.store(path)
     logger.info(
@@ -1577,7 +1587,7 @@ def _load_or_run_genscore_features(
         person_id=aug_result.kept_person_id.astype(str),
         columns_json=np.array(json.dumps(list(dataset.columns))),
         node_types_json=np.array(json.dumps(list(dataset.node_types))),
-        meta_json=np.array(json.dumps(_json_sanitise(meta))),
+        meta_json=np.array(json.dumps(_json_sanitise(meta), allow_nan=False)),
         cc_W_e=model.W_e.astype(np.float32, copy=False),
         cc_b_enc=model.b_enc.astype(np.float32, copy=False),
         cc_W_d_G=model.W_d_G.astype(np.float32, copy=False),
@@ -1825,7 +1835,7 @@ def _load_or_run_mrdag(
     _atomic_npz(
         path,
         pi=result.pi,
-        diagnostics_json=np.array(json.dumps(_json_sanitise(diagnostics))),
+        diagnostics_json=np.array(json.dumps(_json_sanitise(diagnostics), allow_nan=False)),
     )
     cache.store(path)
     return result.pi, diagnostics
@@ -2025,7 +2035,7 @@ def _load_or_run_mcmc(
         path,
         edge_probs=np.asarray(result.edge_probs, dtype=float),
         samples=samples,
-        diagnostics_json=np.array(json.dumps(_json_sanitise(diagnostics))),
+        diagnostics_json=np.array(json.dumps(_json_sanitise(diagnostics), allow_nan=False)),
         runtime_s=np.array(runtime_s),
     )
     cache.store(path)
@@ -2047,6 +2057,7 @@ def _validate_edges(
     edge_probs: np.ndarray,
     columns: Sequence[str],
     rng: np.random.Generator,
+    allowed_edges: Optional[np.ndarray] = None,
 ) -> dict[str, Any]:
     known_edges = _known_edges_for_columns(columns)
     if not known_edges:
@@ -2057,6 +2068,7 @@ def _validate_edges(
         node_names=columns,
         n_permute=VALIDATION_N_PERMUTE,
         rng=rng,
+        eligible_edges=allowed_edges,
     )
     out["known_edges"] = [list(edge) for edge in known_edges]
     return out
@@ -2091,6 +2103,56 @@ def _posterior_parent_sets(
     return parent_sets, weights, raw_counts
 
 
+def _median_probability_parent_set(
+    samples: np.ndarray,
+    target_idx: int,
+) -> tuple[int, ...]:
+    max_parents = int(globals().get("SURVIVAL_GAM_MAX_PARENTS", 6))
+    min_edge_prob = float(globals().get("SURVIVAL_GAM_MIN_EDGE_PROB", 0.5))
+    edge_probs = samples.astype(float).mean(axis=0)
+    probs = edge_probs[:, target_idx].copy()
+    probs[target_idx] = 0.0
+    order = np.argsort(-probs)
+    chosen = [
+        int(i)
+        for i in order
+        if np.isfinite(probs[i]) and float(probs[i]) >= min_edge_prob
+    ]
+    return tuple(sorted(chosen[:max_parents]))
+
+
+def _survival_parent_sets(
+    samples: np.ndarray,
+    target_idx: int,
+    *,
+    top_k: int,
+) -> tuple[list[tuple[int, ...]], np.ndarray, list[int], list[str]]:
+    parent_sets, weights, raw_counts = _posterior_parent_sets(
+        samples,
+        target_idx,
+        top_k=top_k,
+    )
+    sources = ["sampled"] * len(parent_sets)
+
+    median_set = _median_probability_parent_set(samples, target_idx)
+    if median_set:
+        if median_set in parent_sets:
+            sources[parent_sets.index(median_set)] = "sampled+median_probability"
+        else:
+            pseudo_count = max(raw_counts) if raw_counts else 1
+            parent_sets = [median_set] + parent_sets
+            raw_counts = [int(pseudo_count)] + raw_counts
+            sources = ["median_probability"] + sources
+            if len(parent_sets) > top_k:
+                parent_sets = parent_sets[:top_k]
+                raw_counts = raw_counts[:top_k]
+                sources = sources[:top_k]
+            weights = np.asarray(raw_counts, dtype=float)
+            weights /= float(weights.sum())
+
+    return parent_sets, weights, raw_counts, sources
+
+
 def _survival_time_grid(time_arr: np.ndarray) -> np.ndarray:
     t = np.asarray(time_arr, dtype=float)
     if not np.all(np.isfinite(t)) or np.any(t <= 0.0):
@@ -2100,6 +2162,40 @@ def _survival_time_grid(time_arr: np.ndarray) -> np.ndarray:
     if t_max <= t_min:
         raise ValueError("survival follow-up times have no usable range")
     return np.linspace(t_min, t_max, SURVIVAL_TIME_GRID_POINTS)
+
+
+def _survival_at_times(
+    survival: np.ndarray,
+    t_grid: np.ndarray,
+    times: np.ndarray,
+) -> np.ndarray:
+    """Interpolate a survival surface to exact evaluation times."""
+    S = np.asarray(survival, dtype=float)
+    grid = np.asarray(t_grid, dtype=float).ravel()
+    eval_times = np.asarray(times, dtype=float).ravel()
+    if S.ndim != 2:
+        raise ValueError(f"survival surface must be 2-D, got shape {S.shape}")
+    if S.shape[1] != grid.size:
+        raise ValueError(
+            f"survival surface has {S.shape[1]} time columns but grid has {grid.size}"
+        )
+    if grid.size == 0:
+        raise ValueError("survival time grid is empty")
+    if not (
+        np.all(np.isfinite(S))
+        and np.all(np.isfinite(grid))
+        and np.all(np.isfinite(eval_times))
+    ):
+        raise ValueError("survival surface, grid, and eval_times must be finite")
+    if np.any((S < -1e-12) | (S > 1.0 + 1e-12)):
+        raise ValueError("survival surface must contain probabilities in [0, 1]")
+    if np.any(np.diff(grid) <= 0.0):
+        raise ValueError("survival time grid must be strictly increasing")
+    S = np.clip(S, 0.0, 1.0)
+    out = np.empty((S.shape[0], eval_times.size), dtype=float)
+    for i in range(S.shape[0]):
+        out[i] = np.interp(eval_times, grid, S[i], left=S[i, 0], right=S[i, -1])
+    return out
 
 
 def _weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> np.ndarray:
@@ -2120,31 +2216,75 @@ def _survival_metrics(
     t_grid: np.ndarray,
 ) -> dict[str, Any]:
     eval_times = np.asarray(SURVIVAL_EVAL_TIMES, dtype=float)
-    t_idx = int(np.argmin(np.abs(t_grid - 10.0)))
-    p_event = 1.0 - survival_mean[:, t_idx]
-    y_event = ((time_arr <= 10.0) & (event_arr == 1)).astype(int)
-    calibration = calibration_metrics(y_event, p_event, n_bins=10, strategy="quantile")
+    S_eval = _survival_at_times(survival_mean, t_grid, eval_times)
+    p_event_eval = 1.0 - S_eval
+    p_event_10y = 1.0 - _survival_at_times(
+        survival_mean,
+        t_grid,
+        np.asarray([10.0], dtype=float),
+    )[:, 0]
+
+    # 10y status is *indeterminate* for subjects censored before 10y: we
+    # do not know whether they would have had an event by 10y.  The model
+    # surface (gamfit MLE) is censoring-aware, but a binary outcome that
+    # buckets censored<10y subjects as ``y=0`` would compare a calibrated
+    # prediction against a biased label and inflate ECE / Brier and pull
+    # Nagelkerke R^2 negative.  Restrict calibration to subjects whose
+    # 10y status is determined: events by 10y, or alive at 10y (T >= 10).
+    indeterminate = (time_arr < 10.0) & (event_arr == 0)
+    determined = ~indeterminate
+    p_det = p_event_10y[determined]
+    y_det = (
+        (time_arr[determined] <= 10.0) & (event_arr[determined] == 1)
+    ).astype(int)
+    if p_det.size == 0:
+        raise ValueError("no subjects have determined 10-year status for calibration")
+    calibration = calibration_metrics(
+        y_det, p_det, n_bins=10, strategy="quantile"
+    )
+
     td = time_dependent_auc(
         time=time_arr,
         event=event_arr,
-        risk_score=p_event,
+        risk_score=p_event_eval,
         eval_times=eval_times,
     )
+
+    # IPCW Brier collapses where ``T_i > tau`` is empty (no controls left
+    # at the upper tail of follow-up): the ctrl-term mass is zero and the
+    # case-term divides by S_hat -> 0, giving a degenerate near-zero
+    # value that contaminates the IBS integral.  Trim to taus with at
+    # least 1% of the cohort still at risk (and >= 10 subjects).
+    n_total = int(time_arr.size)
+    min_at_risk = max(10, int(0.01 * n_total))
+    n_at_risk = np.array(
+        [int(np.sum(time_arr > tau)) for tau in t_grid], dtype=int
+    )
+    keep = n_at_risk >= min_at_risk
+    if not np.any(keep):
+        keep = np.zeros_like(n_at_risk, dtype=bool)
+        keep[0] = True
+    brier_grid = t_grid[keep]
+    brier_pred = survival_mean[:, keep]
     br = brier_score(
         time=time_arr,
         event=event_arr,
-        survival_pred=survival_mean,
-        eval_times=t_grid,
+        survival_pred=brier_pred,
+        eval_times=brier_grid,
     )
+
     return {
-        "nagelkerke_r2_at_10y": float(nagelkerke_r2(y_event, p_event)),
+        "nagelkerke_r2_at_10y": float(nagelkerke_r2(y_det, p_det)),
         "calibration_at_10y": calibration,
+        "calibration_at_10y_n_used": int(determined.sum()),
+        "calibration_at_10y_n_indeterminate": int(indeterminate.sum()),
         "time_dependent_auc": {
             "times": td["times"],
             "auc": td["auc"],
             "integrated_auc": float(td["integrated_auc"]),
         },
         "brier": br,
+        "brier_grid_n_at_risk_min": int(min_at_risk),
     }
 
 
@@ -2200,7 +2340,7 @@ def _load_or_run_survival_parent_fit(
     _atomic_npz(
         path,
         survival_mean=mean,
-        diagnostics_json=np.array(json.dumps(_json_sanitise(diag))),
+        diagnostics_json=np.array(json.dumps(_json_sanitise(diag), allow_nan=False)),
         runtime_s=np.array(runtime_s),
     )
     cache.store(path, filename)
@@ -2248,7 +2388,7 @@ def _load_or_run_survival_gam(
         raise RuntimeError("survival GAM requires at least one observed disease event")
 
     target_idx = _target_index(data.columns, SURVIVAL_TARGET_COLUMN)
-    parent_sets, weights, parent_set_counts = _posterior_parent_sets(
+    parent_sets, weights, parent_set_counts, parent_set_sources = _survival_parent_sets(
         samples,
         target_idx,
         top_k=min(CAUSAL_PATH_TOP_K, 8),
@@ -2258,10 +2398,11 @@ def _load_or_run_survival_gam(
     fit_summaries = []
     t0 = time.time()
     logger.info("[gam] fitting %d gamfit survival parent-set models", len(parent_sets))
-    for parent_set, weight, count in zip(
+    for parent_set, weight, count, source in zip(
         parent_sets,
         weights,
         parent_set_counts,
+        parent_set_sources,
     ):
         cols = tuple(data.columns[i] for i in parent_set)
         mean, diag, _fit_runtime_s = _load_or_run_survival_parent_fit(
@@ -2275,6 +2416,7 @@ def _load_or_run_survival_gam(
         per_model.append(mean)
         diag["posterior_parent_set_weight"] = float(weight)
         diag["posterior_parent_set_count"] = int(count)
+        diag["parent_set_source"] = str(source)
         diag["parent_columns"] = list(cols)
         fit_summaries.append(diag)
 
@@ -2294,11 +2436,13 @@ def _load_or_run_survival_gam(
                 "columns": [data.columns[i] for i in ps],
                 "weight": float(w),
                 "count": int(c),
+                "source": str(source),
             }
-            for ps, w, c in zip(
+            for ps, w, c, source in zip(
                 parent_sets,
                 weights,
                 parent_set_counts,
+                parent_set_sources,
             )
         ],
         "fit_summaries": fit_summaries,
@@ -2316,7 +2460,7 @@ def _load_or_run_survival_gam(
         survival_upper=survival_upper,
         variance_structural=variance_structural,
         parent_columns_json=np.array(json.dumps(list(parent_columns))),
-        diagnostics_json=np.array(json.dumps(_json_sanitise(diagnostics))),
+        diagnostics_json=np.array(json.dumps(_json_sanitise(diagnostics), allow_nan=False)),
         runtime_s=np.array(runtime_s),
     )
     cache.store(path)
@@ -2520,6 +2664,7 @@ def run_pipeline() -> PipelineResult:
     _log_structural_constraints(logger, allowed_edges, data.columns)
 
     with _phase(logger, "dagslam"):
+        t0 = time.time()
         key = _run_key(data, mrdag_prior)
         dagslam = _load_or_run_dagslam(
             cache,
@@ -2529,7 +2674,7 @@ def run_pipeline() -> PipelineResult:
             logger,
             allowed_edges=allowed_edges,
         )
-        timings["dagslam"] = float(dagslam["runtime_s"])
+        timings["dagslam"] = time.time() - t0
         logger.info(
             "[dagslam] log_score=%.3f n_edges=%d",
             float(dagslam["log_score"]),
@@ -2538,6 +2683,7 @@ def run_pipeline() -> PipelineResult:
         _log_dagslam_top_edges(logger, dagslam["adjacency"], data.columns)
 
     with _phase(logger, "mcmc"):
+        t0 = time.time()
         edge_probs, mcmc_samples, mcmc_diagnostics, mcmc_runtime = _load_or_run_mcmc(
             cache,
             key,
@@ -2547,10 +2693,16 @@ def run_pipeline() -> PipelineResult:
             logger,
             allowed_edges=allowed_edges,
         )
-        timings["mcmc"] = mcmc_runtime
+        del mcmc_runtime
+        timings["mcmc"] = time.time() - t0
         logger.info(
-            "[mcmc] accept_overall=%.3f max_rhat_skel=%.3f min_ess=%.1f",
-            float(mcmc_diagnostics["accept_rate"]["overall"]),
+            "[mcmc] accept_overall=%.3f accept_mh=%.3f max_rhat_skel=%.3f min_ess=%.1f",
+            float(mcmc_diagnostics["accept_rate"].get("overall", float("nan"))),
+            float(
+                mcmc_diagnostics["accept_rate"].get(
+                    "metropolis_hastings", float("nan")
+                )
+            ),
             float(mcmc_diagnostics.get("max_rhat_skeleton", float("nan"))),
             float(mcmc_diagnostics.get("min_ess", float("nan"))),
         )
@@ -2560,11 +2712,17 @@ def run_pipeline() -> PipelineResult:
             mcmc_diagnostics,
             data.columns,
             float(THRESHOLD_DEFAULT),
+            allowed_edges=allowed_edges,
         )
 
-    thresholded = _acyclic_threshold_from_edge_probs(edge_probs, THRESHOLD_DEFAULT)
+    thresholded = _acyclic_threshold_from_edge_probs(
+        edge_probs,
+        THRESHOLD_DEFAULT,
+        allowed_edges=allowed_edges,
+    )
 
     with _phase(logger, "gam"):
+        t0 = time.time()
         (
             survival_time_grid,
             survival_mean,
@@ -2574,7 +2732,8 @@ def run_pipeline() -> PipelineResult:
             survival_diagnostics,
             survival_runtime,
         ) = _load_or_run_survival_gam(cache, key, data, mcmc_samples, logger)
-        timings["gam"] = survival_runtime
+        del survival_runtime
+        timings["gam"] = time.time() - t0
         logger.info(
             "[gam] parent_columns=%s n_parent_sets=%d",
             list(survival_parent_columns),
@@ -2592,13 +2751,17 @@ def run_pipeline() -> PipelineResult:
         causal_pathways = []
     _log_causal_pathways(logger, causal_pathways)
 
-    validation = _validate_edges(
+    edge_validation = _validate_edges(
         edge_probs,
         data.columns,
         rng=np.random.default_rng(PIPELINE_SEED + 4),
+        allowed_edges=allowed_edges,
     )
-    validation["survival"] = survival_diagnostics.get("metrics", {})
-    _log_validation_metrics(logger, validation)
+    validation = {
+        "known_edge_recovery": edge_validation,
+        "survival": survival_diagnostics.get("metrics", {}),
+    }
+    _log_validation_metrics(logger, edge_validation)
 
     logger.info("[summary] === pipeline metrics ===")
     logger.info(
@@ -2624,22 +2787,27 @@ def run_pipeline() -> PipelineResult:
         float(dagslam["log_score"]),
         int(dagslam["n_edges"]),
     )
-    n_off = data.p * (data.p - 1)
+    n_scored = int(allowed_edges.sum())
     logger.info(
-        "[summary] mcmc: accept=%.3f max_rhat_skel=%.3f min_ess=%.1f "
+        "[summary] mcmc: accept=%.3f accept_mh=%.3f max_rhat_skel=%.3f min_ess=%.1f "
         "edges_above_%.2f=%d/%d",
-        float(mcmc_diagnostics["accept_rate"]["overall"]),
+        float(mcmc_diagnostics["accept_rate"].get("overall", float("nan"))),
+        float(
+            mcmc_diagnostics["accept_rate"].get(
+                "metropolis_hastings", float("nan")
+            )
+        ),
         float(mcmc_diagnostics.get("max_rhat_skeleton", float("nan"))),
         float(mcmc_diagnostics.get("min_ess", float("nan"))),
         float(THRESHOLD_DEFAULT),
         int(np.sum(thresholded)),
-        int(n_off),
+        int(n_scored),
     )
-    if "auroc" in validation:
+    if "auroc" in edge_validation:
         logger.info(
             "[summary] validation: AUROC=%.3f AUPRC=%.3f",
-            float(validation["auroc"]),
-            float(validation["auprc"]),
+            float(edge_validation["auroc"]),
+            float(edge_validation["auprc"]),
         )
     surv_metrics = survival_diagnostics.get("metrics") or {}
     if surv_metrics:
@@ -2650,7 +2818,7 @@ def run_pipeline() -> PipelineResult:
             "[summary] survival: integrated_AUC=%.3f integrated_Brier=%.4f "
             "ECE_10y=%.4f Nagelkerke_R2_10y=%.3f",
             float(td.get("integrated_auc", float("nan"))),
-            float(br.get("integrated_brier", float("nan"))),
+            float(br.get("ibs", float("nan"))),
             float(cal.get("ece", float("nan"))),
             float(surv_metrics.get("nagelkerke_r2_at_10y", float("nan"))),
         )
@@ -2777,6 +2945,7 @@ def _log_mcmc_diagnostics(
     diagnostics: dict[str, Any],
     columns: Sequence[str],
     threshold: float,
+    allowed_edges: Optional[np.ndarray] = None,
 ) -> None:
     accept_rate = diagnostics.get("accept_rate", {}) or {}
     by_type = ", ".join(
@@ -2799,8 +2968,16 @@ def _log_mcmc_diagnostics(
         ],
     )
     n = edge_probs.shape[0]
-    off = ~np.eye(n, dtype=bool)
-    flat = edge_probs[off]
+    if allowed_edges is None:
+        scored = ~np.eye(n, dtype=bool)
+    else:
+        scored = np.asarray(allowed_edges, dtype=bool).copy()
+        if scored.shape != (n, n):
+            raise ValueError(
+                f"allowed_edges must have shape {(n, n)}, got {scored.shape}"
+            )
+        np.fill_diagonal(scored, False)
+    flat = edge_probs[scored]
     n_above = int(np.sum(flat >= threshold))
     n_certain = int(np.sum(flat >= 0.95))
     n_zero = int(np.sum(flat <= 0.05))
@@ -2808,7 +2985,7 @@ def _log_mcmc_diagnostics(
         "[mcmc] edges_above_%.2f=%d / %d  (>=0.95: %d, <=0.05: %d)",
         float(threshold),
         n_above,
-        int(off.sum()),
+        int(scored.sum()),
         n_certain,
         n_zero,
     )
@@ -2835,22 +3012,25 @@ def _log_validation_metrics(
         int(validation.get("n_ground_truth_edges", 0)),
     )
     thresholds = list(validation.get("thresholds") or [])
-    recovery = list(validation.get("observed_recovery") or [])
-    rec_p = list(validation.get("recovery_pvalue") or [])
-    mcc = list(validation.get("mcc") or [])
-    mcc_p = list(validation.get("mcc_pvalue") or [])
-    for idx, thr in enumerate(thresholds):
-        rec = recovery[idx] if idx < len(recovery) else float("nan")
-        rp = rec_p[idx] if idx < len(rec_p) else float("nan")
-        mc = mcc[idx] if idx < len(mcc) else float("nan")
-        mp = mcc_p[idx] if idx < len(mcc_p) else float("nan")
+    # ``known_edge_recovery`` returns these as dicts keyed by the float
+    # threshold value (not lists), so we look up by key here.
+    recovery = validation.get("observed_recovery") or {}
+    rec_p = validation.get("recovery_pvalue") or {}
+    mcc = validation.get("mcc") or {}
+    mcc_p = validation.get("mcc_pvalue") or {}
+    for thr in thresholds:
+        key = float(thr)
+        rec = float(recovery.get(key, float("nan")))
+        rp = float(rec_p.get(key, float("nan")))
+        mc = float(mcc.get(key, float("nan")))
+        mp = float(mcc_p.get(key, float("nan")))
         logger.info(
             "[validation] thr=%.2f recovery=%.3f (p=%.3f)  MCC=%.3f (p=%.3f)",
-            float(thr),
-            float(rec),
-            float(rp),
-            float(mc),
-            float(mp),
+            key,
+            rec,
+            rp,
+            mc,
+            mp,
         )
     per_edge = validation.get("per_edge") or {}
     if per_edge:
@@ -2871,13 +3051,22 @@ def _log_validation_metrics(
 def _log_survival_metrics(
     logger: logging.Logger, diagnostics: dict[str, Any]
 ) -> None:
+    def _values(obj: Any) -> list[Any]:
+        if obj is None:
+            return []
+        if isinstance(obj, np.ndarray):
+            return obj.ravel().tolist()
+        if isinstance(obj, (list, tuple)):
+            return list(obj)
+        return list(obj)
+
     metrics = diagnostics.get("metrics") or {}
     if not metrics:
         logger.info("[gam] no survival metrics computed")
         return
     td = metrics.get("time_dependent_auc") or {}
-    times = list(td.get("times") or [])
-    aucs = list(td.get("auc") or [])
+    times = _values(td.get("times"))
+    aucs = _values(td.get("auc"))
     pairs = ", ".join(
         f"t={float(t):.1f}:AUC={float(a):.3f}" for t, a in zip(times, aucs)
     )
@@ -2889,8 +3078,8 @@ def _log_survival_metrics(
     br = metrics.get("brier") or {}
     logger.info(
         "[gam] integrated_Brier=%.4f  Brier_at_eval=%s",
-        float(br.get("integrated_brier", float("nan"))),
-        [f"{float(x):.4f}" for x in (br.get("brier") or [])],
+        float(br.get("ibs", float("nan"))),
+        [f"{float(x):.4f}" for x in _values(br.get("brier"))],
     )
     cal = metrics.get("calibration_at_10y") or {}
     decomp = cal.get("brier_decomposition") or {}
@@ -2958,17 +3147,29 @@ def _is_reachable_local(adj: np.ndarray, src: int, dst: int) -> bool:
 def _acyclic_threshold_from_edge_probs(
     edge_probs: np.ndarray,
     threshold: float,
+    allowed_edges: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Build a thresholded DAG by greedily adding high-probability edges."""
     probs = np.asarray(edge_probs, dtype=float)
     if probs.ndim != 2 or probs.shape[0] != probs.shape[1]:
         raise ValueError(f"edge_probs must be square, got shape {probs.shape}")
     p = probs.shape[0]
+    if allowed_edges is None:
+        allowed = np.ones((p, p), dtype=bool)
+    else:
+        allowed = np.asarray(allowed_edges, dtype=bool).copy()
+        if allowed.shape != (p, p):
+            raise ValueError(
+                f"allowed_edges must have shape {(p, p)}, got {allowed.shape}"
+            )
+    np.fill_diagonal(allowed, False)
     adj = np.zeros((p, p), dtype=int)
     candidates: list[tuple[float, int, int]] = []
     for i in range(p):
         for j in range(p):
             if i == j:
+                continue
+            if not bool(allowed[i, j]):
                 continue
             prob = float(probs[i, j])
             if np.isfinite(prob) and prob >= threshold:
@@ -3094,7 +3295,13 @@ def save_result(
 
     paths["crosscoder_features_json"] = str(out / "crosscoder_features.json")
     with open(paths["crosscoder_features_json"], "w") as fh:
-        json.dump(_json_sanitise(result.genscore_features), fh, indent=2, sort_keys=True)
+        json.dump(
+            _json_sanitise(result.genscore_features),
+            fh,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
 
     diagnostics = {
         k: v
@@ -3120,12 +3327,12 @@ def save_result(
     }
     paths["summary_json"] = str(out / "summary.json")
     with open(paths["summary_json"], "w") as fh:
-        json.dump(_json_sanitise(summary), fh, indent=2, sort_keys=True)
+        json.dump(_json_sanitise(summary), fh, indent=2, sort_keys=True, allow_nan=False)
 
     config = _pipeline_config() if run_config is None else run_config
     paths["run_config_json"] = str(out / "run_config.json")
     with open(paths["run_config_json"], "w") as fh:
-        json.dump(_json_sanitise(config), fh, indent=2, sort_keys=True)
+        json.dump(_json_sanitise(config), fh, indent=2, sort_keys=True, allow_nan=False)
 
     return paths
 

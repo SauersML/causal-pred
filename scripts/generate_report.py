@@ -45,6 +45,8 @@ def _inline_png(path: str) -> str:
 def _fmt(v: Any) -> str:
     if v is None:
         return "n/a"
+    if isinstance(v, str) and v in {"NaN", "Infinity", "-Infinity"}:
+        return html.escape(v)
     if isinstance(v, float):
         if v != v:  # NaN
             return "NaN"
@@ -85,39 +87,44 @@ def build_report(outputs_dir: str) -> str:
                 plot_items.append(_image_block(fname, src))
 
     validation = summary.get("validation", {}) or {}
+    survival_validation = validation.get("survival", {}) or {}
+    edge_validation = validation.get("known_edge_recovery", {}) or {}
     stage_status = summary.get("stage_status", {}) or {}
     timings = summary.get("timings", {}) or {}
     data_summary = summary.get("data_summary", {}) or {}
-    parent_sets = summary.get("parent_sets", []) or []
+    survival_diag = summary.get("survival_diagnostics", {}) or {}
+    parent_sets = survival_diag.get("parent_sets", []) or []
 
     metrics_flat: Dict[str, Any] = {
         "target_node": summary.get("target_node", "n/a"),
         "n": data_summary.get("n", "n/a"),
         "event_rate": data_summary.get("event_rate", "n/a"),
-        "Nagelkerke R^2 (t=10y)": validation.get("nagelkerke_r2_at_10y", "n/a"),
+        "Nagelkerke R^2 (t=10y)": survival_validation.get(
+            "nagelkerke_r2_at_10y",
+            "n/a",
+        ),
     }
-    calib = validation.get("calibration_at_10y", {}) or {}
+    calib = survival_validation.get("calibration_at_10y", {}) or {}
     if isinstance(calib, dict):
         metrics_flat["ECE (t=10y)"] = calib.get("ece", "n/a")
         metrics_flat["Brier (t=10y, point)"] = calib.get("brier", "n/a")
-    recov = validation.get("known_edge_recovery", {}) or {}
-    if isinstance(recov, dict):
-        metrics_flat["Edge recovery AUROC"] = recov.get("auroc", "n/a")
-        metrics_flat["Edge recovery AUPRC"] = recov.get("auprc", "n/a")
-    ibs = validation.get("brier", {})
+    if isinstance(edge_validation, dict):
+        metrics_flat["Edge recovery AUROC"] = edge_validation.get("auroc", "n/a")
+        metrics_flat["Edge recovery AUPRC"] = edge_validation.get("auprc", "n/a")
+    ibs = survival_validation.get("brier", {})
     if isinstance(ibs, dict):
         metrics_flat["Integrated Brier Score"] = ibs.get("ibs", "n/a")
 
-    tda = validation.get("time_dependent_auc", {}) or {}
+    tda = survival_validation.get("time_dependent_auc", {}) or {}
     if isinstance(tda, dict) and "auc" in tda:
-        eval_times = tda.get("eval_times", [])
+        eval_times = tda.get("times", [])
         auc_values = tda.get("auc", [])
         for tt, aa in zip(eval_times, auc_values):
             metrics_flat[f"AUC(t={_fmt(tt)})"] = aa
 
     parent_set_rows = []
     for ps in parent_sets:
-        names = ps.get("parent_names", [])
+        names = ps.get("columns", [])
         w = ps.get("weight", 0.0)
         parent_set_rows.append(
             f"<tr><td>{html.escape(', '.join(names)) or '&empty;'}</td>"
@@ -154,12 +161,20 @@ def build_report(outputs_dir: str) -> str:
             return "status-placeholder"
         return "status-error"
 
-    stage_rows = "\n".join(
-        f"<tr><th>{html.escape(k)}</th>"
-        f"<td class='{_status_class(str(v))}'>{html.escape(str(v))}</td>"
-        f"<td>{_fmt(timings.get(k))}</td></tr>"
-        for k, v in stage_status.items()
-    )
+    if stage_status:
+        stage_rows = "\n".join(
+            f"<tr><th>{html.escape(k)}</th>"
+            f"<td class='{_status_class(str(v))}'>{html.escape(str(v))}</td>"
+            f"<td>{_fmt(timings.get(k))}</td></tr>"
+            for k, v in stage_status.items()
+        )
+    else:
+        stage_rows = "\n".join(
+            f"<tr><th>{html.escape(str(k))}</th>"
+            f"<td class='status-ok'>recorded</td>"
+            f"<td>{_fmt(v)}</td></tr>"
+            for k, v in timings.items()
+        )
 
     plots_html = (
         "\n".join(plot_items) if plot_items else ("<p><em>No plots found.</em></p>")

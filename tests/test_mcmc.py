@@ -22,6 +22,7 @@ from causal_pred.data.nodes import CANONICAL_EDGES, NODE_INDEX, N_NODES
 from causal_pred.mcmc.structure_mcmc import (
     MCMCResult,
     _is_dag,
+    _rhat_edgewise,
     run_structure_mcmc,
 )
 
@@ -106,6 +107,17 @@ def test_allowed_edges_are_structural():
     assert np.all(res.edge_probs[forbidden] == 0.0)
     for sample in res.samples:
         assert np.all(sample[forbidden] == 0)
+
+
+def test_rhat_detects_constant_chain_disagreement():
+    c0 = np.zeros((8, 3, 3), dtype=np.int8)
+    c1 = np.zeros((8, 3, 3), dtype=np.int8)
+    c1[:, 0, 1] = 1
+
+    rhat = _rhat_edgewise([c0, c1])
+
+    assert np.isinf(rhat[0, 1])
+    assert rhat[1, 2] == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------

@@ -2,11 +2,11 @@
 
 This module is a thin wrapper over the ``gamfit`` Python library (PyO3
 bindings to SauersML/gam's Rust engine). The library implements the
-penalised-spline survival GAM with REML smoothing and analytical
-uncertainty; we feed it pandas frames and read back the dense
-survival surface via :class:`gamfit.SurvivalPrediction`. There is no IPCW,
-no EM, no imputation, no events-only complete-case hack: the library's
-native survival likelihood handles censoring exactly.
+penalised-spline survival GAM with REML smoothing; we feed it pandas frames
+and read back the dense survival surface via
+:class:`gamfit.SurvivalPrediction`. There is no IPCW, no EM, no imputation,
+no events-only complete-case hack: the library's native survival likelihood
+handles censoring exactly.
 
 Public API
 ----------
@@ -190,7 +190,7 @@ def _predict_survival_matrix(
     X_new: np.ndarray,
     t_grid: np.ndarray,
 ) -> np.ndarray:
-    """Return ``(n_new, n_t)`` survival probabilities S(t | x).
+    """Return the point-estimate survival surface of shape ``(n_new, n_t)``.
 
     The gamfit model returns a :class:`gamfit.SurvivalPrediction` object
     for the requested rows. Small diagnostic calls use ``survival_at``;
@@ -224,6 +224,7 @@ def _predict_survival_matrix(
     )
 
     pred = fit.model.predict(df_new)
+
     try:
         S_mean = np.asarray(pred.survival_at(t_grid), dtype=float)
     except ValueError as exc:
@@ -243,7 +244,9 @@ def _predict_survival_matrix(
     # S must be non-increasing in t; enforce by left-to-right cumulative
     # minimum so floating-point noise can't violate monotonicity.
     S_mean = np.minimum.accumulate(S_mean, axis=1)
-    return np.clip(S_mean, 0.0, 1.0)
+    S_mean = np.clip(S_mean, 0.0, 1.0)
+
+    return S_mean
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +267,11 @@ class SurvivalGAM:
     _n_posterior_draws: int = 200
     _predict_cache: Dict[int, np.ndarray] = field(default_factory=dict, repr=False)
 
-    def _cached_predict(self, X_new: np.ndarray, t_grid: np.ndarray) -> np.ndarray:
+    def _cached_predict(
+        self,
+        X_new: np.ndarray,
+        t_grid: np.ndarray,
+    ) -> np.ndarray:
         if self._fit is None:
             raise RuntimeError("SurvivalGAM has no fit attached")
         X_new = np.ascontiguousarray(X_new, dtype=float)
@@ -289,24 +296,28 @@ class SurvivalGAM:
         return X_new.reshape(-1, p)
 
     def predict_survival(self, X_new: np.ndarray, t_grid: np.ndarray) -> np.ndarray:
-        """Posterior-predictive survival probabilities ``(n_samples, n_new, n_t)``.
+        """MAP survival surface broadcast as ``(n_samples, n_new, n_t)``.
 
-        The gamfit library returns a single point estimate of ``S(t | x)``
-        with no per-cell standard error; we broadcast the same surface
-        across the requested ``n_samples`` axis to keep the shape
-        contract that downstream BMA / validation code expects.
+        Returns the gamfit MAP estimate of ``S(t | x)`` replicated
+        across the ``n_samples`` axis.  No posterior sampling: every
+        slice along axis 0 is identical and ``var(axis=0) == 0``.  Use
+        :meth:`predict_survival_mean` if you only want the unreplicated
+        ``(n_new, n_t)`` surface.
         """
         X_new = self._shape_X_new(X_new)
         t_grid = np.asarray(t_grid, dtype=float).ravel()
+        S_draws_count = max(int(self._n_posterior_draws), 1)
         S_mean = self._cached_predict(X_new, t_grid)
-        S = max(int(self._n_posterior_draws), 1)
-        return np.broadcast_to(S_mean, (S,) + S_mean.shape).copy()
+        return np.broadcast_to(
+            S_mean, (S_draws_count,) + S_mean.shape
+        ).copy()
 
     def predict_survival_mean(self, X_new: np.ndarray, t_grid: np.ndarray) -> np.ndarray:
         """Point-estimate survival surface ``(n_new, n_t)`` without draw expansion."""
         X_new = self._shape_X_new(X_new)
         t_grid = np.asarray(t_grid, dtype=float).ravel()
-        return self._cached_predict(X_new, t_grid).copy()
+        S_mean = self._cached_predict(X_new, t_grid)
+        return S_mean.copy()
 
     def predict_median_survival(self, X_new: np.ndarray) -> np.ndarray:
         """Posterior draws of the median survival time per row."""
@@ -388,7 +399,7 @@ def fit_survival_gam(
         When callable, receives concise gamfit fit/summary messages. When
         True, messages are sent to this module's logger.
     """
-    del rng  # accepted for API compat; library is deterministic
+    del rng  # gamfit fitting is deterministic for fixed data.
 
     time = np.asarray(time, dtype=float)
     event = np.asarray(event, dtype=float)

@@ -65,8 +65,31 @@ def _covariate_matrix(data: SyntheticDataset) -> Tuple[np.ndarray, list]:
     return X, names
 
 
-def _safe_t_idx(t_grid: np.ndarray, t_star: float) -> int:
-    return int(np.argmin(np.abs(t_grid - t_star)))
+def _surv_at_times(surv: np.ndarray, t_grid: np.ndarray, times: Sequence[float]) -> np.ndarray:
+    S = np.asarray(surv, dtype=float)
+    grid = np.asarray(t_grid, dtype=float).ravel()
+    eval_times = np.asarray(times, dtype=float).ravel()
+    if S.ndim != 2:
+        raise ValueError(f"survival matrix must be 2-D, got shape {S.shape}")
+    if S.shape[1] != grid.size:
+        raise ValueError(f"survival matrix has {S.shape[1]} columns but grid has {grid.size}")
+    if grid.size == 0:
+        raise ValueError("survival time grid is empty")
+    if np.any(np.diff(grid) <= 0.0):
+        raise ValueError("survival time grid must be strictly increasing")
+    if not (
+        np.all(np.isfinite(S))
+        and np.all(np.isfinite(grid))
+        and np.all(np.isfinite(eval_times))
+    ):
+        raise ValueError("survival matrix, grid, and evaluation times must be finite")
+    if np.any((S < -1e-12) | (S > 1.0 + 1e-12)):
+        raise ValueError("survival matrix must contain probabilities in [0, 1]")
+    S = np.clip(S, 0.0, 1.0)
+    out = np.empty((S.shape[0], eval_times.size), dtype=float)
+    for i in range(S.shape[0]):
+        out[i] = np.interp(eval_times, grid, S[i], left=S[i, 0], right=S[i, -1])
+    return out
 
 
 def _surv_metrics(
@@ -79,16 +102,15 @@ def _surv_metrics(
 ) -> dict:
     """Compute Nagelkerke R^2 at ``eval_t``, td-AUC, and IBS from a survival
     matrix ``surv`` of shape ``(n, len(t_grid))``."""
-    t_idx = _safe_t_idx(t_grid, eval_t)
-    p_event = 1.0 - surv[:, t_idx]
+    p_event = 1.0 - _surv_at_times(surv, t_grid, [eval_t])[:, 0]
     y_event = ((time <= eval_t) & (event == 1)).astype(int)
     r2 = nagelkerke_r2(y_event, p_event) if y_event.sum() > 0 else float("nan")
 
-    # Risk score = 1 - S(10y); higher = worse.
+    auc_surv = _surv_at_times(surv, t_grid, auc_times)
     td = time_dependent_auc(
         time=time,
         event=event,
-        risk_score=p_event,
+        risk_score=1.0 - auc_surv,
         eval_times=np.array(auc_times, dtype=float),
     )
     br = brier_score(time=time, event=event, survival_pred=surv, eval_times=t_grid)
@@ -272,13 +294,11 @@ def run_naive_logistic(
     # Compute Nagelkerke directly on the classifier's 10y probability (it
     # is exactly the model's target).
     r2 = nagelkerke_r2(y, p10)
-    t_idx = _safe_t_idx(t_grid, t_eval)
-    p_event = 1.0 - surv[:, t_idx]
-    # Sanity check: p_event at t_idx should match p10 up to grid snap.
+    auc_surv = _surv_at_times(surv, t_grid, auc_times)
     td = time_dependent_auc(
         time=data.time,
         event=data.event,
-        risk_score=p_event,
+        risk_score=1.0 - auc_surv,
         eval_times=np.array(auc_times, dtype=float),
     )
     br = brier_score(
