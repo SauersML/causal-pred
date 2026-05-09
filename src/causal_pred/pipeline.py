@@ -1065,6 +1065,154 @@ def _cohort_scores_from_gnomon_scores(
     return cohort_scores, n_overlap
 
 
+def _list_workspace_cache_files(
+    cache: WorkspaceCache, dirname: str, pattern: str
+) -> list[str]:
+    seen: set[str] = set()
+    local_dir = cache.local_dir / dirname
+    if local_dir.is_dir():
+        for p in local_dir.glob(pattern):
+            if p.is_file() and p.stat().st_size > 0:
+                seen.add(f"{dirname}/{p.name}")
+    if cache.bucket is not None:
+        uri = f"{cache.bucket}/{WORKSPACE_CACHE_PREFIX}/{dirname}/{pattern}"
+        try:
+            out = subprocess.run(
+                ["gsutil", "ls", uri],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except Exception:
+            out = None
+        if out is not None and out.returncode == 0:
+            for line in out.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                seen.add(f"{dirname}/{line.rsplit('/', 1)[-1]}")
+    return sorted(seen)
+
+
+def _try_parse_sscore_for_cohort(
+    path: Path, person_ids: pd.Series, logger: logging.Logger
+) -> Optional[pd.DataFrame]:
+    try:
+        scores = parse_sscore(path, keep_iids=person_ids.astype(str).tolist())
+    except Exception as exc:
+        logger.info("[prs] sscore %s failed to parse: %s", path, exc)
+        return None
+    min_rows = min(PRS_MIN_COMPLETE_ROWS, int(person_ids.size))
+    overlap = int(person_ids.astype(str).isin(scores.index.astype(str)).sum())
+    if overlap < min_rows:
+        logger.info(
+            "[prs] sscore %s rejected: cohort overlap %d < required %d",
+            path,
+            overlap,
+            min_rows,
+        )
+        return None
+    if scores.shape[1] < PRS_NODES:
+        logger.info(
+            "[prs] sscore %s rejected: %d cols < required %d",
+            path,
+            scores.shape[1],
+            PRS_NODES,
+        )
+        return None
+    return scores
+
+
+def _adopt_orphan_prs_panel(
+    cache: WorkspaceCache,
+    local_path: Path,
+    remote_name: str,
+    person_ids: Sequence[str],
+    logger: logging.Logger,
+) -> Optional[pd.DataFrame]:
+    dirname, target_basename = remote_name.rsplit("/", 1)
+    candidates = [
+        c
+        for c in _list_workspace_cache_files(cache, dirname, "aou-prs-panel-*.csv.gz")
+        if c.rsplit("/", 1)[-1] != target_basename
+    ]
+    if not candidates:
+        return None
+    logger.info(
+        "[prs] direct PRS panel cache miss for %s; scanning %d orphan candidate(s)",
+        target_basename,
+        len(candidates),
+    )
+    for orphan_remote in candidates:
+        orphan_local = cache.path(orphan_remote)
+        fetched = cache.fetch(orphan_remote, orphan_local, overwrite=True)
+        if not _prs_cache_usable(fetched, person_ids, logger=logger):
+            continue
+        logger.warning(
+            "[prs] adopting orphan PRS panel %s -> %s; re-keying to current digest",
+            orphan_remote,
+            remote_name,
+        )
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        if fetched.resolve() != local_path.resolve():
+            shutil.copy2(fetched, local_path)
+        cache.store(local_path, remote_name)
+        return _read_prs_panel(local_path, logger=logger)
+    return None
+
+
+def _adopt_orphan_gnomon_sscore(
+    cache: WorkspaceCache,
+    local_sscore: Path,
+    remote_name: str,
+    person_ids: pd.Series,
+    logger: logging.Logger,
+) -> Optional[pd.DataFrame]:
+    dirname, target_basename = remote_name.rsplit("/", 1)
+    candidates = [
+        c
+        for c in _list_workspace_cache_files(cache, dirname, "gnomon-scores-*.sscore")
+        if c.rsplit("/", 1)[-1] != target_basename
+    ]
+    if not candidates:
+        return None
+    logger.info(
+        "[prs] direct cache miss for %s; scanning %d orphan sscore candidate(s)",
+        target_basename,
+        len(candidates),
+    )
+    for orphan_remote in candidates:
+        orphan_local = cache.path(orphan_remote)
+        fetched = cache.fetch(orphan_remote, orphan_local)
+        if not fetched.is_file() or fetched.stat().st_size == 0:
+            continue
+        logger.info(
+            "[prs] evaluating orphan %s size=%.1fMiB",
+            fetched,
+            _path_size_mib(fetched),
+        )
+        t_parse = time.time()
+        scores = _try_parse_sscore_for_cohort(fetched, person_ids, logger)
+        if scores is None:
+            continue
+        logger.warning(
+            "[prs] adopting orphan gnomon sscore %s -> %s "
+            "(rows=%d cols=%d parse=%s); re-keying to current digest",
+            orphan_remote,
+            remote_name,
+            scores.shape[0],
+            scores.shape[1],
+            _format_seconds(time.time() - t_parse),
+        )
+        local_sscore.parent.mkdir(parents=True, exist_ok=True)
+        if fetched.resolve() != local_sscore.resolve():
+            shutil.copy2(fetched, local_sscore)
+        cache.store(local_sscore, remote_name)
+        return scores
+    return None
+
+
 def _restore_gnomon_scores(
     cache: Optional[WorkspaceCache],
     local_sscore: Path,
@@ -1075,22 +1223,24 @@ def _restore_gnomon_scores(
     if cache is None:
         return None
     restored = cache.fetch(remote_name, local_sscore)
-    if not restored.is_file() or restored.stat().st_size == 0:
-        return None
-    logger.info(
-        "[prs] parsing cached gnomon scores %s size=%.1fMiB",
-        restored,
-        _path_size_mib(restored),
+    if restored.is_file() and restored.stat().st_size > 0:
+        logger.info(
+            "[prs] parsing cached gnomon scores %s size=%.1fMiB",
+            restored,
+            _path_size_mib(restored),
+        )
+        t_parse = time.time()
+        scores = parse_sscore(restored, keep_iids=person_ids.astype(str).tolist())
+        logger.info(
+            "[prs] parsed cached gnomon scores rows=%d cols=%d elapsed=%s",
+            scores.shape[0],
+            scores.shape[1],
+            _format_seconds(time.time() - t_parse),
+        )
+        return scores
+    return _adopt_orphan_gnomon_sscore(
+        cache, local_sscore, remote_name, person_ids, logger
     )
-    t_parse = time.time()
-    scores = parse_sscore(restored, keep_iids=person_ids.astype(str).tolist())
-    logger.info(
-        "[prs] parsed cached gnomon scores rows=%d cols=%d elapsed=%s",
-        scores.shape[0],
-        scores.shape[1],
-        _format_seconds(time.time() - t_parse),
-    )
-    return scores
 
 
 def _latest_sscore(out_dir: Path, started_at: float) -> Optional[Path]:
@@ -1295,6 +1445,11 @@ def _load_or_build_prs_panel(
     if _prs_cache_usable(path, person_ids, logger=logger):
         logger.info("[prs] restored workspace cache %s", path)
         return _read_prs_panel(path, logger=logger), str(path)
+    adopted = _adopt_orphan_prs_panel(
+        cache, path, remote_name, person_ids, logger
+    )
+    if adopted is not None:
+        return adopted, str(path)
     logger.info(
         "[prs] no usable cache; building PRS panel from gnomon scoring -> %s",
         path,
