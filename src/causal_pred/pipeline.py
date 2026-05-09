@@ -2381,14 +2381,40 @@ def _load_or_run_genscore_features(
     r_G = feature_stream_share(model)
     logger.info("[genscore] aligning full panels for post-training encode")
     panels_aligned = align_panels_by_iid(person_ids, prs_df, ehr_panel)
+    n_full = int(panels_aligned.A.shape[0])
+    d_full = int(model.d)
+    # Encode the full panel in chunks to keep peak memory bounded. Materializing
+    # z_full (n_full x d float64) at once was ~1.7 GiB on a 102k x 2048 fit and
+    # OOM-killed the AoU notebook silently after the genscore upload completed.
+    # We only need per-feature activation counts and the four scalar SS terms,
+    # so accumulate batch-wise and drop each z_batch.
+    chunk = 4096
+    activation_count = np.zeros(d_full, dtype=np.int64)
+    ss_res_a = 0.0
+    ss_tot_a = 0.0
+    ss_res_b = 0.0
+    ss_tot_b = 0.0
     logger.info(
-        "[genscore] encoding full panel through crosscoder (n=%d) on %s",
-        int(panels_aligned.A.shape[0]),
+        "[genscore] encoding full panel through crosscoder n=%d chunks=%d on %s",
+        n_full,
+        (n_full + chunk - 1) // chunk,
         str(model.device),
     )
-    z_full = encode(model, panels_aligned.A, panels_aligned.B)
+    for i in range(0, n_full, chunk):
+        A_batch = panels_aligned.A[i : i + chunk]
+        B_batch = panels_aligned.B[i : i + chunk]
+        z_batch = encode(model, A_batch, B_batch)
+        activation_count += (z_batch > 0).sum(axis=0).astype(np.int64)
+        a_hat_batch = z_batch @ model.W_d_G
+        b_hat_batch = z_batch @ model.W_d_E
+        a_z_batch = (A_batch - model.mean_G) / model.std_G
+        b_z_batch = (B_batch - model.mean_E) / model.std_E
+        ss_res_a += float(np.sum((a_z_batch - a_hat_batch) ** 2))
+        ss_tot_a += float(np.sum(a_z_batch ** 2))
+        ss_res_b += float(np.sum((b_z_batch - b_hat_batch) ** 2))
+        ss_tot_b += float(np.sum(b_z_batch ** 2))
+    activation_rate_all = activation_count / float(n_full)
     logger.info("[genscore] encode complete; computing reconstruction metrics")
-    activation_rate_all = (z_full > 0).mean(axis=0)
     dead_mask_all = activation_rate_all == 0.0
     genome_only = (~dead_mask_all) & (r_G > GENSCORE_GENOME_SHARE_MAX)
     ehr_only = (~dead_mask_all) & (r_G < GENSCORE_GENOME_SHARE_MIN)
@@ -2397,15 +2423,6 @@ def _load_or_run_genscore_features(
         & (r_G >= GENSCORE_GENOME_SHARE_MIN)
         & (r_G <= GENSCORE_GENOME_SHARE_MAX)
     )
-
-    a_hat = z_full @ model.W_d_G
-    b_hat = z_full @ model.W_d_E
-    a_z = (panels_aligned.A - model.mean_G) / model.std_G
-    b_z = (panels_aligned.B - model.mean_E) / model.std_E
-    ss_res_a = float(np.sum((a_z - a_hat) ** 2))
-    ss_tot_a = float(np.sum(a_z**2))
-    ss_res_b = float(np.sum((b_z - b_hat) ** 2))
-    ss_tot_b = float(np.sum(b_z**2))
     r2_g = 1.0 - ss_res_a / ss_tot_a if ss_tot_a > 0 else float("nan")
     r2_e = 1.0 - ss_res_b / ss_tot_b if ss_tot_b > 0 else float("nan")
 
