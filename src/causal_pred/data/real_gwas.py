@@ -237,9 +237,10 @@ PUBLISHED_MR: Dict[Tuple[str, str], Tuple[float, float, int, str]] = {
 # outcome is defined.
 CIRCULAR_PAIRS: Tuple[Tuple[str, str], ...] = (
     ("HbA1c", "T2D"),
-    # SBP/HTN: SBP is used to define HTN, so SBP -> HTN is definitional,
-    # and HTN -> SBP is an indicator-of-itself relationship.  Marked as
-    # structural (kept) but not circular -- they're still causally real.
+    # SBP/HTN: SBP is used to define HTN, and HTN is an indicator of the
+    # same underlying blood-pressure process rather than an ordinary cause.
+    ("systolic_BP", "hypertension"),
+    ("hypertension", "systolic_BP"),
 )
 
 

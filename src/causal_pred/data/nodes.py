@@ -94,7 +94,6 @@ CANONICAL_EDGES: Tuple[Tuple[str, str], ...] = (
     ("BMI", "T2D"),
     ("BMI", "hypertension"),
     ("BMI", "HbA1c"),
-    ("HbA1c", "T2D"),
     ("systolic_BP", "cardiovascular_disease"),
     # age is a driver of almost everything
     ("age", "T2D"),
@@ -105,7 +104,6 @@ CANONICAL_EDGES: Tuple[Tuple[str, str], ...] = (
     ("family_history_T2D", "T2D"),
     # hypertension -> CVD
     ("hypertension", "cardiovascular_disease"),
-    ("hypertension", "systolic_BP"),
 )
 
 # Extra edges used only by the simulator (mild confounders / demographic
@@ -116,6 +114,10 @@ SYNTHETIC_ONLY_EDGES: Tuple[Tuple[str, str], ...] = (
     ("sex", "cardiovascular_disease"),
     ("ancestry_PC1", "LDL"),
     ("ancestry_PC1", "HbA1c"),
+    # Simulated risk-marker/diagnostic dependencies, excluded from the clean
+    # literature gold-standard benchmark.
+    ("HbA1c", "T2D"),
+    ("hypertension", "systolic_BP"),
 )
 
 ALL_GROUND_TRUTH_EDGES: Tuple[Tuple[str, str], ...] = (

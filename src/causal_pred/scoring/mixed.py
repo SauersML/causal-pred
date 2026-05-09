@@ -16,15 +16,17 @@ Score forms (peer-review quality)
       T        = t * I_p                      with
       t        = alpha_mu (alpha_w - p - 1) / (alpha_mu + 1)
 
-  the joint log marginal likelihood of a subset ``Y`` of variables
-  (|Y| = l) is, using the Kuipers-corrected constant,
+      the joint log marginal likelihood of a subset ``Y`` of variables
+      (|Y| = l) uses the induced subset degrees of freedom
+      ``nu_l = alpha_w - p + l`` from the full p-dimensional prior.  With the
+      Kuipers-corrected constant,
 
       log p(Y) = - N l / 2 * log(pi)
                  + l / 2 * log(alpha_mu / (alpha_mu + N))
-                 + (alpha_w + l - 1) / 2 * log|T_Y|
-                 - (alpha_w + N + l - 1) / 2 * log|R_Y|
-                 + sum_{i=1}^{l} log Gamma((alpha_w + N + l - i) / 2)
-                 - sum_{i=1}^{l} log Gamma((alpha_w + l - i) / 2)
+                 + nu_l / 2 * log|T_Y|
+                 - (nu_l + N) / 2 * log|R_Y|
+                 + sum_{i=1}^{l} log Gamma((nu_l + N + 1 - i) / 2)
+                 - sum_{i=1}^{l} log Gamma((nu_l + 1 - i) / 2)
 
   where
 
@@ -278,7 +280,8 @@ class _BGeWorkspace:
             return 0.0  # empty product -> log 1 = 0
 
         alpha_mu = self.alpha_mu
-        alpha_w = self.alpha_w
+        alpha_w_full = self.alpha_w
+        nu_l = alpha_w_full - self.p + n_vars
 
         # Slice the shared R matrix; |T_Y| = t_scale^n_vars because T is t*I.
         R_Y = self.R[np.ix_(idx, idx)]
@@ -288,15 +291,15 @@ class _BGeWorkspace:
         # Constant & log-gamma parts.
         term_const = -0.5 * N * n_vars * np.log(np.pi)
         term_mu = 0.5 * n_vars * (np.log(alpha_mu) - np.log(alpha_mu + N))
-        term_T = 0.5 * (alpha_w + n_vars - 1.0) * log_det_T
-        term_R = -0.5 * (alpha_w + N + n_vars - 1.0) * log_det_R
+        term_T = 0.5 * nu_l * log_det_T
+        term_R = -0.5 * (nu_l + N) * log_det_R
 
-        # sum_{i=1}^{n_vars} [ log Gamma((alpha_w + N + n_vars - i)/2)
-        #                     - log Gamma((alpha_w + n_vars - i)/2) ]
+        # sum_{i=1}^{n_vars} [ log Gamma((nu_l + N + 1 - i)/2)
+        #                     - log Gamma((nu_l + 1 - i)/2) ]
         i = np.arange(1, n_vars + 1, dtype=np.float64)
         term_gamma = float(
-            np.sum(gammaln(0.5 * (alpha_w + N + n_vars - i)))
-            - np.sum(gammaln(0.5 * (alpha_w + n_vars - i)))
+            np.sum(gammaln(0.5 * (nu_l + N + 1.0 - i)))
+            - np.sum(gammaln(0.5 * (nu_l + 1.0 - i)))
         )
 
         return float(term_const + term_mu + term_T + term_R + term_gamma)

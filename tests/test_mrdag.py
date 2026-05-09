@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 
 from causal_pred.data.nodes import NODE_INDEX, NODE_NAMES, N_NODES
-from causal_pred.data.gwas import MR_EXPOSURES, MR_OUTCOMES
+from causal_pred.data.gwas import MR_EXPOSURES, MR_OUTCOMES, _true_mr_effect
 from causal_pred.mrdag.pipeline import (
     run_mrdag,
     MrDAGResult,
@@ -180,6 +180,12 @@ def test_real_gwas_loads():
     # Circular pair should have been dropped.
     i_hba = g.exposure_index("HbA1c")
     assert np.isnan(g.betas[i_hba, j_t2d])
+    i_sbp = g.exposure_index("systolic_BP")
+    j_htn = g.outcome_index("hypertension")
+    assert np.isnan(g.betas[i_sbp, j_htn])
+    i_htn = g.exposure_index("hypertension")
+    j_sbp = g.outcome_index("systolic_BP")
+    assert np.isnan(g.betas[i_htn, j_sbp])
 
 
 def test_run_mrdag_accepts_real_gwas():
@@ -230,6 +236,13 @@ def test_path_effect_zero_when_no_path():
     assert abs(T[3, 0]) < 1e-12
     # 2 -> 0: no path (backwards)
     assert abs(T[2, 0]) < 1e-12
+
+
+def test_synthetic_gwas_effects_are_total_effects():
+    pa_t2d = _true_mr_effect("physical_activity", "T2D")
+    expected = (-0.22 * 0.55) + (-0.22 * 0.25 * 0.45)
+
+    assert pa_t2d == pytest.approx(expected)
 
 
 # ---------------------------------------------------------------------------

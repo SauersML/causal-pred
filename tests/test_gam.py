@@ -22,14 +22,14 @@ class _FakeSummary:
 class _FakePrediction:
     def __init__(self, df_new, with_uncertainty: bool):
         exit_time = df_new["exit"].to_numpy(dtype=float)
-        row = np.arange(exit_time.size, dtype=float)
+        self.n_rows = int(exit_time.size)
+        self.with_uncertainty = bool(with_uncertainty)
+        row = np.arange(self.n_rows, dtype=float)
         self.survival = (
             np.exp(-0.03 * (exit_time - 1.0)) * (1.0 - 0.0001 * row)
         ).reshape(-1, 1)
         self.survival_se = (
-            np.full((exit_time.size, 1), 0.02, dtype=float)
-            if with_uncertainty
-            else None
+            np.full((self.n_rows, 1), 0.02, dtype=float) if with_uncertainty else None
         )
 
 
@@ -158,7 +158,7 @@ def test_predict_shape():
     assert np.all(med > 0)
 
 
-def test_predict_survival_mean_expands_person_time_grid():
+def test_predict_survival_mean_uses_gamfit_surface():
     from causal_pred.gam.survival import (
         _SubmodelFit,
         _predict_survival_matrix,
@@ -172,22 +172,29 @@ def test_predict_survival_mean_expands_person_time_grid():
     surface = surface - np.arange(t_grid.size, dtype=float).reshape(1, -1) * 0.02
 
     class _Prediction:
-        def __init__(self, with_uncertainty: bool):
-            self.survival = surface.reshape(-1, 1)
+        def __init__(self, *, with_uncertainty: bool, expanded: bool):
+            self.with_uncertainty = bool(with_uncertainty)
+            self.survival = surface.reshape(-1, 1) if expanded else surface[:, -1:]
             self.survival_se = (
                 np.full((n_new * t_grid.size, 1), 0.05)
-                if with_uncertainty
+                if expanded and with_uncertainty
                 else None
             )
 
     class _Model:
         def predict(self, df_new, *, with_uncertainty=False):
-            assert df_new.shape[0] == n_new * t_grid.size
+            if df_new.shape[0] == n_new * t_grid.size:
+                np.testing.assert_allclose(
+                    df_new["exit"].to_numpy(),
+                    1.0 + np.tile(t_grid, n_new),
+                )
+                return _Prediction(with_uncertainty=with_uncertainty, expanded=True)
+            assert df_new.shape[0] == n_new
             np.testing.assert_allclose(
                 df_new["exit"].to_numpy(),
-                1.0 + np.tile(t_grid, n_new),
+                np.full(n_new, 1.0 + np.max(t_grid)),
             )
-            return _Prediction(with_uncertainty)
+            return _Prediction(with_uncertainty=with_uncertainty, expanded=False)
 
     fit = _SubmodelFit(
         model=_Model(),
@@ -304,12 +311,14 @@ def test_survival_se_requires_gamfit_uncertainty():
     from causal_pred.gam.survival import SurvivalGAM, _SubmodelFit
 
     class _NoSePrediction:
-        survival = np.full((4, 1), 0.8, dtype=float)
-        survival_se = None
+        def __init__(self, n_rows: int):
+            self.n_rows = int(n_rows)
+            self.survival = np.full((n_rows, 1), 0.8, dtype=float)
+            self.survival_se = None
 
     class _NoSeModel:
         def predict(self, df_new, *, with_uncertainty=False):
-            return _NoSePrediction()
+            return _NoSePrediction(df_new.shape[0])
 
     gam_model = SurvivalGAM(
         columns=("x",),

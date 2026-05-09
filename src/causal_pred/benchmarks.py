@@ -681,6 +681,8 @@ def run_causal_pred(
             train_X_ps,
             columns=cols,
             n_uncertainty_slices=max(1, int(gam_samples)),
+            location_formula="1",
+            noise_formula=" + ".join(cols) if cols else "1",
             progress=False,
         )
         per_model.append(fit.predict_survival_mean(test_X_ps, t_grid))

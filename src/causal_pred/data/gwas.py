@@ -26,9 +26,12 @@ real two-sample MR summary statistics.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cache
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
+
+from .nodes import N_NODES, NODE_INDEX
 
 
 
@@ -89,25 +92,35 @@ class GWASSummary:
         return self.outcomes.index(name)
 
 
+_DIRECT_MR_EFFECTS: dict[tuple[str, str], float] = {
+    ("BMI", "T2D"): 0.55,
+    ("BMI", "hypertension"): 0.40,
+    ("BMI", "HbA1c"): 0.25,
+    ("HbA1c", "T2D"): 0.45,
+    ("LDL", "cardiovascular_disease"): 0.30,
+    ("systolic_BP", "cardiovascular_disease"): 0.38,
+    ("years_smoking", "cardiovascular_disease"): 0.28,
+    ("physical_activity", "BMI"): -0.22,
+    ("diet_quality", "BMI"): -0.20,
+    ("diet_quality", "LDL"): -0.15,
+    ("hypertension", "cardiovascular_disease"): 0.35,
+    ("hypertension", "systolic_BP"): 0.50,
+}
+
+
+@cache
+def _total_mr_effect_matrix() -> np.ndarray:
+    B = np.zeros((N_NODES, N_NODES), dtype=float)
+    for (parent, child), effect in _DIRECT_MR_EFFECTS.items():
+        B[NODE_INDEX[parent], NODE_INDEX[child]] = effect
+    return np.linalg.solve(np.eye(N_NODES) - B, np.eye(N_NODES)) - np.eye(N_NODES)
+
+
 def _true_mr_effect(parent: str, child: str) -> float:
-    """Return the population-level MR effect size for a (parent, child)
-    edge in the ground-truth DAG.  Non-edges return 0."""
-    effects = {
-        ("BMI", "T2D"): 0.55,
-        ("BMI", "hypertension"): 0.40,
-        ("BMI", "HbA1c"): 0.25,
-        ("HbA1c", "T2D"): 0.45,
-        ("LDL", "T2D"): 0.00,  # LDL is NOT causal for T2D
-        ("LDL", "cardiovascular_disease"): 0.30,
-        ("systolic_BP", "cardiovascular_disease"): 0.38,
-        ("years_smoking", "cardiovascular_disease"): 0.28,
-        ("physical_activity", "BMI"): -0.22,
-        ("diet_quality", "BMI"): -0.20,
-        ("diet_quality", "LDL"): -0.15,
-        ("hypertension", "cardiovascular_disease"): 0.35,
-        ("hypertension", "systolic_BP"): 0.50,
-    }
-    return effects.get((parent, child), 0.0)
+    """Return the population total effect targeted by the MrDAG likelihood."""
+    if parent not in NODE_INDEX or child not in NODE_INDEX:
+        return 0.0
+    return float(_total_mr_effect_matrix()[NODE_INDEX[parent], NODE_INDEX[child]])
 
 
 def simulate_gwas(

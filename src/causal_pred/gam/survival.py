@@ -2,9 +2,9 @@
 
 The module is a thin wrapper over ``gamfit`` (PyO3 bindings to
 SauersML/gam's Rust engine). gamfit handles right-censoring in its native
-location-scale survival likelihood and returns delta-method response-scale
-standard errors for survival predictions. Bayesian model averaging adds
-structural uncertainty across parent sets.
+location-scale GAMLSS survival likelihood and returns delta-method
+response-scale standard errors for survival predictions. Bayesian model
+averaging adds structural uncertainty across parent sets.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ ProgressCallback = Callable[[str], None]
 _SURVIVAL_ENTRY_ORIGIN = 1.0
 _SURVIVAL_LIKELIHOOD = "location-scale"
 _SURVIVAL_NOISE_FORMULA = "1"
+_SURVIVAL_MODEL_FAMILY = "gamlss"
 
 
 def _progress_callback(progress: bool | ProgressCallback) -> Optional[ProgressCallback]:
@@ -60,9 +61,11 @@ def _fit_gam(
     event: np.ndarray,
     X: np.ndarray,
     columns: Tuple[str, ...],
+    location_formula: Optional[str] = None,
+    noise_formula: Optional[str] = None,
     progress: bool | ProgressCallback = False,
 ) -> _SubmodelFit:
-    """Fit a gamfit location-scale survival model."""
+    """Fit a gamfit location-scale GAMLSS survival model."""
 
     time = np.asarray(time, dtype=float)
     event = np.asarray(event, dtype=float)
@@ -86,7 +89,8 @@ def _fit_gam(
     if not np.all(np.isfinite(X)):
         raise ValueError("survival GAM covariates must be finite")
 
-    rhs = _build_survival_formula(columns)
+    rhs = _build_survival_formula(columns) if location_formula is None else str(location_formula)
+    sigma_rhs = _SURVIVAL_NOISE_FORMULA if noise_formula is None else str(noise_formula)
     formula = f"Surv(entry, exit, event) ~ {rhs}"
     if X.shape[1] > 0:
         x_center = X.mean(axis=0)
@@ -112,13 +116,13 @@ def _fit_gam(
             "fit start "
             f"n={time.shape[0]} events={int(np.sum(event > 0.0))} "
             f"p={len(columns)} likelihood={_SURVIVAL_LIKELIHOOD} "
-            f"formula={formula} noise_formula={_SURVIVAL_NOISE_FORMULA}"
+            f"formula={formula} noise_formula={sigma_rhs}"
         )
     model = gam.fit(
         df,
         formula,
         survival_likelihood=_SURVIVAL_LIKELIHOOD,
-        config={"noise_formula": _SURVIVAL_NOISE_FORMULA},
+        config={"noise_formula": sigma_rhs},
     )
     train_summary: Dict[str, Any] = dict(model.summary().to_dict())
     if emit is not None:
@@ -145,7 +149,7 @@ def _fit_gam(
         formula=formula,
         train_summary=train_summary,
         survival_likelihood=_SURVIVAL_LIKELIHOOD,
-        noise_formula=_SURVIVAL_NOISE_FORMULA,
+        noise_formula=sigma_rhs,
         x_center=x_center.astype(float, copy=True),
         x_scale=x_scale.astype(float, copy=True),
     )
@@ -190,26 +194,30 @@ def _model_matrix(fit: _SubmodelFit, X: np.ndarray) -> np.ndarray:
     return (X - fit.x_center.reshape(1, -1)) / fit.x_scale.reshape(1, -1)
 
 
-def _prediction_frame(
+def _expanded_prediction_frame(
     fit: _SubmodelFit,
     X_new: np.ndarray,
     t_grid: np.ndarray,
 ) -> pd.DataFrame:
     n_new = int(X_new.shape[0])
+    n_t = int(t_grid.shape[0])
     X_model = _model_matrix(fit, X_new)
-    max_horizon = float(np.max(t_grid)) if t_grid.size else 0.0
-    exit_time = _SURVIVAL_ENTRY_ORIGIN + max(max_horizon, 1e-9)
+    repeated_X = (
+        np.repeat(X_model, n_t, axis=0)
+        if X_model.shape[1] > 0
+        else np.zeros((n_new * n_t, 0), dtype=float)
+    )
     return pd.DataFrame(
         {
-            "entry": np.full(n_new, _SURVIVAL_ENTRY_ORIGIN, dtype=float),
-            "exit": np.full(n_new, exit_time, dtype=float),
-            "event": np.zeros(n_new, dtype=float),
-            **{name: X_model[:, i] for i, name in enumerate(fit.columns)},
+            "entry": np.full(n_new * n_t, _SURVIVAL_ENTRY_ORIGIN, dtype=float),
+            "exit": _SURVIVAL_ENTRY_ORIGIN + np.tile(t_grid, n_new),
+            "event": np.ones(n_new * n_t, dtype=float),
+            **{name: repeated_X[:, i] for i, name in enumerate(fit.columns)},
         }
     )
 
 
-def _validate_gamfit_surface(
+def _reshape_expanded_surface(
     values: Any,
     *,
     n_new: int,
@@ -217,47 +225,18 @@ def _validate_gamfit_surface(
     label: str,
 ) -> np.ndarray:
     arr = np.asarray(values, dtype=float)
-    if arr.shape != (n_new, n_t):
+    if arr.ndim == 2 and arr.shape == (n_new * n_t, 1):
+        out = arr[:, 0].reshape(n_new, n_t)
+    elif arr.ndim == 1 and arr.shape == (n_new * n_t,):
+        out = arr.reshape(n_new, n_t)
+    else:
         raise RuntimeError(
             f"gamfit returned {label} surface of shape {arr.shape}; "
-            f"expected ({n_new}, {n_t})"
+            f"expected ({n_new * n_t}, 1)"
         )
-    if not np.all(np.isfinite(arr)):
+    if not np.all(np.isfinite(out)):
         raise RuntimeError(f"gamfit returned non-finite {label} values")
-    return arr
-
-
-def _survival_at_matrix(
-    pred: Any,
-    backend_t_grid: np.ndarray,
-    *,
-    n_new: int,
-    n_t: int,
-) -> np.ndarray:
-    return _validate_gamfit_surface(
-        pred.survival_at(backend_t_grid),
-        n_new=n_new,
-        n_t=n_t,
-        label="survival",
-    )
-
-
-def _survival_se_at_matrix(
-    pred: Any,
-    backend_t_grid: np.ndarray,
-    *,
-    n_new: int,
-    n_t: int,
-) -> np.ndarray:
-    values = pred.survival_se_at(backend_t_grid)
-    if values is None:
-        raise RuntimeError("gamfit did not return survival_se for survival prediction")
-    return _validate_gamfit_surface(
-        values,
-        n_new=n_new,
-        n_t=n_t,
-        label="survival_se",
-    )
+    return out
 
 
 def _predict_survival_grid(
@@ -272,24 +251,25 @@ def _predict_survival_grid(
         empty = np.zeros((n_new, n_t), dtype=float)
         return empty, empty if with_uncertainty else None
     pred = fit.model.predict(
-        _prediction_frame(fit, X_new, t_grid),
+        _expanded_prediction_frame(fit, X_new, t_grid),
         with_uncertainty=with_uncertainty,
     )
-    backend_t_grid = _SURVIVAL_ENTRY_ORIGIN + t_grid
-    S_mean = _survival_at_matrix(
-        pred,
-        backend_t_grid,
+    S_mean = _reshape_expanded_surface(
+        pred.survival,
         n_new=n_new,
         n_t=n_t,
+        label="survival",
     )
     S_mean = np.minimum.accumulate(np.clip(S_mean, 0.0, 1.0), axis=1)
     if not with_uncertainty:
         return S_mean, None
-    S_se = _survival_se_at_matrix(
-        pred,
-        backend_t_grid,
+    if pred.survival_se is None:
+        raise RuntimeError("gamfit did not return survival_se for survival prediction")
+    S_se = _reshape_expanded_surface(
+        pred.survival_se,
         n_new=n_new,
         n_t=n_t,
+        label="survival_se",
     )
     return S_mean, np.clip(S_se, 0.0, None)
 
@@ -477,9 +457,11 @@ def fit_survival_gam(
     X: np.ndarray,
     columns: Optional[Tuple[str, ...]] = None,
     n_uncertainty_slices: int = 1000,
+    location_formula: Optional[str] = None,
+    noise_formula: Optional[str] = None,
     progress: bool | ProgressCallback = False,
 ) -> SurvivalGAM:
-    """Fit a right-censored survival GAM via the gamfit Python library."""
+    """Fit a right-censored GAMLSS survival model via gamfit."""
 
     time = np.asarray(time, dtype=float)
     event = np.asarray(event, dtype=float)
@@ -497,6 +479,8 @@ def fit_survival_gam(
         event,
         X,
         columns,
+        location_formula=location_formula,
+        noise_formula=noise_formula,
         progress=progress,
     )
     summ = fit.train_summary or {}
@@ -535,9 +519,12 @@ def fit_survival_gam(
 
     diagnostics = {
         "backend": "gamfit",
+        "model_family": _SURVIVAL_MODEL_FAMILY,
         "library_version": gam.build_info().get("version"),
         "formula": fit.formula,
         "noise_formula": fit.noise_formula,
+        "gamlss_location_formula": fit.formula,
+        "gamlss_scale_formula": fit.noise_formula,
         "covariate_center": fit.x_center.tolist(),
         "covariate_scale": fit.x_scale.tolist(),
         "train_summary": summ,

@@ -227,8 +227,8 @@ def _log_posterior(
     """Target log posterior log P(G | data) up to constants.
 
     log P(G | data) = log P(G) + sum over observed cells of
-        [ log N(beta_ij | mu_ij, se_ij^2)
-          + 1[(i,j) edge present] * wakefield_log_bf(r_ij, se_ij, W) ],
+        [ log N(beta_ij | mu_ij, se_ij^2 + eps2)
+          + 1[(i,j) edge present] * wakefield_log_bf(r_ij, se_ij, W, eps2) ],
 
     where mu_ij = T_ij(G, B_indirect) with B_indirect zeroed on the
     direct (i, j) entry.
@@ -262,7 +262,7 @@ def _log_posterior(
     r = obs_beta - mu
     r_obs = r[obs_mask]
     se_obs = obs_se[obs_mask]
-    v = se_obs * se_obs
+    v = se_obs * se_obs + eps2
     log_null = -0.5 * float(np.sum(r_obs * r_obs / v + np.log(v) + _LOG_2PI))
 
     # 4) Wakefield BF contribution for present direct edges on

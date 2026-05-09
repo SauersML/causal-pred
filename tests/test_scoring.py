@@ -94,12 +94,13 @@ def test_bge_matches_reference():
     Concretely, the log marginal under NW(nu, alpha_mu, T, alpha_w) of
     data matrix X (N x l) with zero prior mean is
 
-        log p(X) = - N l / 2 log(pi)
-                   + l / 2 log(alpha_mu / (alpha_mu + N))
-                   + (alpha_w + l - 1)/2 log|T|
-                   - (alpha_w + N + l - 1)/2 log|R|
-                   + sum_{i=1..l} [ gammaln((alpha_w+N+l-i)/2)
-                                    - gammaln((alpha_w+l-i)/2) ]
+        nu_l = alpha_w - p + l
+        log p(X_Y) = - N l / 2 log(pi)
+                     + l / 2 log(alpha_mu / (alpha_mu + N))
+                     + nu_l/2 log|T_Y|
+                     - (nu_l + N)/2 log|R_Y|
+                     + sum_{i=1..l} [ gammaln((nu_l+N+1-i)/2)
+                                      - gammaln((nu_l+1-i)/2) ]
 
     We compute the RHS two different ways:
       (a) via our ``_BGeWorkspace.log_marginal`` on a 2-column subset.
@@ -129,6 +130,7 @@ def test_bge_matches_reference():
     # (b) independent reference:
     idx = [0, 2]
     n_vars = len(idx)
+    nu_l = alpha_w - p + n_vars
     Xy = X[:, idx]
     x_bar = Xy.mean(axis=0)
     Xc = Xy - x_bar
@@ -143,12 +145,12 @@ def test_bge_matches_reference():
     ref = (
         -0.5 * N * n_vars * math.log(math.pi)
         + 0.5 * n_vars * (math.log(alpha_mu) - math.log(alpha_mu + N))
-        + 0.5 * (alpha_w + n_vars - 1) * log_det_T
-        - 0.5 * (alpha_w + N + n_vars - 1) * log_det_R
+        + 0.5 * nu_l * log_det_T
+        - 0.5 * (nu_l + N) * log_det_R
         + sum(
-            math.lgamma(0.5 * (alpha_w + N + n_vars - i)) for i in range(1, n_vars + 1)
+            math.lgamma(0.5 * (nu_l + N + 1 - i)) for i in range(1, n_vars + 1)
         )
-        - sum(math.lgamma(0.5 * (alpha_w + n_vars - i)) for i in range(1, n_vars + 1))
+        - sum(math.lgamma(0.5 * (nu_l + 1 - i)) for i in range(1, n_vars + 1))
     )
 
     rel = abs(ours - ref) / max(1.0, abs(ref))
