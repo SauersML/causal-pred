@@ -305,6 +305,27 @@ class WorkspaceCache:
             )
 
 
+def _log_rss(logger: logging.Logger, label: str) -> None:
+    """Log process RSS (Linux only, silently no-op elsewhere) at a checkpoint
+    so we can spot memory growth before the kernel OOM-killer fires."""
+    try:
+        with open("/proc/self/status") as fh:
+            vm_rss = vm_peak = vm_size = ""
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    vm_rss = line.split(":", 1)[1].strip()
+                elif line.startswith("VmPeak:"):
+                    vm_peak = line.split(":", 1)[1].strip()
+                elif line.startswith("VmSize:"):
+                    vm_size = line.split(":", 1)[1].strip()
+        if vm_rss:
+            logger.info(
+                "[mem] %s rss=%s peak=%s vsz=%s", label, vm_rss, vm_peak, vm_size
+            )
+    except OSError:
+        pass
+
+
 def _post_training_reconstruction_stats(
     model: Any,
     panels_aligned: Any,
@@ -2093,6 +2114,8 @@ def _render_genscore_plots_async(
                 save_all_genscore_plots,
             )
 
+            logger.info("[genscore-plots] worker started")
+            _log_rss(logger, "genscore-plots worker start")
             t0 = time.time()
             history = {
                 "step": list(genscore_meta.get("loss_history_step", [])),
@@ -2198,6 +2221,17 @@ def _render_genscore_plots_async(
             )
 
             plots_dir = str(Path(DEFAULT_OUTPUT_DIR) / "plots")
+            logger.info(
+                "[genscore-plots] rendering into %s "
+                "(panels n=%d m_G=%d m_E=%d, model d=%d k=%d)",
+                plots_dir,
+                int(panels.A.shape[0]),
+                int(panels.A.shape[1]),
+                int(panels.B.shape[1]),
+                int(model.d),
+                int(model.k),
+            )
+            _log_rss(logger, "genscore-plots before save_all")
             saved = save_all_genscore_plots(
                 plots_dir,
                 GenscorePlotInputs(
@@ -2210,6 +2244,7 @@ def _render_genscore_plots_async(
                     history=history,
                 ),
             )
+            _log_rss(logger, "genscore-plots after save_all")
             logger.info(
                 "[genscore-plots] wrote %d figures to %s elapsed=%.1fs",
                 len(saved),
@@ -2348,7 +2383,9 @@ def _load_or_run_genscore_features(
         crosscoder_checkpoint_callback=_store_crosscoder_checkpoint,
     )
     logger.info("[genscore] crosscoder training done; flushing final checkpoint upload")
+    _log_rss(logger, "after train_crosscoder")
     checkpoint_uploader.flush()
+    _log_rss(logger, "after checkpoint flush")
     logger.info(
         "[genscore] post-training: computing top genome/EHR loadings for %d promoted features",
         len(aug_result.feature_selection.indices),
@@ -2426,6 +2463,7 @@ def _load_or_run_genscore_features(
         int(model.d),
         int(ehr_panel.m),
     )
+    _log_rss(logger, "before bundle write")
     _atomic_npz(
         path,
         X=dataset.X,
@@ -2458,6 +2496,7 @@ def _load_or_run_genscore_features(
     )
     cache.store(path)
     logger.info("[genscore] bundle uploaded; computing post-training summary metrics")
+    _log_rss(logger, "before post-training reconstruction")
     model_bundle: dict[str, Any] | None = {
         "W_e": np.asarray(model.W_e),
         "b_enc": np.asarray(model.b_enc),
@@ -2488,6 +2527,7 @@ def _load_or_run_genscore_features(
         _post_training_reconstruction_stats(model, panels_aligned, logger)
     )
     logger.info("[genscore] encode complete; computing reconstruction metrics")
+    _log_rss(logger, "after post-training reconstruction")
     dead_mask_all = activation_rate_all == 0.0
     genome_only = (~dead_mask_all) & (r_G > GENSCORE_GENOME_SHARE_MAX)
     ehr_only = (~dead_mask_all) & (r_G < GENSCORE_GENOME_SHARE_MIN)
@@ -3885,6 +3925,7 @@ def run_pipeline() -> PipelineResult:
         logger,
     )
 
+    _log_rss(logger, "before mrdag")
     with _phase(logger, "mrdag"):
         t0 = time.time()
         mrdag_pi, mrdag_diagnostics = _load_or_run_mrdag(cache, logger)
@@ -3896,6 +3937,7 @@ def run_pipeline() -> PipelineResult:
     allowed_edges = _structural_allowed_edges(data.columns, data.node_types)
     _log_structural_constraints(logger, allowed_edges, data.columns)
 
+    _log_rss(logger, "before dagslam")
     with _phase(logger, "dagslam"):
         t0 = time.time()
         key = _run_key(data, mrdag_prior, allowed_edges)
@@ -3915,6 +3957,7 @@ def run_pipeline() -> PipelineResult:
         )
         _log_dagslam_top_edges(logger, dagslam["adjacency"], data.columns)
 
+    _log_rss(logger, "before mcmc")
     with _phase(logger, "mcmc"):
         t0 = time.time()
         edge_probs, mcmc_samples, mcmc_diagnostics, mcmc_runtime = _load_or_run_mcmc(
