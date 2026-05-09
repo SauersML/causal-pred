@@ -28,6 +28,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -147,7 +148,7 @@ GENSCORE_CROSSCODER_KWARGS = {
     "validation_fraction": 0.1,
     "mixed_likelihood": True,
 }
-GENSCORE_CROSSCODER_CHECKPOINT_EVERY = 100
+GENSCORE_CROSSCODER_CHECKPOINT_EVERY = 1000
 
 GAM_N_SAMPLES = 200
 SURVIVAL_TIME_GRID_POINTS = 50
@@ -301,6 +302,62 @@ class WorkspaceCache:
                 uri,
                 _format_seconds(time.time() - t0),
             )
+
+
+class _AsyncUploader:
+    """Coalescing background uploader for repeatedly-overwritten artefacts
+    (e.g. crosscoder checkpoints). ``store`` returns immediately; if a
+    previous upload is still running, the request is coalesced and the
+    worker picks up the latest snapshot when it next polls. ``flush``
+    blocks until any queued upload completes so callers can ensure the
+    final state hits the bucket before exiting.
+    """
+
+    def __init__(self, cache: WorkspaceCache, label: str = "upload") -> None:
+        self._cache = cache
+        self._label = label
+        self._lock = threading.Lock()
+        self._next: Optional[tuple[Path, str]] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def store(self, local_path: Path, remote_name: str) -> None:
+        with self._lock:
+            self._next = (Path(local_path), str(remote_name))
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._run,
+                    daemon=True,
+                    name=f"{self._label}-uploader",
+                )
+                self._thread.start()
+
+    def _run(self) -> None:
+        logger = logging.getLogger("causal_pred.pipeline")
+        while True:
+            with self._lock:
+                target = self._next
+                self._next = None
+            if target is None:
+                return
+            local, remote = target
+            snap = local.with_suffix(local.suffix + ".upload-tmp")
+            try:
+                shutil.copy2(local, snap)
+                self._cache.store(snap, remote)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] async upload failed: %r", self._label, exc
+                )
+            finally:
+                try:
+                    snap.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def flush(self) -> None:
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join()
 
 
 PIPELINE_LOG_FILENAME = "pipeline.log"
@@ -2156,14 +2213,16 @@ def _load_or_run_genscore_features(
             _path_size_mib(checkpoint_path),
         )
 
+    checkpoint_uploader = _AsyncUploader(cache, label="crosscoder")
+
     def _store_crosscoder_checkpoint(local_path: Path, step: int) -> None:
         logger.info(
-            "[crosscoder] checkpoint step=%d path=%s size=%.1fMiB",
+            "[crosscoder] checkpoint step=%d path=%s size=%.1fMiB (queued)",
             int(step),
             local_path,
             _path_size_mib(local_path),
         )
-        cache.store(local_path, checkpoint_filename)
+        checkpoint_uploader.store(local_path, checkpoint_filename)
 
     t0 = time.time()
     aug_result, model = run_genscore(
@@ -2182,6 +2241,7 @@ def _load_or_run_genscore_features(
         crosscoder_checkpoint_every=GENSCORE_CROSSCODER_CHECKPOINT_EVERY,
         crosscoder_checkpoint_callback=_store_crosscoder_checkpoint,
     )
+    checkpoint_uploader.flush()
     sel = aug_result.feature_selection
     top_genome_loadings: dict[str, list[dict[str, float]]] = {}
     top_ehr_loadings: dict[str, list[dict[str, float]]] = {}
