@@ -1526,7 +1526,7 @@ def _load_or_build_prs_panel(
         "[prs] no usable cache; building PRS panel from gnomon scoring -> %s",
         path,
     )
-    panel = _build_prs_panel(
+    _build_prs_panel(
         cohort_csv,
         path,
         logger,
@@ -1546,6 +1546,11 @@ def _load_or_build_prs_panel(
         "[prs] workspace store finished in %s",
         _format_seconds(time.time() - t_store),
     )
+    # Re-read from disk so the in-memory frame matches what _restore_prs_panel
+    # would return on a later run. CSV float roundtrip flips a few low bits,
+    # which would otherwise propagate into _genscore_key and invalidate the
+    # crosscoder fit checkpoint for any subsequent run.
+    panel = _read_prs_panel(path, logger=logger)
     return panel, str(path)
 
 
