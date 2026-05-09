@@ -161,11 +161,12 @@ York (1995).
 
 ## 7. Survival GAM
 
-We fit right-censored gamfit location-scale survival models conditional on a
-candidate parent set:
+We fit right-censored gamfit Gompertz-Makeham GAMLSS survival models
+conditional on a candidate parent set:
 
 ```
 Surv(entry, exit, event) ~ sum_k f_k(x_k),
+baseline_target = gompertz-makeham,
 noise_formula = 1,
 ```
 

@@ -63,8 +63,10 @@ path. `synthetic.py` generates an AoU-shaped matrix with a known
 ground-truth DAG -- still used by tests and by historical benchmarks.
 `nodes.py` is the single source of truth for the synthetic schema's
 `NODE_NAMES` (length 18) and the parallel `node_types` tuple.
-`real_gwas.py` holds literature-derived IVW beta / SE / SNP-count cells
-with PMID/DOI. `polygenic.py` shells out to the `gnomon` CLI for
+`opengwas.py` runs real two-sample IVW (LD-clumped tophits + outcome
+harmonisation + IVW) against the OpenGWAS REST API and caches the
+resulting beta / SE / SNP-count cells under `data/mr_cache/` keyed by
+`(exposure_id, outcome_id, p, r2, kb)`. `polygenic.py` shells out to the `gnomon` CLI for
 scoring and HWE-PCA ancestry projection; it never reimplements scoring
 in Python. `cohort.py` is the cohort-data branch of the same loader:
 it accepts OMOP-shaped condition + measurement frames for cohort CSV
@@ -124,11 +126,11 @@ the biologically admissible graph space.
 
 ### `gam/`
 Survival GAM wrappers around the `gamfit` Python bindings for the
-`SauersML/gam` Rust engine. The production pipeline fits gamfit location-scale
-survival models on posterior parent sets sampled by structure MCMC plus the
-target's median-probability parent model, queries gamfit survival curves and
-response-scale standard errors, then averages per-person survival curves by
-parent-set posterior probability.
+`SauersML/gam` Rust engine. The production pipeline fits gamfit
+Gompertz-Makeham GAMLSS survival models on posterior parent sets sampled by
+structure MCMC plus the target's median-probability parent model, queries
+gamfit survival curves and response-scale standard errors, then averages
+per-person survival curves by parent-set posterior probability.
 
 ### `validation/`
 Known-edge recall/AUROC, Nagelkerke R-squared, Brier decomposition
@@ -169,24 +171,19 @@ internally where needed. `node_types` is a length-`p` tuple of
 ### How to add a new disease
 1. Add the outcome node to `NODE_NAMES` in `data/nodes.py` with a
    `"survival"` type and declare its upstream causes.
-2. Add IV cells (beta, se, SNP count, PMID) to `data/real_gwas.py` for each
-   exposure that has a published Mendelian-randomisation estimate onto the
-   new outcome. Cells without a published value stay as
-   `LITERATURE_UNAVAILABLE`.
+2. Add the new outcome's OpenGWAS study ID to
+   `OPENGWAS_STUDY_IDS` in `data/opengwas.py` and run the pipeline with
+   `OPENGWAS_JWT` set so the IVW cells get fetched and written to
+   `data/mr_cache/`. Pairs without overlapping instruments stay as NaN.
 3. Update the synthetic generator's ground-truth DAG so validation metrics
    stay meaningful.
 4. Rerun `uv run python -m causal_pred.pipeline` and inspect the diff in
    `outputs/summary.json`.
 
-### How to swap the GAM backend
-The only supported GAM backend is the `SauersML/gam` Rust engine pinned in
-`pyproject.toml`. Do not reach for the legacy pure-Python library whose
-import name begins with "py" -- it has repeatedly caused regressions and is
-a hard tripwire (see CLAUDE.md). If you genuinely need a new backend:
-1. Implement the `SurvivalGAM` methods used by the pipeline behind a thin
-   adapter module.
-2. Replace the required dependency in `pyproject.toml` and update the lockfile.
-3. Run the full suite and a benchmark smoke test before making the switch.
+### GAM backend
+The only supported GAM backend is `gamfit`, pinned in `pyproject.toml`.
+Survival models are fitted as gamfit Gompertz-Makeham GAMLSS models; no
+alternate GAM backend is supported.
 
 ### How `gnomon` slots in
 `data/polygenic.py` constructs a temporary working directory, writes VCF or
@@ -204,8 +201,9 @@ raises a clear `NotImplementedError` naming the missing binary.
    production entry path.
 3. Provide per-ancestry HWE-PCA eigenvectors so `gnomon` can project new
    samples into the reference PC space.
-4. Re-examine the `real_gwas.py` IVs: some will not transport (eg HbA1c
-   effects differ by assay). Replace or null out as needed.
+4. Re-examine the cached `data/mr_cache/` IVs: some will not transport
+   (e.g. HbA1c effects differ by assay). Refresh or null out as needed
+   by re-running `opengwas.load_live_gwas` with `OPENGWAS_JWT` set.
 
 ## Reproducibility notes
 

@@ -5,13 +5,15 @@ Covers:
   * probabilities in [0, 1] where defined
   * NaN outside the MR trait set
   * recovery of BMI -> T2D (MR-positive, known from literature)
-  * non-recovery of LDL -> T2D (MR-null, known from literature)
+  * absence of strong direct physical_activity -> T2D (mediated by BMI)
   * diagonal NaN or 0
   * between-chain agreement + Gelman-Rubin R-hat
-  * real-literature GWAS loader
+  * the cached OpenGWAS two-sample MR loader
   * DAG-implied total-effect utility: no path -> T(i, j) = 0
   * cycle rejection in the MCMC machinery
 """
+
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -28,6 +30,19 @@ from causal_pred.mrdag.pipeline import (
 )
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_MR_CACHE_DIR = _REPO_ROOT / "data" / "mr_cache"
+
+
+def _load_cached_gwas():
+    from causal_pred.data.opengwas import OpenGWASClient, load_live_gwas
+
+    return load_live_gwas(
+        client=OpenGWASClient(token=None),
+        cache_dir=_MR_CACHE_DIR,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Module-scoped fixture so we only run MCMC once.
 # ---------------------------------------------------------------------------
@@ -35,9 +50,7 @@ from causal_pred.mrdag.pipeline import (
 
 @pytest.fixture(scope="module")
 def mrdag_result():
-    from causal_pred.data.gwas import simulate_gwas
-
-    gwas = simulate_gwas()
+    gwas = _load_cached_gwas()
     return run_mrdag(
         gwas,
         rng=np.random.default_rng(2024),
@@ -101,11 +114,11 @@ def test_bmi_to_t2d_high(mrdag_result):
     assert val > 0.7, f"Expected BMI->T2D > 0.7, got {val:.3f}"
 
 
-def test_ldl_to_t2d_low(mrdag_result):
+def test_physical_activity_to_t2d_direct_low(mrdag_result):
     pi = mrdag_result.pi
-    val = pi[NODE_INDEX["LDL"], NODE_INDEX["T2D"]]
+    val = pi[NODE_INDEX["physical_activity"], NODE_INDEX["T2D"]]
     assert np.isfinite(val)
-    assert val < 0.3, f"Expected LDL->T2D < 0.3, got {val:.3f}"
+    assert val < 0.3, f"Expected physical_activity->T2D < 0.3, got {val:.3f}"
 
 
 # ---------------------------------------------------------------------------
@@ -157,27 +170,20 @@ def test_diagnostics_present(mrdag_result):
 
 
 # ---------------------------------------------------------------------------
-# Real-literature GWAS loader.
+# Cached OpenGWAS two-sample MR loader.
 # ---------------------------------------------------------------------------
 
 
-def test_real_gwas_loads():
-    from causal_pred.data.real_gwas import load_real_gwas
-
-    g = load_real_gwas()
+def test_opengwas_cached_summary_loads():
+    g = _load_cached_gwas()
     assert g.betas.shape == g.ses.shape
     i_bmi = g.exposure_index("BMI")
     j_t2d = g.outcome_index("T2D")
     assert np.isfinite(g.betas[i_bmi, j_t2d])
     assert g.betas[i_bmi, j_t2d] > 0.4, (
-        f"Literature BMI->T2D beta should be > 0.4, got {g.betas[i_bmi, j_t2d]}"
+        f"BMI->T2D IVW beta should be > 0.4, got {g.betas[i_bmi, j_t2d]}"
     )
-    i_ldl = g.exposure_index("LDL")
-    assert np.isfinite(g.betas[i_ldl, j_t2d])
-    assert abs(g.betas[i_ldl, j_t2d]) < 0.15, (
-        f"Literature LDL->T2D beta should be ~0, got {g.betas[i_ldl, j_t2d]}"
-    )
-    # Circular pair should have been dropped.
+    # Circular pairs are dropped.
     i_hba = g.exposure_index("HbA1c")
     assert np.isnan(g.betas[i_hba, j_t2d])
     i_sbp = g.exposure_index("systolic_BP")
@@ -188,11 +194,9 @@ def test_real_gwas_loads():
     assert np.isnan(g.betas[i_htn, j_sbp])
 
 
-def test_run_mrdag_accepts_real_gwas():
-    """``run_mrdag`` should work on a literature-based ``RealGWASSummary``."""
-    from causal_pred.data.real_gwas import load_real_gwas
-
-    g = load_real_gwas()
+def test_run_mrdag_on_cached_opengwas_summary():
+    """``run_mrdag`` must run end-to-end on the cached two-sample MR data."""
+    g = _load_cached_gwas()
     res = run_mrdag(
         g,
         rng=np.random.default_rng(11),
@@ -202,14 +206,12 @@ def test_run_mrdag_accepts_real_gwas():
         thin=5,
     )
     assert res.pi.shape == (N_NODES, N_NODES)
-    # BMI -> T2D should come out high even on the real data.
     bmi_t2d = res.pi[NODE_INDEX["BMI"], NODE_INDEX["T2D"]]
     assert np.isfinite(bmi_t2d)
-    assert bmi_t2d > 0.7, f"real-data BMI->T2D = {bmi_t2d:.3f}"
-    # LDL -> T2D should remain low.
-    ldl_t2d = res.pi[NODE_INDEX["LDL"], NODE_INDEX["T2D"]]
-    assert np.isfinite(ldl_t2d)
-    assert ldl_t2d < 0.3, f"real-data LDL->T2D = {ldl_t2d:.3f}"
+    assert bmi_t2d > 0.7, f"opengwas BMI->T2D = {bmi_t2d:.3f}"
+    pa_t2d = res.pi[NODE_INDEX["physical_activity"], NODE_INDEX["T2D"]]
+    assert np.isfinite(pa_t2d)
+    assert pa_t2d < 0.3, f"opengwas physical_activity->T2D = {pa_t2d:.3f}"
 
 
 # ---------------------------------------------------------------------------
@@ -236,27 +238,6 @@ def test_path_effect_zero_when_no_path():
     assert abs(T[3, 0]) < 1e-12
     # 2 -> 0: no path (backwards)
     assert abs(T[2, 0]) < 1e-12
-
-
-def test_synthetic_gwas_effects_are_total_effects():
-    from pathlib import Path
-
-    from causal_pred.data import opengwas
-    from causal_pred.data.gwas import simulate_gwas
-
-    cache_dir = Path(__file__).resolve().parents[1] / "data" / "mr_cache"
-    gwas = simulate_gwas()
-    live = opengwas.load_live_gwas(
-        client=opengwas.OpenGWASClient(token=None),
-        cache_dir=cache_dir,
-    )
-    i = gwas.exposure_index("physical_activity")
-    j = gwas.outcome_index("T2D")
-    live_i = live.exposures.index("physical_activity")
-    live_j = live.outcomes.index("T2D")
-
-    assert np.isfinite(gwas.betas[i, j])
-    assert gwas.betas[i, j] == pytest.approx(live.betas[live_i, live_j])
 
 
 # ---------------------------------------------------------------------------

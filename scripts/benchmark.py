@@ -13,7 +13,7 @@ Baselines included:
   * Kaplan-Meier (no covariates)
   * Cox proportional hazards (all covariates)
   * Naive logistic at t = 10 y
-  * Naive MR-IVW edge recovery (Bonferroni on published PUBLISHED_MR)
+  * Naive MR-IVW edge recovery (Bonferroni on cached OpenGWAS IVW)
   * The causal-pred stack (MrDAG -> DAGSLAM -> MCMC -> gamfit survival GAM)
 """
 
@@ -123,11 +123,6 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--mcmc-iter", type=int, default=500)
     parser.add_argument("--mcmc-chains", type=int, default=1)
     parser.add_argument("--gam-samples", type=int, default=100)
-    parser.add_argument(
-        "--no-real-gwas",
-        action="store_true",
-        help="use simulated GWAS summaries instead of published",
-    )
     parser.add_argument("--output-dir", type=str, default=os.path.join(ROOT, "outputs"))
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--quiet", action="store_true")
@@ -151,7 +146,6 @@ def main(argv: list | None = None) -> int:
         mcmc_iter=args.mcmc_iter,
         mcmc_chains=args.mcmc_chains,
         gam_samples=args.gam_samples,
-        use_real_gwas=not args.no_real_gwas,
         rng=np.random.default_rng(args.seed + 1),
     )
 
@@ -189,7 +183,6 @@ def main(argv: list | None = None) -> int:
             "mcmc_iter": args.mcmc_iter,
             "mcmc_chains": args.mcmc_chains,
             "gam_samples": args.gam_samples,
-            "use_real_gwas": not args.no_real_gwas,
         },
         "git_sha": _git_sha(ROOT),
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

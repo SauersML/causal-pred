@@ -21,16 +21,18 @@ class _FakeSummary:
 
 class _FakePrediction:
     def __init__(self, df_new, with_uncertainty: bool):
-        exit_time = df_new["exit"].to_numpy(dtype=float)
-        self.n_rows = int(exit_time.size)
+        self.n_rows = int(df_new.shape[0])
         self.with_uncertainty = bool(with_uncertainty)
-        row = np.arange(self.n_rows, dtype=float)
-        self.survival = (
-            np.exp(-0.03 * (exit_time - 1.0)) * (1.0 - 0.0001 * row)
-        ).reshape(-1, 1)
-        self.survival_se = (
-            np.full((self.n_rows, 1), 0.02, dtype=float) if with_uncertainty else None
-        )
+
+    def survival_at(self, times):
+        horizon = np.asarray(times, dtype=float).reshape(1, -1) - 1.0
+        row = np.arange(self.n_rows, dtype=float).reshape(-1, 1)
+        return np.exp(-0.03 * horizon) * (1.0 - 0.0001 * row)
+
+    def survival_se_at(self, times):
+        if not self.with_uncertainty:
+            return None
+        return np.full((self.n_rows, len(times)), 0.02, dtype=float)
 
 
 class _FakeModel:
@@ -53,10 +55,11 @@ def test_fit_smoke(monkeypatch):
 
     seen = {}
 
-    def fake_fit(df, formula, *, survival_likelihood, config):
+    def fake_fit(df, formula, *, survival_likelihood, baseline_target, config):
         seen["df_columns"] = tuple(df.columns)
         seen["formula"] = formula
         seen["survival_likelihood"] = survival_likelihood
+        seen["baseline_target"] = baseline_target
         seen["config"] = dict(config)
         seen["df"] = df.copy()
         return _FakeModel()
@@ -87,6 +90,7 @@ def test_fit_smoke(monkeypatch):
     )
 
     assert seen["survival_likelihood"] == "location-scale"
+    assert seen["baseline_target"] == "gompertz-makeham"
     assert seen["config"] == {"noise_formula": "1"}
     assert seen["df_columns"] == ("entry", "exit", "event", "sex", "BMI")
     assert seen["formula"] == "Surv(entry, exit, event) ~ sex + BMI"
@@ -113,6 +117,7 @@ def test_fit_smoke(monkeypatch):
         "n_events",
         "converged",
         "formula",
+        "baseline_target",
         "noise_formula",
         "covariate_center",
         "covariate_scale",
@@ -172,29 +177,27 @@ def test_predict_survival_mean_uses_gamfit_surface():
     surface = surface - np.arange(t_grid.size, dtype=float).reshape(1, -1) * 0.02
 
     class _Prediction:
-        def __init__(self, *, with_uncertainty: bool, expanded: bool):
+        def __init__(self, *, with_uncertainty: bool):
             self.with_uncertainty = bool(with_uncertainty)
-            self.survival = surface.reshape(-1, 1) if expanded else surface[:, -1:]
-            self.survival_se = (
-                np.full((n_new * t_grid.size, 1), 0.05)
-                if expanded and with_uncertainty
-                else None
-            )
+
+        def survival_at(self, times):
+            np.testing.assert_allclose(times, 1.0 + t_grid)
+            return surface
+
+        def survival_se_at(self, times):
+            np.testing.assert_allclose(times, 1.0 + t_grid)
+            if not self.with_uncertainty:
+                return None
+            return np.full((n_new, t_grid.size), 0.05)
 
     class _Model:
         def predict(self, df_new, *, with_uncertainty=False):
-            if df_new.shape[0] == n_new * t_grid.size:
-                np.testing.assert_allclose(
-                    df_new["exit"].to_numpy(),
-                    1.0 + np.tile(t_grid, n_new),
-                )
-                return _Prediction(with_uncertainty=with_uncertainty, expanded=True)
             assert df_new.shape[0] == n_new
             np.testing.assert_allclose(
                 df_new["exit"].to_numpy(),
                 np.full(n_new, 1.0 + np.max(t_grid)),
             )
-            return _Prediction(with_uncertainty=with_uncertainty, expanded=False)
+            return _Prediction(with_uncertainty=with_uncertainty)
 
     fit = _SubmodelFit(
         model=_Model(),
@@ -313,8 +316,12 @@ def test_survival_se_requires_gamfit_uncertainty():
     class _NoSePrediction:
         def __init__(self, n_rows: int):
             self.n_rows = int(n_rows)
-            self.survival = np.full((n_rows, 1), 0.8, dtype=float)
-            self.survival_se = None
+
+        def survival_at(self, times):
+            return np.full((self.n_rows, len(times)), 0.8, dtype=float)
+
+        def survival_se_at(self, times):
+            return None
 
     class _NoSeModel:
         def predict(self, df_new, *, with_uncertainty=False):

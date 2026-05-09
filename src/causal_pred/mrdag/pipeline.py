@@ -481,9 +481,8 @@ def run_mrdag(
 ) -> MrDAGResult:
     """Run MrDAG on an IVW summary-statistics object.
 
-    Accepts either a simulated ``GWASSummary`` or a literature-based
-    ``RealGWASSummary``; both expose ``exposures``, ``outcomes``,
-    ``betas``, ``ses``, ``n_snps``.
+    Expects a :class:`causal_pred.data.gwas.GWASSummary`-shaped object
+    exposing ``exposures``, ``outcomes``, ``betas``, ``ses``, ``n_snps``.
     """
     if rng is None:
         rng = np.random.default_rng(0)

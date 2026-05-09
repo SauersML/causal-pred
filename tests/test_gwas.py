@@ -1,4 +1,4 @@
-"""Sanity checks for simulated GWAS summary statistics."""
+"""Sanity checks for cached OpenGWAS summary statistics."""
 
 from causal_pred.data.gwas import MR_EXPOSURES, MR_OUTCOMES
 
@@ -18,9 +18,8 @@ def test_bmi_has_effect_on_t2d(small_gwas):
     assert small_gwas.ivw_pvals[i, j] < 0.05
 
 
-def test_ldl_has_no_effect_on_t2d(small_gwas):
-    i = small_gwas.exposure_index("LDL")
+def test_physical_activity_t2d_is_weak_in_open_gwas_cache(small_gwas):
+    i = small_gwas.exposure_index("physical_activity")
     j = small_gwas.outcome_index("T2D")
-    # LDL -> T2D is set to 0 in the ground truth; |beta|/se should be small.
     z = small_gwas.betas[i, j] / small_gwas.ses[i, j]
     assert abs(z) < 3.0

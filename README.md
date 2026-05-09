@@ -3,9 +3,9 @@
 End-to-end implementation of the project proposed in `paper/main.tex`: predict
 disease *and* its causes on biobank-scale individual-level data, with explicit
 structural uncertainty over DAG parent sets. The gamfit survival backend
-fits right-censored location-scale survival models and reports gamfit
-delta-method response-scale uncertainty, which is combined with structural
-parent-set uncertainty.
+fits right-censored Gompertz-Makeham GAMLSS survival models through gamfit and
+reports gamfit delta-method response-scale uncertainty, which is combined with
+structural parent-set uncertainty.
 
 Target disease: **Type 2 Diabetes (T2D)**. T2D has well-characterised causal
 parents (BMI, HbA1c, lifestyle, genetic risk), strong Mendelian-randomisation
@@ -15,8 +15,7 @@ which makes the validation framework meaningful even on synthetic data.
 ## Documentation
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — module map, data flow, and
-  extension points (add a new disease, swap the GAM backend, retarget at a
-  different biobank).
+  extension points (add a new disease, retarget at a different biobank).
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — install, run, regenerate, troubleshoot.
 - [`docs/MATHEMATICAL_NOTES.md`](docs/MATHEMATICAL_NOTES.md) — equation-level
   transcription of MrDAG and DAGSLAM with all approximations labelled.

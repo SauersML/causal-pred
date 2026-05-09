@@ -21,7 +21,9 @@ This module only declares:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Tuple
+from functools import cache
+from pathlib import Path
+from typing import Dict, Sequence, Tuple
 
 import numpy as np
 
@@ -104,9 +106,57 @@ class GWASSummary:
         return self.outcomes.index(name)
 
 
+def _repo_mr_cache_dir() -> Path:
+    return Path(__file__).resolve().parents[3] / "data" / "mr_cache"
+
+
+@cache
+def _cached_open_gwas_summary(
+    exposures: Tuple[str, ...],
+    outcomes: Tuple[str, ...],
+) -> GWASSummary:
+    from .opengwas import OpenGWASClient, load_live_gwas
+
+    summary = load_live_gwas(
+        exposures=exposures,
+        outcomes=outcomes,
+        client=OpenGWASClient(token=None),
+        cache_dir=_repo_mr_cache_dir(),
+        drop_circular=True,
+    )
+    usable = np.isfinite(summary.betas) & np.isfinite(summary.ses) & (summary.ses > 0.0)
+    if not np.any(usable):
+        raise RuntimeError(
+            "cached OpenGWAS MR summaries are unavailable; expected usable IVW cells "
+            f"under {_repo_mr_cache_dir()}"
+        )
+    return summary
+
+
+def simulate_gwas(
+    exposures: Sequence[str] = MR_EXPOSURES,
+    outcomes: Sequence[str] = MR_OUTCOMES,
+) -> GWASSummary:
+    """Return cached OpenGWAS IVW total-effect summaries in GWASSummary form."""
+    exposures = tuple(exposures)
+    outcomes = tuple(outcomes)
+    summary = _cached_open_gwas_summary(exposures, outcomes)
+    return GWASSummary(
+        exposures=exposures,
+        outcomes=outcomes,
+        betas=np.array(summary.betas, dtype=float, copy=True),
+        ses=np.array(summary.ses, dtype=float, copy=True),
+        ivw_pvals=np.array(summary.ivw_pvals, dtype=float, copy=True),
+        n_snps=np.array(summary.n_snps, dtype=int, copy=True),
+        citations=dict(summary.citations),
+        circular_pairs=tuple(summary.circular_pairs),
+    )
+
+
 __all__ = [
     "GWASSummary",
     "MR_EXPOSURES",
     "MR_OUTCOMES",
     "CIRCULAR_PAIRS",
+    "simulate_gwas",
 ]

@@ -35,15 +35,12 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
+from pathlib import Path
+
 from .data.nodes import NODE_INDEX, NODE_NAMES, NODE_TYPES, NODES, CANONICAL_EDGES
 from .data.synthetic import SyntheticDataset
-from .data.gwas import simulate_gwas
-from .data.real_gwas import (
-    PUBLISHED_MR,
-    LITERATURE_UNAVAILABLE,
-    CIRCULAR_PAIRS,
-    load_real_gwas,
-)
+from .data.gwas import CIRCULAR_PAIRS
+from .data.opengwas import load_live_gwas
 from .dagslam import run_dagslam
 from .mcmc import run_structure_mcmc
 from .mrdag import run_mrdag
@@ -457,12 +454,16 @@ def run_naive_logistic(
 # ---------------------------------------------------------------------------
 
 
+def _benchmark_mr_cache_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "data" / "mr_cache"
+
+
 def _build_mr_edge_scores(
     node_names: Sequence[str] = NODE_NAMES,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build three (p, p) matrices from PUBLISHED_MR: ``|z|``, ``beta``
-    and ``p-value``.  NaN where no published estimate is available."""
-    from scipy.stats import norm
+    """Build three (p, p) matrices from the cached OpenGWAS two-sample MR run:
+    ``|z|``, ``beta`` and ``p-value``.  NaN where no usable IVW cell exists."""
+    summary = load_live_gwas(cache_dir=_benchmark_mr_cache_dir())
 
     p = len(node_names)
     idx = {n: i for i, n in enumerate(node_names)}
@@ -470,18 +471,20 @@ def _build_mr_edge_scores(
     beta = np.full((p, p), np.nan)
     pvals = np.full((p, p), np.nan)
 
-    for (exp_name, out_name), entry in PUBLISHED_MR.items():
-        if entry is LITERATURE_UNAVAILABLE:
+    for a, exp_name in enumerate(summary.exposures):
+        if exp_name not in idx:
             continue
-        if exp_name not in idx or out_name not in idx:
-            continue
-        b, se, _L, _cite = entry
-        if se <= 0 or not np.isfinite(b):
-            continue
-        i, j = idx[exp_name], idx[out_name]
-        z_abs[i, j] = abs(b / se)
-        beta[i, j] = b
-        pvals[i, j] = 2.0 * (1.0 - norm.cdf(abs(b / se)))
+        for b_idx, out_name in enumerate(summary.outcomes):
+            if out_name not in idx:
+                continue
+            b = float(summary.betas[a, b_idx])
+            se = float(summary.ses[a, b_idx])
+            if not (np.isfinite(b) and np.isfinite(se)) or se <= 0.0:
+                continue
+            i, j = idx[exp_name], idx[out_name]
+            z_abs[i, j] = abs(b / se)
+            beta[i, j] = b
+            pvals[i, j] = float(summary.ivw_pvals[a, b_idx])
 
     return z_abs, beta, pvals
 
@@ -493,12 +496,12 @@ def run_mr_ivw(
 ) -> dict:
     """Naive MR-IVW edge classifier.
 
-    For each exposure->outcome pair with a published IVW estimate, we
+    For each exposure->outcome pair with a cached OpenGWAS IVW estimate, we
     declare an edge present if ``p < alpha / n_tests`` (Bonferroni).  The
     continuous score used for AUROC/AUPRC is ``|z|`` (the absolute
     IVW-derived Wald statistic).
 
-    Cells with no published estimate are left NaN and excluded from both
+    Cells with no cached OpenGWAS IVW estimate are left NaN and excluded from both
     the predictions and the ground-truth set.  Circular pairs
     (HbA1c -> T2D) are also excluded.
     """
@@ -518,7 +521,10 @@ def run_mr_ivw(
     # Bonferroni cut-off across tested cells.
     n_tests = int(usable.sum())
     if n_tests == 0:
-        raise RuntimeError("no usable MR-IVW cells; check PUBLISHED_MR")
+        raise RuntimeError(
+            "no usable MR-IVW cells from the OpenGWAS cache; "
+            f"populate {_benchmark_mr_cache_dir()} or set OPENGWAS_JWT"
+        )
     thresh = alpha / n_tests
 
     A = np.zeros((p, p), dtype=bool)
@@ -569,32 +575,31 @@ def run_causal_pred(
     mcmc_iter: int = 500,
     mcmc_chains: int = 1,
     gam_samples: int = 100,
-    use_real_gwas: bool = True,
     t_grid: np.ndarray = DEFAULT_T_GRID,
     auc_times: Sequence[float] = DEFAULT_AUC_TIMES,
     rng: Optional[np.random.Generator] = None,
 ) -> dict:
-    """Run the causal-pred stack on the synthetic benchmark data.
+    """Run the causal-pred stack on the benchmark data.
 
-    The benchmark uses the same model families as production while keeping
-    the input synthetic-data native: MrDAG supplies edge priors, DAGSLAM
-    gives a warm-start DAG, structure MCMC samples parent sets, and gamfit
-    fits held-out survival curves for the sampled T2D parent sets.
+    The benchmark uses the same model families as production: MrDAG supplies
+    edge priors (from cached OpenGWAS two-sample MR), DAGSLAM gives a
+    warm-start DAG, structure MCMC samples parent sets, and gamfit fits
+    held-out survival curves for the sampled T2D parent sets.
     """
     t0 = time.perf_counter()
     if rng is None:
         rng = np.random.default_rng(20260416)
     if tuple(data.columns) != tuple(NODE_NAMES):
-        raise ValueError("causal-pred benchmark requires synthetic NODE_NAMES order")
+        raise ValueError("causal-pred benchmark requires NODE_NAMES order")
     if tuple(data.node_types) != tuple(NODE_TYPES):
-        raise ValueError("causal-pred benchmark requires synthetic NODE_TYPES")
+        raise ValueError("causal-pred benchmark requires NODE_TYPES")
 
     train_idx, test_idx = _train_test_indices(data.event)
     X_train = np.asarray(data.X[train_idx], dtype=float)
     X_test = np.asarray(data.X[test_idx], dtype=float)
     allowed_edges = _benchmark_allowed_edges(data.columns, data.node_types)
 
-    gwas = load_real_gwas() if use_real_gwas else simulate_gwas()
+    gwas = load_live_gwas(cache_dir=_benchmark_mr_cache_dir())
     mrdag_iter = max(80, min(1000, int(mcmc_iter) * 4))
     mrdag_burn = max(20, min(mrdag_iter // 2, mrdag_iter // 5))
     mrdag_thin = max(1, (mrdag_iter - mrdag_burn) // max(20, int(mcmc_iter)))
@@ -681,8 +686,6 @@ def run_causal_pred(
             train_X_ps,
             columns=cols,
             n_uncertainty_slices=max(1, int(gam_samples)),
-            location_formula="1",
-            noise_formula=" + ".join(cols) if cols else "1",
             progress=False,
         )
         per_model.append(fit.predict_survival_mean(test_X_ps, t_grid))
@@ -723,7 +726,7 @@ def run_causal_pred(
             "n_test": int(test_idx.size),
             "runtime_s": float(time.perf_counter() - t0),
             "gam_runtime_s": float(time.perf_counter() - gam_t0),
-            "gwas_source": "literature" if use_real_gwas else "opengwas_cache",
+            "gwas_source": "opengwas_cache",
             "mrdag_n_candidate_edges": int(
                 mrdag.diagnostics.get("n_candidate_edges", 0)
             ),
@@ -826,7 +829,6 @@ def run_all_baselines(
     mcmc_iter: int = 500,
     mcmc_chains: int = 1,
     gam_samples: int = 100,
-    use_real_gwas: bool = True,
     rng: Optional[np.random.Generator] = None,
 ) -> dict:
     """Run every baseline on ``data`` and return a dict keyed by model."""
@@ -841,7 +843,6 @@ def run_all_baselines(
         mcmc_iter=mcmc_iter,
         mcmc_chains=mcmc_chains,
         gam_samples=gam_samples,
-        use_real_gwas=use_real_gwas,
         t_grid=t_grid,
         auc_times=auc_times,
         rng=rng,

@@ -2,6 +2,7 @@
 
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -29,6 +30,10 @@ def medium_data():
 
 @pytest.fixture
 def small_gwas():
-    from causal_pred.data.gwas import simulate_gwas
+    from causal_pred.data.opengwas import OpenGWASClient, load_live_gwas
 
-    return simulate_gwas()
+    cache_dir = Path(ROOT) / "data" / "mr_cache"
+    return load_live_gwas(
+        client=OpenGWASClient(token=None),
+        cache_dir=cache_dir,
+    )

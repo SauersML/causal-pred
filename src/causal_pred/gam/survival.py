@@ -1,10 +1,10 @@
 """Survival GAM wrapper over the gamfit Python library.
 
 The module is intentionally a thin wrapper over ``gamfit`` (PyO3 bindings to
-SauersML/gam's Rust engine). gamfit fits the right-censored Weibull survival
-GAM and evaluates survival curves at requested horizons. Within-model
-response-scale uncertainty is not exposed by gamfit for this likelihood, so
-pipeline intervals are explicitly structural-only across parent sets.
+SauersML/gam's Rust engine). gamfit fits the right-censored
+Gompertz-Makeham GAMLSS survival model and evaluates survival curves and
+response-scale standard errors at requested horizons. Bayesian model averaging
+adds structural uncertainty across parent sets.
 """
 
 from __future__ import annotations
@@ -16,16 +16,19 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import gamfit as gam
 import numpy as np
 import pandas as pd
+from scipy.special import ndtri
 
 
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[str], None]
 
 _SURVIVAL_ENTRY_ORIGIN = 1.0
-_SURVIVAL_LIKELIHOOD = "weibull"
-_SURVIVAL_MODEL_FAMILY = "weibull"
-_UNCERTAINTY_MODE = "structural_only_gamfit_weibull_point_estimate"
-_UNCERTAINTY_SOURCE = "gamfit.SurvivalPrediction.survival_at"
+_SURVIVAL_LIKELIHOOD = "location-scale"
+_SURVIVAL_BASELINE_TARGET = "gompertz-makeham"
+_SURVIVAL_NOISE_FORMULA = "1"
+_SURVIVAL_MODEL_FAMILY = "gamlss-gompertz-makeham"
+_UNCERTAINTY_MODE = "gamfit_gompertz_makeham_gamlss_delta_method_response_se"
+_UNCERTAINTY_SOURCE = "gamfit.SurvivalPrediction.survival_se_at"
 
 
 def _progress_callback(progress: bool | ProgressCallback) -> Optional[ProgressCallback]:
@@ -51,6 +54,8 @@ class _SubmodelFit:
     formula: str
     train_summary: Dict[str, Any]
     survival_likelihood: str = _SURVIVAL_LIKELIHOOD
+    baseline_target: str = _SURVIVAL_BASELINE_TARGET
+    noise_formula: str = _SURVIVAL_NOISE_FORMULA
     x_center: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=float))
     x_scale: np.ndarray = field(default_factory=lambda: np.ones(0, dtype=float))
 
@@ -62,7 +67,7 @@ def _fit_gam(
     columns: Tuple[str, ...],
     progress: bool | ProgressCallback = False,
 ) -> _SubmodelFit:
-    """Fit a gamfit Weibull survival model."""
+    """Fit a gamfit Gompertz-Makeham GAMLSS survival model."""
 
     time = np.asarray(time, dtype=float)
     event = np.asarray(event, dtype=float)
@@ -111,9 +116,16 @@ def _fit_gam(
             "fit start "
             f"n={time.shape[0]} events={int(np.sum(event > 0.0))} "
             f"p={len(columns)} likelihood={_SURVIVAL_LIKELIHOOD} "
-            f"formula={formula}"
+            f"baseline={_SURVIVAL_BASELINE_TARGET} formula={formula} "
+            f"noise_formula={_SURVIVAL_NOISE_FORMULA}"
         )
-    model = gam.fit(df, formula, survival_likelihood=_SURVIVAL_LIKELIHOOD)
+    model = gam.fit(
+        df,
+        formula,
+        survival_likelihood=_SURVIVAL_LIKELIHOOD,
+        baseline_target=_SURVIVAL_BASELINE_TARGET,
+        config={"noise_formula": _SURVIVAL_NOISE_FORMULA},
+    )
     train_summary: Dict[str, Any] = dict(model.summary().to_dict())
     if emit is not None:
         summary_items = []
@@ -139,6 +151,8 @@ def _fit_gam(
         formula=formula,
         train_summary=train_summary,
         survival_likelihood=_SURVIVAL_LIKELIHOOD,
+        baseline_target=_SURVIVAL_BASELINE_TARGET,
+        noise_formula=_SURVIVAL_NOISE_FORMULA,
         x_center=x_center.astype(float, copy=True),
         x_scale=x_scale.astype(float, copy=True),
     )
@@ -220,32 +234,86 @@ def _validate_gamfit_surface(
     return arr
 
 
+def _predict_survival_grid(
+    fit: _SubmodelFit,
+    X_new: np.ndarray,
+    t_grid: np.ndarray,
+    *,
+    with_uncertainty: bool,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    X_new, t_grid, n_new, n_t = _shape_prediction_inputs(fit, X_new, t_grid)
+    if n_new == 0 or n_t == 0:
+        empty = np.zeros((n_new, n_t), dtype=float)
+        return empty, empty if with_uncertainty else None
+    pred = fit.model.predict(
+        _prediction_frame(fit, X_new, t_grid),
+        with_uncertainty=with_uncertainty,
+    )
+    backend_t_grid = _SURVIVAL_ENTRY_ORIGIN + t_grid
+    S_mean = _validate_gamfit_surface(
+        pred.survival_at(backend_t_grid),
+        n_new=n_new,
+        n_t=n_t,
+        label="survival",
+    )
+    S_mean = np.minimum.accumulate(np.clip(S_mean, 0.0, 1.0), axis=1)
+    if not with_uncertainty:
+        return S_mean, None
+    values = pred.survival_se_at(backend_t_grid)
+    if values is None:
+        raise RuntimeError("gamfit did not return survival_se for survival prediction")
+    S_se = _validate_gamfit_surface(
+        values,
+        n_new=n_new,
+        n_t=n_t,
+        label="survival_se",
+    )
+    return S_mean, np.clip(S_se, 0.0, None)
+
+
 def _predict_survival_matrix(
     fit: _SubmodelFit,
     X_new: np.ndarray,
     t_grid: np.ndarray,
 ) -> np.ndarray:
-    X_new, t_grid, n_new, n_t = _shape_prediction_inputs(fit, X_new, t_grid)
-    if n_new == 0 or n_t == 0:
-        return np.zeros((n_new, n_t), dtype=float)
-    pred = fit.model.predict(_prediction_frame(fit, X_new, t_grid))
-    S_mean = _validate_gamfit_surface(
-        pred.survival_at(_SURVIVAL_ENTRY_ORIGIN + t_grid),
-        n_new=n_new,
-        n_t=n_t,
-        label="survival",
+    S_mean, _S_se = _predict_survival_grid(
+        fit,
+        X_new,
+        t_grid,
+        with_uncertainty=False,
     )
-    return np.minimum.accumulate(np.clip(S_mean, 0.0, 1.0), axis=1)
+    return S_mean
+
+
+def _predict_survival_surfaces(
+    fit: _SubmodelFit,
+    X_new: np.ndarray,
+    t_grid: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    S_mean, S_se = _predict_survival_grid(
+        fit,
+        X_new,
+        t_grid,
+        with_uncertainty=True,
+    )
+    if S_se is None:
+        raise RuntimeError("gamfit did not return survival_se for survival prediction")
+    return S_mean, S_se
 
 
 @dataclass
 class SurvivalGAM:
-    """Fitted gamfit survival model."""
+    """Fitted gamfit Gompertz-Makeham GAMLSS survival model."""
 
     columns: Tuple[str, ...]
     diagnostics: Dict[str, Any]
     _fit: Optional[_SubmodelFit] = field(repr=False, default=None)
+    _n_uncertainty_slices: int = 200
     _mean_cache: Dict[int, np.ndarray] = field(default_factory=dict, repr=False)
+    _uncertainty_cache: Dict[int, tuple[np.ndarray, np.ndarray]] = field(
+        default_factory=dict,
+        repr=False,
+    )
 
     def _prediction_cache_key(self, X_new: np.ndarray, t_grid: np.ndarray) -> int:
         return hash((X_new.tobytes(), X_new.shape, t_grid.tobytes(), t_grid.shape))
@@ -277,10 +345,35 @@ class SurvivalGAM:
         self._mean_cache[key] = mean
         return mean
 
+    def _cached_predict(
+        self,
+        X_new: np.ndarray,
+        t_grid: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if self._fit is None:
+            raise RuntimeError("SurvivalGAM has no fit attached")
+        X_new = np.ascontiguousarray(X_new, dtype=float)
+        t_grid = np.ascontiguousarray(t_grid, dtype=float)
+        key = self._prediction_cache_key(X_new, t_grid)
+        cached = self._uncertainty_cache.get(key)
+        if cached is not None:
+            return cached
+        surfaces = _predict_survival_surfaces(self._fit, X_new, t_grid)
+        self._uncertainty_cache[key] = surfaces
+        self._mean_cache[key] = surfaces[0]
+        return surfaces
+
     def predict_survival(self, X_new: np.ndarray, t_grid: np.ndarray) -> np.ndarray:
         X_new = self._shape_X_new(X_new)
         t_grid = np.asarray(t_grid, dtype=float).ravel()
-        return self._cached_mean(X_new, t_grid)[None, :, :].copy()
+        n_slices = max(int(self._n_uncertainty_slices), 1)
+        S_mean, S_se = self._cached_predict(X_new, t_grid)
+        if n_slices == 1:
+            return S_mean[None, :, :].copy()
+        probs = (np.arange(n_slices, dtype=float) + 0.5) / float(n_slices)
+        z = ndtri(probs)
+        S = S_mean[None, :, :] + z[:, None, None] * S_se[None, :, :]
+        return np.minimum.accumulate(np.clip(S, 0.0, 1.0), axis=2)
 
     def predict_survival_mean(
         self, X_new: np.ndarray, t_grid: np.ndarray
@@ -289,12 +382,19 @@ class SurvivalGAM:
         t_grid = np.asarray(t_grid, dtype=float).ravel()
         return self._cached_mean(X_new, t_grid).copy()
 
+    def predict_survival_se(self, X_new: np.ndarray, t_grid: np.ndarray) -> np.ndarray:
+        X_new = self._shape_X_new(X_new)
+        t_grid = np.asarray(t_grid, dtype=float).ravel()
+        _S_mean, S_se = self._cached_predict(X_new, t_grid)
+        return S_se.copy()
+
     def predict_survival_variance(
         self,
         X_new: np.ndarray,
         t_grid: np.ndarray,
     ) -> np.ndarray:
-        return np.zeros_like(self.predict_survival_mean(X_new, t_grid))
+        S_se = self.predict_survival_se(X_new, t_grid)
+        return S_se * S_se
 
     def predict_median_survival(self, X_new: np.ndarray) -> np.ndarray:
         X_new = self._shape_X_new(X_new)
@@ -338,11 +438,13 @@ class SurvivalGAM:
 
     def uncertainty_summary(self) -> dict:
         d = dict(self.diagnostics)
-        d["prediction_slices"] = 1
+        d["n_uncertainty_slices"] = int(self._n_uncertainty_slices)
         d["uncertainty_mode"] = _UNCERTAINTY_MODE
         d["uncertainty_source"] = _UNCERTAINTY_SOURCE
         if self._fit is not None:
             d["survival_likelihood"] = self._fit.survival_likelihood
+            d["baseline_target"] = self._fit.baseline_target
+            d["noise_formula"] = self._fit.noise_formula
         d["columns"] = list(self.columns)
         return d
 
@@ -352,9 +454,10 @@ def fit_survival_gam(
     event: np.ndarray,
     X: np.ndarray,
     columns: Optional[Tuple[str, ...]] = None,
+    n_uncertainty_slices: int = 1000,
     progress: bool | ProgressCallback = False,
 ) -> SurvivalGAM:
-    """Fit a right-censored survival GAM via the gamfit Python library."""
+    """Fit a right-censored Gompertz-Makeham GAMLSS survival model via gamfit."""
 
     time = np.asarray(time, dtype=float)
     event = np.asarray(event, dtype=float)
@@ -407,6 +510,7 @@ def fit_survival_gam(
         "model_family": _SURVIVAL_MODEL_FAMILY,
         "library_version": gam.build_info().get("version"),
         "formula": fit.formula,
+        "noise_formula": fit.noise_formula,
         "covariate_center": fit.x_center.tolist(),
         "covariate_scale": fit.x_scale.tolist(),
         "train_summary": summ,
@@ -419,12 +523,18 @@ def fit_survival_gam(
         "n_train": fit.n_train,
         "n_events": fit.n_events,
         "survival_likelihood": fit.survival_likelihood,
-        "prediction_slices": 1,
+        "baseline_target": fit.baseline_target,
+        "n_uncertainty_slices": int(n_uncertainty_slices),
         "uncertainty_mode": _UNCERTAINTY_MODE,
         "uncertainty_source": _UNCERTAINTY_SOURCE,
     }
 
-    return SurvivalGAM(columns=columns, diagnostics=diagnostics, _fit=fit)
+    return SurvivalGAM(
+        columns=columns,
+        diagnostics=diagnostics,
+        _fit=fit,
+        _n_uncertainty_slices=int(n_uncertainty_slices),
+    )
 
 
 def bma_survival(

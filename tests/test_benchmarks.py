@@ -168,8 +168,7 @@ def test_survival_metrics_exclude_early_censoring_and_use_time_specific_auc(
 def test_mr_ivw_runs():
     out = run_mr_ivw()
     assert out["model"] == "mr_ivw"
-    # PUBLISHED_MR is literally the ground-truth source for the MR-eligible
-    # edges, so the classifier should easily clear AUPRC > 0.5.
+    # Cached OpenGWAS MR estimates should still enrich known edges strongly.
     assert out["edge_auprc"] > 0.5
     # AUROC should also be above chance.
     assert out["edge_auroc"] > 0.55
@@ -185,7 +184,6 @@ def test_causal_pred_runs_with_gamfit():
         mcmc_iter=5,
         mcmc_chains=1,
         gam_samples=2,
-        use_real_gwas=False,
         rng=np.random.default_rng(12),
     )
 

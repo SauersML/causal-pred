@@ -65,20 +65,18 @@ uv run python scripts/run_full_pipeline.py
 
 The MrDAG prior is built from two-sample IVW estimates over a curated
 trait set (BMI, LDL, HbA1c, SBP, lifetime smoking, physical activity,
-hypertension, T2D, CAD). Source selection is controlled by:
+hypertension, T2D, CAD), produced by
+`src/causal_pred/data/opengwas.py::load_live_gwas`:
 
-- `OPENGWAS_JWT` -- if set, the pipeline runs **live** two-sample IVW
-  via the OpenGWAS REST API (study IDs in
-  `src/causal_pred/data/opengwas.py::OPENGWAS_STUDY_IDS`). Get a token
-  at <https://opengwas.io/profile/>.
-- `MR_GWAS_SOURCE=literature` -- forces the offline fallback table in
-  `src/causal_pred/data/real_gwas.py`.
-- Default: live when a JWT is present, literature otherwise.
-
-Live IVW results are cached per `(exposure, outcome, p, r2, kb, pop)`
-combination under `data/mr_cache/`, so repeat runs do not re-hit the
-API. The MrDAG cache key includes the source label so live and
-literature runs do not collide.
+- `OPENGWAS_JWT` -- required to refresh from the OpenGWAS REST API
+  (study IDs in `OPENGWAS_STUDY_IDS`). Get a token at
+  <https://opengwas.io/profile/>.
+- The on-disk cache under `data/mr_cache/` is keyed by
+  `(exposure, outcome, p, r2, kb)` so repeat runs do not re-hit the
+  API; an empty `OPENGWAS_JWT` is fine as long as the relevant cells
+  are already cached.
+- If neither cache nor token yields a usable cell the pipeline raises
+  immediately. There is no fabricated fallback.
 
 ## Paper rebuild
 
@@ -170,10 +168,10 @@ The `SauersML/gam` Rust extension did not build. Run:
 
 ```sh
 rustup default stable
-uv sync --dev --reinstall-package gam
+uv sync --dev --reinstall-package gamfit
 ```
 
-Do NOT swap in the legacy pure-Python GAM library; see CLAUDE.md.
+Use `gamfit`; do not swap in the legacy pure-Python GAM library.
 
 ### `gnomon` missing
 The wrapper raises `NotImplementedError` naming the missing binary. Install
