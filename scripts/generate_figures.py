@@ -6,11 +6,10 @@ Reads the standard files under ``outputs/`` and writes figures to
 
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 
 import numpy as np
 
@@ -19,6 +18,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+OUTPUTS_DIR = ROOT / "outputs"
+PLOTS_DIR = OUTPUTS_DIR / "plots"
 
 from causal_pred import plots  # noqa: E402
 from causal_pred.pipeline import _known_edges_for_columns  # noqa: E402
@@ -74,17 +76,9 @@ def _survival_fan_samples(outputs_dir: Path) -> tuple[Optional[np.ndarray], Opti
     return t_grid, np.clip(samples, 0.0, 1.0)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="generate_figures",
-        description="Render PNG/PDF figures from pipeline output artifacts.",
-    )
-    parser.add_argument("--outputs-dir", default=str(ROOT / "outputs"))
-    parser.add_argument("--plots-dir", default=None)
-    args = parser.parse_args(argv)
-
-    outputs_dir = Path(args.outputs_dir)
-    plots_dir = Path(args.plots_dir) if args.plots_dir else outputs_dir / "plots"
+def main() -> int:
+    outputs_dir = OUTPUTS_DIR
+    plots_dir = PLOTS_DIR
     summary = _load_json(outputs_dir / "summary.json")
     columns = [str(c) for c in summary.get("columns", [])]
     node_types = [str(t) for t in summary.get("node_types", [])]

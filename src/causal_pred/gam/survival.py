@@ -53,6 +53,7 @@ class _SubmodelFit:
     n_events: int
     formula: str
     train_summary: Dict[str, Any]
+    location_formula: str = "1"
     survival_likelihood: str = _SURVIVAL_LIKELIHOOD
     baseline_target: str = _SURVIVAL_BASELINE_TARGET
     noise_formula: str = _SURVIVAL_NOISE_FORMULA
@@ -66,6 +67,8 @@ def _fit_gam(
     X: np.ndarray,
     columns: Tuple[str, ...],
     progress: bool | ProgressCallback = False,
+    location_formula: Optional[str] = None,
+    noise_formula: Optional[str] = None,
 ) -> _SubmodelFit:
     """Fit a gamfit Gompertz-Makeham GAMLSS survival model."""
 
@@ -91,7 +94,13 @@ def _fit_gam(
     if not np.all(np.isfinite(X)):
         raise ValueError("survival GAM covariates must be finite")
 
-    formula = f"Surv(entry, exit, event) ~ {_build_survival_formula(columns)}"
+    location_rhs = (
+        _build_survival_formula(columns)
+        if location_formula is None
+        else str(location_formula)
+    )
+    sigma_rhs = _SURVIVAL_NOISE_FORMULA if noise_formula is None else str(noise_formula)
+    formula = f"Surv(entry, exit, event) ~ {location_rhs}"
     if X.shape[1] > 0:
         x_center = X.mean(axis=0)
         x_scale = X.std(axis=0)
@@ -117,14 +126,14 @@ def _fit_gam(
             f"n={time.shape[0]} events={int(np.sum(event > 0.0))} "
             f"p={len(columns)} likelihood={_SURVIVAL_LIKELIHOOD} "
             f"baseline={_SURVIVAL_BASELINE_TARGET} formula={formula} "
-            f"noise_formula={_SURVIVAL_NOISE_FORMULA}"
+            f"noise_formula={sigma_rhs}"
         )
     model = gam.fit(
         df,
         formula,
         survival_likelihood=_SURVIVAL_LIKELIHOOD,
         baseline_target=_SURVIVAL_BASELINE_TARGET,
-        config={"noise_formula": _SURVIVAL_NOISE_FORMULA},
+        config={"noise_formula": sigma_rhs},
     )
     train_summary: Dict[str, Any] = dict(model.summary().to_dict())
     if emit is not None:
@@ -149,10 +158,11 @@ def _fit_gam(
         n_train=int(time.shape[0]),
         n_events=int(np.sum(event > 0.0)),
         formula=formula,
+        location_formula=location_rhs,
         train_summary=train_summary,
         survival_likelihood=_SURVIVAL_LIKELIHOOD,
         baseline_target=_SURVIVAL_BASELINE_TARGET,
-        noise_formula=_SURVIVAL_NOISE_FORMULA,
+        noise_formula=sigma_rhs,
         x_center=x_center.astype(float, copy=True),
         x_scale=x_scale.astype(float, copy=True),
     )
@@ -456,6 +466,8 @@ def fit_survival_gam(
     columns: Optional[Tuple[str, ...]] = None,
     n_uncertainty_slices: int = 1000,
     progress: bool | ProgressCallback = False,
+    location_formula: Optional[str] = None,
+    noise_formula: Optional[str] = None,
 ) -> SurvivalGAM:
     """Fit a right-censored Gompertz-Makeham GAMLSS survival model via gamfit."""
 
@@ -470,7 +482,15 @@ def fit_survival_gam(
         columns = tuple(f"x{i}" for i in range(X.shape[1]))
     columns = tuple(columns)
 
-    fit = _fit_gam(time, event, X, columns, progress=progress)
+    fit = _fit_gam(
+        time,
+        event,
+        X,
+        columns,
+        progress=progress,
+        location_formula=location_formula,
+        noise_formula=noise_formula,
+    )
     summ = fit.train_summary or {}
 
     def _summary_float(key: str, default: float = float("nan")) -> float:
@@ -510,6 +530,7 @@ def fit_survival_gam(
         "model_family": _SURVIVAL_MODEL_FAMILY,
         "library_version": gam.build_info().get("version"),
         "formula": fit.formula,
+        "location_formula": fit.location_formula,
         "noise_formula": fit.noise_formula,
         "covariate_center": fit.x_center.tolist(),
         "covariate_scale": fit.x_scale.tolist(),

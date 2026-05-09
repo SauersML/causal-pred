@@ -2,12 +2,11 @@
 
 Run with
 
-    uv run python scripts/benchmark.py \
-        --n 1000 --mcmc-iter 500 --gam-samples 100
+    uv run python scripts/benchmark.py
 
-Writes ``outputs/benchmarks.json`` (the full metrics table) and, unless
-``--no-plots`` is passed, ``outputs/benchmarks.png`` (a bar chart
-comparing the numeric metrics across baselines).
+Writes ``outputs/benchmarks.json`` (the full metrics table) and
+``outputs/benchmarks.png`` (a bar chart comparing the numeric metrics
+across baselines).
 
 Baselines included:
   * Kaplan-Meier (no covariates)
@@ -19,7 +18,6 @@ Baselines included:
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import subprocess
@@ -41,6 +39,13 @@ from causal_pred.benchmarks import (  # noqa: E402
     DEFAULT_AUC_TIMES,
     run_all_baselines,
 )
+
+N = 1000
+SEED = 20260416
+MCMC_ITER = 500
+MCMC_CHAINS = 1
+GAM_SAMPLES = 100
+OUTPUT_DIR = os.path.join(ROOT, "outputs")
 
 
 def _json_sanitise(obj: Any) -> Any:
@@ -112,63 +117,46 @@ def _bar_chart(baselines: Dict[str, dict], out_path: str) -> None:
     plt.close(fig)
 
 
-def main(argv: list | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument(
-        "--n", type=int, default=1000, help="number of synthetic individuals"
-    )
-    parser.add_argument(
-        "--seed", type=int, default=20260416, help="numpy RNG seed for the simulator"
-    )
-    parser.add_argument("--mcmc-iter", type=int, default=500)
-    parser.add_argument("--mcmc-chains", type=int, default=1)
-    parser.add_argument("--gam-samples", type=int, default=100)
-    parser.add_argument("--output-dir", type=str, default=os.path.join(ROOT, "outputs"))
-    parser.add_argument("--no-plots", action="store_true")
-    parser.add_argument("--quiet", action="store_true")
-    args = parser.parse_args(argv)
+def main() -> int:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    rng = np.random.default_rng(args.seed)
+    rng = np.random.default_rng(SEED)
     t0 = time.perf_counter()
-    data = simulate(n=args.n, rng=rng)
+    data = simulate(n=N, rng=rng)
 
-    if not args.quiet:
-        print(
-            f"[bench] dataset n={data.n} p={data.p} event_rate={data.event.mean():.3f}"
-        )
+    print(
+        f"[bench] dataset n={data.n} p={data.p} event_rate={data.event.mean():.3f}"
+    )
 
     baselines = run_all_baselines(
         data,
         t_grid=DEFAULT_T_GRID,
         auc_times=DEFAULT_AUC_TIMES,
-        mcmc_iter=args.mcmc_iter,
-        mcmc_chains=args.mcmc_chains,
-        gam_samples=args.gam_samples,
-        rng=np.random.default_rng(args.seed + 1),
+        mcmc_iter=MCMC_ITER,
+        mcmc_chains=MCMC_CHAINS,
+        gam_samples=GAM_SAMPLES,
+        rng=np.random.default_rng(SEED + 1),
     )
 
-    if not args.quiet:
-        for name, m in baselines.items():
-            if m.get("status") in ("skipped", "failed"):
-                print(
-                    f"[bench] {name:<16} {m.get('status'):<8} "
-                    f"({m.get('reason') or m.get('error', '')})"
-                )
-                continue
-            if "edge_auprc" in m and "nagelkerke_at_10y" not in m:
-                print(
-                    f"[bench] {name:<16} edge_AUROC={m.get('edge_auroc'):.3f} "
-                    f"edge_AUPRC={m.get('edge_auprc'):.3f}"
-                )
-            else:
-                r2 = m.get("nagelkerke_at_10y", float("nan"))
-                ia = m.get("time_dep_auc", {}).get("integrated_auc", float("nan"))
-                ibs = m.get("ibs", float("nan"))
-                print(
-                    f"[bench] {name:<16} R2@10y={r2:.3f} td-AUC={ia:.3f} IBS={ibs:.3f}"
-                )
+    for name, m in baselines.items():
+        if m.get("status") in ("skipped", "failed"):
+            print(
+                f"[bench] {name:<16} {m.get('status'):<8} "
+                f"({m.get('reason') or m.get('error', '')})"
+            )
+            continue
+        if "edge_auprc" in m and "nagelkerke_at_10y" not in m:
+            print(
+                f"[bench] {name:<16} edge_AUROC={m.get('edge_auroc'):.3f} "
+                f"edge_AUPRC={m.get('edge_auprc'):.3f}"
+            )
+        else:
+            r2 = m.get("nagelkerke_at_10y", float("nan"))
+            ia = m.get("time_dep_auc", {}).get("integrated_auc", float("nan"))
+            ibs = m.get("ibs", float("nan"))
+            print(
+                f"[bench] {name:<16} R2@10y={r2:.3f} td-AUC={ia:.3f} IBS={ibs:.3f}"
+            )
 
     report = {
         "dataset": {
@@ -178,26 +166,24 @@ def main(argv: list | None = None) -> int:
         },
         "baselines": baselines,
         "run_config": {
-            "n": args.n,
-            "seed": args.seed,
-            "mcmc_iter": args.mcmc_iter,
-            "mcmc_chains": args.mcmc_chains,
-            "gam_samples": args.gam_samples,
+            "n": N,
+            "seed": SEED,
+            "mcmc_iter": MCMC_ITER,
+            "mcmc_chains": MCMC_CHAINS,
+            "gam_samples": GAM_SAMPLES,
         },
         "git_sha": _git_sha(ROOT),
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "total_runtime_s": float(time.perf_counter() - t0),
     }
 
-    json_path = os.path.join(args.output_dir, "benchmarks.json")
+    json_path = os.path.join(OUTPUT_DIR, "benchmarks.json")
     with open(json_path, "w") as fh:
         json.dump(_json_sanitise(report), fh, indent=2, allow_nan=False)
 
-    if not args.no_plots:
-        _bar_chart(baselines, os.path.join(args.output_dir, "benchmarks.png"))
+    _bar_chart(baselines, os.path.join(OUTPUT_DIR, "benchmarks.png"))
 
-    if not args.quiet:
-        print(f"[bench] wrote {json_path} (total {report['total_runtime_s']:.1f}s)")
+    print(f"[bench] wrote {json_path} (total {report['total_runtime_s']:.1f}s)")
 
     return 0
 

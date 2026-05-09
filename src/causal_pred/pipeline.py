@@ -518,64 +518,188 @@ def _dataframe_values_hash(df: pd.DataFrame) -> str:
     return _array_hash(values)
 
 
-def _file_sha256(path: Path) -> str:
+_SHA256_PROGRESS_BYTES = 512 * 1024 * 1024  # log every 512 MiB
+_SHA256_PROGRESS_FLOOR_BYTES = 256 * 1024 * 1024  # only log progress for files >256 MiB
+
+
+def _file_sha256(
+    path: Path,
+    *,
+    logger: Optional[logging.Logger] = None,
+    label: Optional[str] = None,
+) -> str:
     h = hashlib.sha256()
+    size = path.stat().st_size
+    log_progress = (
+        logger is not None and size >= _SHA256_PROGRESS_FLOOR_BYTES
+    )
+    if log_progress:
+        assert logger is not None
+        logger.info(
+            "[prs]   sha256 %s start size=%.1f MiB",
+            label or path.name,
+            size / (1 << 20),
+        )
+    started = time.time()
+    read_so_far = 0
+    next_progress = _SHA256_PROGRESS_BYTES
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             h.update(chunk)
+            read_so_far += len(chunk)
+            if log_progress and read_so_far >= next_progress:
+                assert logger is not None
+                elapsed = max(time.time() - started, 1e-6)
+                pct = 100.0 * read_so_far / size if size else 100.0
+                logger.info(
+                    "[prs]   sha256 %s progress %.1f%% (%.1f / %.1f MiB) "
+                    "rate=%.1f MiB/s elapsed=%s",
+                    label or path.name,
+                    pct,
+                    read_so_far / (1 << 20),
+                    size / (1 << 20),
+                    (read_so_far / (1 << 20)) / elapsed,
+                    _format_seconds(elapsed),
+                )
+                next_progress += _SHA256_PROGRESS_BYTES
+    if log_progress:
+        assert logger is not None
+        logger.info(
+            "[prs]   sha256 %s done in %s",
+            label or path.name,
+            _format_seconds(time.time() - started),
+        )
     return h.hexdigest()
 
 
-def _file_stat_fingerprint(path: Path) -> dict[str, Any]:
+def _file_stat_fingerprint(
+    path: Path,
+    *,
+    logger: Optional[logging.Logger] = None,
+    label: Optional[str] = None,
+) -> dict[str, Any]:
     st = path.stat()
     return {
         "name": path.name,
         "size": int(st.st_size),
         "mtime_ns": int(st.st_mtime_ns),
-        "sha256": _file_sha256(path),
+        "sha256": _file_sha256(path, logger=logger, label=label),
     }
 
 
-def _plink_stat_fingerprint(bed: Path) -> dict[str, Any]:
+def _plink_stat_fingerprint(
+    bed: Path,
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> dict[str, Any]:
     prefix = bed.with_suffix("")
     files = []
     for suffix in (".bed", ".bim", ".fam"):
         p = prefix.with_suffix(suffix)
-        files.append(_file_stat_fingerprint(p))
+        if logger is not None:
+            logger.info(
+                "[prs]  fingerprinting %s (%.1f MiB)",
+                p,
+                p.stat().st_size / (1 << 20),
+            )
+        t0 = time.time()
+        files.append(_file_stat_fingerprint(p, logger=logger, label=p.name))
+        if logger is not None:
+            logger.info(
+                "[prs]  fingerprinted %s in %s",
+                p.name,
+                _format_seconds(time.time() - t0),
+            )
     return {"prefix": prefix.name, "files": files}
 
 
-def _gnomon_score_cache_filename(bed: Path, score_files: Sequence[Path]) -> str:
-    return (
-        "gnomon-scores-"
-        + _short_hash(
+def _gnomon_score_cache_filename(
+    bed: Path,
+    score_files: Sequence[Path],
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> str:
+    if logger is not None:
+        logger.info(
+            "[prs] fingerprinting genotype PLINK fileset prefix=%s",
+            bed.with_suffix(""),
+        )
+    t0 = time.time()
+    genotype_fp = _plink_stat_fingerprint(bed, logger=logger)
+    if logger is not None:
+        logger.info(
+            "[prs] genotype fingerprint done in %s; fingerprinting scorer",
+            _format_seconds(time.time() - t0),
+        )
+    t_scorer = time.time()
+    scorer_fp = _gnomon_scorer_fingerprint(logger=logger)
+    if logger is not None:
+        logger.info(
+            "[prs] scorer fingerprint done in %s; fingerprinting %d score files",
+            _format_seconds(time.time() - t_scorer),
+            len(score_files),
+        )
+    t_scores = time.time()
+    sorted_files = sorted(score_files, key=lambda x: x.name)
+    score_fp = []
+    total = len(sorted_files)
+    log_every = max(1, total // 10) if logger is not None else total + 1
+    for idx, p in enumerate(sorted_files, start=1):
+        score_fp.append(
             {
-                "version": PIPELINE_CONFIG_VERSION,
-                "genotype": _plink_stat_fingerprint(bed),
-                "scorer": _gnomon_scorer_fingerprint(),
-                "score_files": [
-                    {
-                        "name": p.name,
-                        "size": int(p.stat().st_size),
-                        "mtime_ns": int(p.stat().st_mtime_ns),
-                        "sha256": _file_sha256(p),
-                    }
-                    for p in sorted(score_files, key=lambda x: x.name)
-                ],
+                "name": p.name,
+                "size": int(p.stat().st_size),
+                "mtime_ns": int(p.stat().st_mtime_ns),
+                "sha256": _file_sha256(p, logger=logger, label=p.name),
             }
         )
-        + ".sscore"
+        if logger is not None and (idx % log_every == 0 or idx == total):
+            logger.info(
+                "[prs]  fingerprinted %d/%d score files (elapsed=%s)",
+                idx,
+                total,
+                _format_seconds(time.time() - t_scores),
+            )
+    if logger is not None:
+        logger.info(
+            "[prs] hashing gnomon score cache key",
+        )
+    t_hash = time.time()
+    digest = _short_hash(
+        {
+            "version": PIPELINE_CONFIG_VERSION,
+            "genotype": genotype_fp,
+            "scorer": scorer_fp,
+            "score_files": score_fp,
+        }
     )
+    if logger is not None:
+        logger.info(
+            "[prs] gnomon score cache-key hash computed in %s -> digest=%s",
+            _format_seconds(time.time() - t_hash),
+            digest,
+        )
+    return "gnomon-scores-" + digest + ".sscore"
 
 
-def _gnomon_scorer_fingerprint() -> dict[str, Any]:
+def _gnomon_scorer_fingerprint(
+    *, logger: Optional[logging.Logger] = None
+) -> dict[str, Any]:
     binary = shutil.which("gnomon")
     fallback = Path("/Users/user/.local/bin/gnomon")
     if binary is None and fallback.is_file() and os.access(fallback, os.X_OK):
         binary = str(fallback)
     if binary is None:
+        if logger is not None:
+            logger.info("[prs]  gnomon binary not found; fingerprint=unavailable")
         return {"available": False, "path": None}
     path = Path(binary).resolve()
+    if logger is not None:
+        logger.info(
+            "[prs]  fingerprinting gnomon binary %s (%.1f MiB)",
+            path,
+            path.stat().st_size / (1 << 20),
+        )
     st = path.stat()
     version = None
     try:
@@ -589,41 +713,93 @@ def _gnomon_scorer_fingerprint() -> dict[str, Any]:
         version = (proc.stdout or proc.stderr).strip() or None
     except Exception:
         version = None
+    sha = _file_sha256(path, logger=logger, label=f"gnomon:{path.name}")
+    if logger is not None:
+        logger.info("[prs]  gnomon version=%s sha256=%s", version, sha[:12])
     return {
         "available": True,
         "path": str(path),
         "size": int(st.st_size),
         "mtime_ns": int(st.st_mtime_ns),
-        "sha256": _file_sha256(path),
+        "sha256": sha,
         "version": version,
     }
 
 
-def _score_files_fingerprint(score_files: Sequence[Path]) -> list[dict[str, Any]]:
-    return [
-        _file_stat_fingerprint(p)
-        for p in sorted((Path(p) for p in score_files), key=lambda x: x.name)
+def _score_files_fingerprint(
+    score_files: Sequence[Path],
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> list[dict[str, Any]]:
+    sorted_files = [
+        Path(p) for p in sorted((Path(p) for p in score_files), key=lambda x: x.name)
     ]
+    out: list[dict[str, Any]] = []
+    total = len(sorted_files)
+    started = time.time()
+    log_every = max(1, total // 10) if logger is not None else total + 1
+    for idx, p in enumerate(sorted_files, start=1):
+        out.append(_file_stat_fingerprint(p, logger=logger, label=p.name))
+        if logger is not None and (idx % log_every == 0 or idx == total):
+            logger.info(
+                "[prs]  fingerprinted %d/%d score files (elapsed=%s)",
+                idx,
+                total,
+                _format_seconds(time.time() - started),
+            )
+    return out
 
 
 def _prs_panel_cache_filename(
     bed: Path,
     score_files: Sequence[Path],
     person_ids: Sequence[str],
+    *,
+    logger: Optional[logging.Logger] = None,
 ) -> str:
-    return (
-        "aou-prs-panel-"
-        + _short_hash(
-            {
-                "version": PIPELINE_CONFIG_VERSION,
-                "genotype": _plink_stat_fingerprint(bed),
-                "score_files": _score_files_fingerprint(score_files),
-                "scorer": _gnomon_scorer_fingerprint(),
-                "person_ids": [str(p) for p in person_ids],
-            }
+    if logger is not None:
+        logger.info("[prs] fingerprinting genotype PLINK fileset prefix=%s", bed.with_suffix(""))
+    t0 = time.time()
+    genotype_fp = _plink_stat_fingerprint(bed, logger=logger)
+    if logger is not None:
+        logger.info(
+            "[prs] genotype fingerprint done in %s",
+            _format_seconds(time.time() - t0),
         )
-        + ".csv.gz"
+        logger.info("[prs] fingerprinting %d PGS score files", len(score_files))
+    t_scores = time.time()
+    score_fp = _score_files_fingerprint(score_files, logger=logger)
+    if logger is not None:
+        logger.info(
+            "[prs] score-file fingerprints done in %s",
+            _format_seconds(time.time() - t_scores),
+        )
+        logger.info("[prs] fingerprinting gnomon scorer binary")
+    t_scorer = time.time()
+    scorer_fp = _gnomon_scorer_fingerprint(logger=logger)
+    if logger is not None:
+        logger.info(
+            "[prs] scorer fingerprint done in %s",
+            _format_seconds(time.time() - t_scorer),
+        )
+        logger.info("[prs] hashing %d person IDs into cache key", len(person_ids))
+    t_hash = time.time()
+    digest = _short_hash(
+        {
+            "version": PIPELINE_CONFIG_VERSION,
+            "genotype": genotype_fp,
+            "score_files": score_fp,
+            "scorer": scorer_fp,
+            "person_ids": [str(p) for p in person_ids],
+        }
     )
+    if logger is not None:
+        logger.info(
+            "[prs] cache-key hash computed in %s -> digest=%s",
+            _format_seconds(time.time() - t_hash),
+            digest,
+        )
+    return "aou-prs-panel-" + digest + ".csv.gz"
 
 
 def _pipeline_config() -> dict[str, Any]:
@@ -751,10 +927,21 @@ def _genscore_key(
     )
 
 
-def _read_prs_panel(path: str | os.PathLike) -> pd.DataFrame:
+def _read_prs_panel(
+    path: str | os.PathLike,
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> pd.DataFrame:
     p = Path(path)
     if not p.is_file():
         raise FileNotFoundError(f"PRS panel not found: {p}")
+    if logger is not None:
+        logger.info(
+            "[prs] reading PRS panel CSV %s (%.1f MiB)",
+            p,
+            p.stat().st_size / (1 << 20),
+        )
+    t0 = time.time()
     df = pd.read_csv(p, dtype={0: "string"})
     index_col = "person_id" if "person_id" in df.columns else df.columns[0]
     out = df.set_index(index_col)
@@ -763,16 +950,47 @@ def _read_prs_panel(path: str | os.PathLike) -> pd.DataFrame:
         out[col] = pd.to_numeric(out[col], errors="coerce")
     if out.shape[1] == 0:
         raise ValueError(f"PRS panel {p} has no score columns")
+    if logger is not None:
+        logger.info(
+            "[prs] PRS panel loaded rows=%d cols=%d in %s",
+            out.shape[0],
+            out.shape[1],
+            _format_seconds(time.time() - t0),
+        )
     return out
 
 
-def _prs_cache_usable(path: Path, person_ids: Sequence[str]) -> bool:
+def _prs_cache_usable(
+    path: Path,
+    person_ids: Sequence[str],
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> bool:
     if not path.is_file() or path.stat().st_size == 0:
+        if logger is not None:
+            logger.info("[prs] cache check: %s missing or empty", path)
         return False
+    if logger is not None:
+        logger.info(
+            "[prs] cache check: scanning ID column of %s (%.1f MiB)",
+            path,
+            path.stat().st_size / (1 << 20),
+        )
+    t0 = time.time()
     ids = pd.read_csv(path, usecols=[0], dtype={0: "string"}).iloc[:, 0]
     have = ids.astype("string").astype(str).to_numpy()
     want = pd.Series(person_ids, dtype="string").astype(str).to_numpy()
-    return have.shape == want.shape and bool(np.array_equal(have, want))
+    ok = have.shape == want.shape and bool(np.array_equal(have, want))
+    if logger is not None:
+        logger.info(
+            "[prs] cache check: %s have=%d want=%d match=%s elapsed=%s",
+            path.name,
+            int(have.shape[0]),
+            int(want.shape[0]),
+            ok,
+            _format_seconds(time.time() - t0),
+        )
+    return ok
 
 
 def _cohort_person_ids(cohort_csv: Path) -> pd.Series:
@@ -908,7 +1126,13 @@ def _build_prs_panel(
         bed,
         len(score_files),
     )
-    sscore_name = _gnomon_score_cache_filename(bed, score_files)
+    t_sscore_name = time.time()
+    sscore_name = _gnomon_score_cache_filename(bed, score_files, logger=logger)
+    logger.info(
+        "[prs] gnomon score cache filename ready in %s -> %s",
+        _format_seconds(time.time() - t_sscore_name),
+        sscore_name,
+    )
     local_sscore = out_dir / sscore_name
     remote_sscore = f"{GNOMON_OUT_DIRNAME}/{sscore_name}"
     logger.info(
@@ -1020,12 +1244,19 @@ def _load_or_build_prs_panel(
         len(score_files),
         len(person_ids),
     )
-    filename = _prs_panel_cache_filename(bed, score_files, person_ids)
+    t_filename = time.time()
+    filename = _prs_panel_cache_filename(
+        bed, score_files, person_ids, logger=logger
+    )
     path = Path(DEFAULT_CACHE_DIR) / PRS_PANEL_CACHE_DIRNAME / filename
-    logger.info("[prs] PRS panel cache target: %s", path)
-    if _prs_cache_usable(path, person_ids):
+    logger.info(
+        "[prs] PRS panel cache target: %s (filename build elapsed=%s)",
+        path,
+        _format_seconds(time.time() - t_filename),
+    )
+    if _prs_cache_usable(path, person_ids, logger=logger):
         logger.info("[prs] using local cache %s", path)
-        return _read_prs_panel(path), str(path)
+        return _read_prs_panel(path, logger=logger), str(path)
 
     remote_name = f"{PRS_PANEL_CACHE_DIRNAME}/{filename}"
     logger.info(
@@ -1033,10 +1264,18 @@ def _load_or_build_prs_panel(
         remote_name,
         path,
     )
+    t_fetch = time.time()
     cache.fetch(remote_name, path, overwrite=True)
-    if _prs_cache_usable(path, person_ids):
+    fetched_size = path.stat().st_size if path.is_file() else 0
+    logger.info(
+        "[prs] workspace fetch finished in %s (local size=%.1f MiB exists=%s)",
+        _format_seconds(time.time() - t_fetch),
+        fetched_size / (1 << 20),
+        path.is_file(),
+    )
+    if _prs_cache_usable(path, person_ids, logger=logger):
         logger.info("[prs] restored workspace cache %s", path)
-        return _read_prs_panel(path), str(path)
+        return _read_prs_panel(path, logger=logger), str(path)
     logger.info(
         "[prs] no usable cache; building PRS panel from gnomon scoring -> %s",
         path,
@@ -1050,7 +1289,17 @@ def _load_or_build_prs_panel(
         bed=bed,
         score_files=score_files,
     )
+    logger.info(
+        "[prs] uploading freshly built PRS panel %s -> %s",
+        path,
+        remote_name,
+    )
+    t_store = time.time()
     cache.store(path, remote_name)
+    logger.info(
+        "[prs] workspace store finished in %s",
+        _format_seconds(time.time() - t_store),
+    )
     return panel, str(path)
 
 

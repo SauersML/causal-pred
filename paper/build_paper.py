@@ -2,10 +2,10 @@ r"""Stamp dynamic numeric values into paper/main.tex from outputs/summary.json.
 
 Usage
 -----
-    uv run python paper/build_paper.py \
-        [--summary outputs/summary.json] \
-        [--tex paper/main.tex] \
-        [--out paper/main.tex]
+    uv run python paper/build_paper.py
+
+Reads outputs/summary.json and outputs/benchmarks.json, then rewrites
+paper/main.tex in place.
 
 The script walks a fixed mapping from summary-JSON keys to LaTeX
 `\newcommand` macros that are already used in `main.tex`, and rewrites
@@ -25,7 +25,6 @@ The build script does NOT invoke pdflatex -- the Makefile does that.
 
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import re
@@ -267,36 +266,13 @@ def _normalise_pipeline_summary(summary: dict) -> None:
             summary.setdefault("runtime_seconds", sum(vals))
 
 
-def main(argv: list[str] | None = None) -> int:
+def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--summary",
-        type=Path,
-        action="append",
-        default=None,
-        help=(
-            "Summary JSON to stamp from; may be given multiple times. "
-            "Defaults to outputs/summary.json and outputs/benchmarks.json."
-        ),
-    )
-    parser.add_argument("--tex", type=Path, default=repo_root / "paper" / "main.tex")
-    parser.add_argument(
-        "--out",
-        type=Path,
-        default=None,
-        help="Output path; defaults to --tex (in-place).",
-    )
-    args = parser.parse_args(argv)
-
-    summary_paths: list[Path]
-    if args.summary:
-        summary_paths = list(args.summary)
-    else:
-        summary_paths = [
-            repo_root / "outputs" / "summary.json",
-            repo_root / "outputs" / "benchmarks.json",
-        ]
+    tex_path = repo_root / "paper" / "main.tex"
+    summary_paths = [
+        repo_root / "outputs" / "summary.json",
+        repo_root / "outputs" / "benchmarks.json",
+    ]
 
     summary: dict = {}
     loaded: list[str] = []
@@ -308,12 +284,11 @@ def main(argv: list[str] | None = None) -> int:
         loaded.append(str(path))
     _normalise_pipeline_summary(summary)
 
-    tex_source = args.tex.read_text()
+    tex_source = tex_path.read_text()
     stamped = stamp_tex(tex_source, summary)
-    out_path = args.out or args.tex
-    out_path.write_text(stamped)
+    tex_path.write_text(stamped)
     print(
-        f"[build_paper] wrote {out_path} ({len(stamped):,} bytes, "
+        f"[build_paper] wrote {tex_path} ({len(stamped):,} bytes, "
         f"summary sources={loaded}, top-level keys={list(summary)})"
     )
     return 0

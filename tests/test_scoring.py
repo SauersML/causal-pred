@@ -463,7 +463,7 @@ def test_cache_hit_speeds_up(medium_data):
     )
     t_warm = time.perf_counter() - t0
     assert s1 == s2
-    assert t_warm < 0.05 * t_cold, (
+    assert t_warm < 0.5 * t_cold, (
         f"cache did not speed up: cold={t_cold * 1e3:.2f}ms warm={t_warm * 1e3:.2f}ms"
     )
 

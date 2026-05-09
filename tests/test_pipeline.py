@@ -897,7 +897,9 @@ def test_build_prs_panel_scores_downloaded_text_files(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "PRS_NODES", 2)
     monkeypatch.setattr(pipeline, "PRS_MIN_COMPLETE_ROWS", 20)
     monkeypatch.setattr(pipeline, "_resolve_microarray_bed", lambda: bed)
-    monkeypatch.setattr(pipeline, "download_panel", lambda _panel_dir: score_files)
+    monkeypatch.setattr(
+        pipeline, "download_panel", lambda _panel_dir, **_kwargs: score_files
+    )
     monkeypatch.setattr(pipeline, "score_panel", fake_score_panel)
 
     out = pipeline._build_prs_panel(
@@ -931,7 +933,9 @@ def test_build_prs_panel_reuses_cached_gnomon_sscore(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "PRS_NODES", 2)
     monkeypatch.setattr(pipeline, "PRS_MIN_COMPLETE_ROWS", 20)
     monkeypatch.setattr(pipeline, "_resolve_microarray_bed", lambda: bed)
-    monkeypatch.setattr(pipeline, "download_panel", lambda _panel_dir: score_files)
+    monkeypatch.setattr(
+        pipeline, "download_panel", lambda _panel_dir, **_kwargs: score_files
+    )
 
     def fail_score_panel(**_kwargs):
         raise AssertionError("cached .sscore should avoid gnomon scoring")

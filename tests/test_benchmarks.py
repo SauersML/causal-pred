@@ -214,7 +214,6 @@ def test_benchmark_script_smoke(tmp_path):
         "3",
         "--gam-samples",
         "2",
-        "--no-real-gwas",
         "--no-plots",
         "--output-dir",
         str(outdir),

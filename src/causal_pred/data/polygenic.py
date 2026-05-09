@@ -42,7 +42,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import IO, Callable, Collection, Iterable, Mapping, Optional, Sequence
+from typing import IO, Callable, Collection, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -914,152 +914,6 @@ def augment_synthetic_with_real_pgs(
     )
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
-_DEMO_PGS_URL = (
-    # PGS Catalog — Mahajan et al. T2D PGS, hg19; ~700KB after harmonisation.
-    "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/PGS000014/ScoringFiles/PGS000014.txt.gz"
-)
-_DEMO_VCF_URL = (
-    # 1000 Genomes phase-3 chr22, GRCh37 — ~11MB compressed.
-    "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502/"
-    "ALL.chr22.phase3_shapeit2_mvncall_integrated_v5a.20130502.genotypes.vcf.gz"
-)
-_DEMO_CACHE = Path.home() / ".cache" / "causal_pred" / "polygenic_demo"
-
-
-def _demo(timeout: int = 900) -> int:
-    """Minimal end-to-end smoke test against publicly-available 1KG data."""
-    import urllib.request
-
-    _DEMO_CACHE.mkdir(parents=True, exist_ok=True)
-    vcf_path = _DEMO_CACHE / Path(_DEMO_VCF_URL).name
-    pgs_path = _DEMO_CACHE / Path(_DEMO_PGS_URL).name
-
-    try:
-        for url, dst in [(_DEMO_VCF_URL, vcf_path), (_DEMO_PGS_URL, pgs_path)]:
-            if not dst.is_file() or dst.stat().st_size == 0:
-                print(f"> downloading {url} -> {dst}")
-                urllib.request.urlretrieve(url, dst)
-    except (OSError, Exception) as exc:  # broad: covers urllib network errors
-        print(f"demo requires internet + 1KG subset download; skipped ({exc!r})")
-        return 0
-
-    print("> running gnomon score on the downloaded cohort ...")
-    try:
-        scores = score_cohort(
-            str(vcf_path),
-            [str(pgs_path)],
-            out_dir=str(_DEMO_CACHE / "out"),
-            timeout=timeout,
-        )
-    except PolygenicToolMissing as exc:
-        print(f"gnomon not available: {exc}")
-        return 1
-    print(scores.describe().to_string())
-    print("> first 5 rows:")
-    print(scores.head().to_string())
-    return 0
-
-
-def _main(argv: Optional[Iterable[str]] = None) -> int:
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        prog="causal_pred.data.polygenic",
-        description=(
-            "Wrappers around the gnomon CLI for polygenic scoring, HWE-PCA "
-            "fitting/projection, and sex-term inference."
-        ),
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    p_score = sub.add_parser(
-        "score", help="Score a cohort against one or more PGS files"
-    )
-    p_score.add_argument("genotype")
-    p_score.add_argument("score_files", nargs="+")
-    p_score.add_argument("--out-dir", default=None)
-    p_score.add_argument("--threads", type=int, default=None)
-    p_score.add_argument("--timeout", type=int, default=600)
-
-    p_fit = sub.add_parser("fit", help="Fit an HWE-PCA model (writes hwe.json)")
-    p_fit.add_argument("genotype")
-    p_fit.add_argument("--n-pcs", type=int, default=10)
-    p_fit.add_argument("--out-dir", default=None)
-    p_fit.add_argument("--timeout", type=int, default=300)
-
-    p_prj = sub.add_parser("project", help="Project samples onto an existing HWE-PCA")
-    p_prj.add_argument("genotype")
-    p_prj.add_argument("model")
-    p_prj.add_argument("--n-pcs", type=int, default=10)
-    p_prj.add_argument("--out-dir", default=None)
-    p_prj.add_argument("--timeout", type=int, default=300)
-
-    p_terms = sub.add_parser("terms", help="Infer per-sample metadata (sex)")
-    p_terms.add_argument("genotype")
-    p_terms.add_argument("--out-dir", default=None)
-    p_terms.add_argument("--timeout", type=int, default=300)
-
-    sub.add_parser("demo", help="Run the 1KG + PGS Catalog smoke test")
-    sub.add_parser("check", help="Print whether gnomon is installed")
-
-    args = parser.parse_args(argv)
-
-    if args.command == "check":
-        if gnomon_available():
-            print(f"gnomon: {_locate_gnomon()}")
-            return 0
-        print("gnomon: NOT FOUND on $PATH")
-        return 1
-
-    if args.command == "score":
-        df = score_cohort(
-            args.genotype,
-            args.score_files,
-            out_dir=args.out_dir,
-            n_threads=args.threads,
-            timeout=args.timeout,
-        )
-        print(df.to_csv(sep="\t"))
-        return 0
-
-    if args.command == "fit":
-        path = fit_pca(
-            args.genotype,
-            n_pcs=args.n_pcs,
-            out_dir=args.out_dir,
-            timeout=args.timeout,
-        )
-        print(path)
-        return 0
-
-    if args.command == "project":
-        df = project_pca(
-            args.genotype,
-            args.model,
-            n_pcs=args.n_pcs,
-            out_dir=args.out_dir,
-            timeout=args.timeout,
-        )
-        print(df.to_csv(sep="\t"))
-        return 0
-
-    if args.command == "terms":
-        df = infer_terms(args.genotype, out_dir=args.out_dir, timeout=args.timeout)
-        print(df.to_csv(sep="\t"))
-        return 0
-
-    if args.command == "demo":
-        return _demo()
-
-    parser.error(f"unknown command: {args.command}")
-    return 2  # pragma: no cover
-
-
 __all__ = [
     "PolygenicToolMissing",
     "PolygenicRunError",
@@ -1074,7 +928,3 @@ __all__ = [
     "parse_projection_bin",
     "parse_sex_tsv",
 ]
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(_main())
