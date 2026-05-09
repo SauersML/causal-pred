@@ -33,17 +33,37 @@ so that the user's source directory is never polluted.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
-from typing import Callable, Collection, Iterable, Mapping, Optional, Sequence
+from typing import IO, Callable, Collection, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _log(msg: str, *args: object) -> None:
+    """Log via ``_LOGGER`` and also print to stdout so output is visible
+    even when no logging handler has been installed by the caller (the
+    pipeline installs handlers on the ``causal_pred`` parent logger; ad-hoc
+    callers may not).
+    """
+    if args:
+        rendered = msg % args
+    else:
+        rendered = msg
+    _LOGGER.info(rendered)
+    if not _LOGGER.hasHandlers():
+        print(rendered, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +162,22 @@ def _write_keep_file(
     return len(matched), len(requested)
 
 
+def _pump_stream(stream: IO[str], prefix: str) -> None:
+    """Forward ``stream`` line-by-line to the module logger (and stdout if no
+    handler is installed). Used to passthrough subprocess output live."""
+    try:
+        for raw in iter(stream.readline, ""):
+            line = raw.rstrip("\r\n")
+            if not line:
+                continue
+            _log("%s %s", prefix, line)
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
 def _run(
     cmd: Sequence[str],
     timeout: int,
@@ -149,22 +185,19 @@ def _run(
     env: Mapping[str, str] | None = None,
     label: str = "gnomon invocation",
 ) -> subprocess.CompletedProcess:
-    """Run gnomon with stdout/stderr inherited by the caller's terminal."""
-    print(f"[gnomon] start {' '.join(cmd)}", flush=True)
+    """Run gnomon and stream its stdout/stderr through the module logger so
+    the surrounding pipeline log captures every line."""
+    _log("[gnomon] start %s", " ".join(cmd))
     started_at = time.time()
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             list(cmd),
-            check=False,
-            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=env,
+            text=True,
+            bufsize=1,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise PolygenicRunError(
-            f"{label} timed out after {timeout}s "
-            f"(elapsed={_format_seconds(time.time() - started_at)}): "
-            f"{' '.join(cmd)!s}"
-        ) from exc
     except FileNotFoundError as exc:
         raise PolygenicRunError(
             f"{label} could not start (binary not found on PATH): {' '.join(cmd)!s}"
@@ -174,17 +207,52 @@ def _run(
             f"{label} failed to spawn ({type(exc).__name__}: {exc}): "
             f"{' '.join(cmd)!s}"
         ) from exc
-    if proc.returncode != 0:
+
+    assert proc.stdout is not None and proc.stderr is not None
+    threads = [
+        threading.Thread(
+            target=_pump_stream,
+            args=(proc.stdout, "[gnomon stdout]"),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_pump_stream,
+            args=(proc.stderr, "[gnomon stderr]"),
+            daemon=True,
+        ),
+    ]
+    for t in threads:
+        t.start()
+
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        proc.kill()
+        for t in threads:
+            t.join(timeout=2.0)
         raise PolygenicRunError(
-            f"{label} failed exit_code={proc.returncode} "
+            f"{label} timed out after {timeout}s "
+            f"(elapsed={_format_seconds(time.time() - started_at)}): "
+            f"{' '.join(cmd)!s}"
+        ) from exc
+
+    for t in threads:
+        t.join(timeout=5.0)
+
+    if returncode != 0:
+        raise PolygenicRunError(
+            f"{label} failed exit_code={returncode} "
             f"elapsed={_format_seconds(time.time() - started_at)}: "
             f"{' '.join(cmd)!s}"
         )
-    print(
-        f"[gnomon] done {label} elapsed={_format_seconds(time.time() - started_at)}",
-        flush=True,
+    _log(
+        "[gnomon] done %s elapsed=%s",
+        label,
+        _format_seconds(time.time() - started_at),
     )
-    return proc
+    return subprocess.CompletedProcess(
+        args=list(cmd), returncode=returncode, stdout="", stderr=""
+    )
 
 
 def _materialise_genotype(src: str, dst_dir: Path) -> Path:
@@ -616,11 +684,11 @@ def score_panel(
             if keep_arg is not None:
                 cmd = [binary, "score", "--keep", str(keep_arg), str(score_arg), str(genotype_in)]
             started_at = time.time()
-            print(
-                "[gnomon] parse plan "
-                f"score_path={score_arg} genotype={genotype_in} "
-                f"keep_iids={keep_label}",
-                flush=True,
+            _log(
+                "[gnomon] parse plan score_path=%s genotype=%s keep_iids=%s",
+                score_arg,
+                genotype_in,
+                keep_label,
             )
             _run(cmd, timeout, env=env, label="gnomon score panel")
 
@@ -644,14 +712,15 @@ def score_panel(
             frame = parse_sscore(
                 sscore,
                 keep_iids=keep_iids,
-                progress=lambda message: print(f"[gnomon] {message}", flush=True),
+                progress=lambda message: _log("[gnomon] %s", message),
             )
-            print(
-                "[gnomon] parsed "
-                f"{sscore} size={_file_size_mib(sscore):.1f}MiB "
-                f"rows={frame.shape[0]} cols={frame.shape[1]} "
-                f"elapsed={_format_seconds(time.time() - parse_started_at)}",
-                flush=True,
+            _log(
+                "[gnomon] parsed %s size=%.1fMiB rows=%d cols=%d elapsed=%s",
+                sscore,
+                _file_size_mib(sscore),
+                frame.shape[0],
+                frame.shape[1],
+                _format_seconds(time.time() - parse_started_at),
             )
             return frame
         finally:

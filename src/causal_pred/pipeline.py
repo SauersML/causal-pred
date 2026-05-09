@@ -307,13 +307,16 @@ PIPELINE_LOG_FILENAME = "pipeline.log"
 
 
 def _setup_logger(verbose: bool) -> logging.Logger:
-    logger = logging.getLogger("causal_pred.pipeline")
-    logger.handlers.clear()
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(
+    # Attach handlers to the package parent so submodules (e.g.
+    # ``causal_pred.data.polygenic``, ``causal_pred.genscore.panels``)
+    # passthrough into the same stdout stream and pipeline.log file.
+    parent = logging.getLogger("causal_pred")
+    parent.handlers.clear()
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(
         logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
     )
-    logger.addHandler(handler)
+    parent.addHandler(stream_handler)
     log_dir = Path(DEFAULT_CACHE_DIR)
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -326,19 +329,26 @@ def _setup_logger(verbose: bool) -> logging.Logger:
             )
         )
         file_handler.setLevel(logging.DEBUG)
-        logger.addHandler(file_handler)
+        parent.addHandler(file_handler)
+    except OSError as exc:
+        sys.stderr.write(
+            f"[pipeline] WARNING failed to attach file log under {log_dir}: {exc}\n"
+        )
+        log_path = None
+    parent.setLevel(logging.DEBUG if verbose else logging.INFO)
+    parent.propagate = False
+
+    logger = logging.getLogger("causal_pred.pipeline")
+    logger.handlers.clear()
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    logger.propagate = True
+    if log_path is not None:
         logger.info(
             "[pipeline] log file %s pid=%d python=%s",
             log_path,
             os.getpid(),
             sys.version.split()[0],
         )
-    except OSError as exc:
-        sys.stderr.write(
-            f"[pipeline] WARNING failed to attach file log under {log_dir}: {exc}\n"
-        )
-    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
-    logger.propagate = False
     return logger
 
 
