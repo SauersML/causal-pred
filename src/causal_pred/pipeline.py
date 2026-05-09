@@ -520,13 +520,19 @@ def _dataframe_values_hash(df: pd.DataFrame) -> str:
 
 _SHA256_PROGRESS_BYTES = 512 * 1024 * 1024  # log every 512 MiB
 _SHA256_PROGRESS_FLOOR_BYTES = 256 * 1024 * 1024  # only log progress for files >256 MiB
+_HUGE_FILE_THRESHOLD_BYTES = 2 * (1 << 30)  # 2 GiB: switch to sampled fingerprint
+_SAMPLE_CHUNK_BYTES = 4 * (1 << 20)  # 4 MiB head + 4 MiB tail
+_SAMPLE_INTERIOR_CHUNKS = 6  # plus a handful of interior probes
+_SAMPLED_DIGEST_TAG = "sampled-v1"
 
 
 def _sha256_sidecar_path(path: Path) -> Path:
     return path.with_suffix(path.suffix + ".sha256")
 
 
-def _read_sha256_sidecar(path: Path, size: int, mtime_ns: int) -> Optional[str]:
+def _read_sha256_sidecar(
+    path: Path, size: int, mtime_ns: int, *, kind: str
+) -> Optional[str]:
     sidecar = _sha256_sidecar_path(path)
     try:
         text = sidecar.read_text()
@@ -542,6 +548,8 @@ def _read_sha256_sidecar(path: Path, size: int, mtime_ns: int) -> Optional[str]:
         return None
     if int(record.get("mtime_ns", -1)) != int(mtime_ns):
         return None
+    if str(record.get("kind", "full")) != kind:
+        return None
     digest = record.get("sha256")
     if not isinstance(digest, str) or len(digest) != 64:
         return None
@@ -549,11 +557,16 @@ def _read_sha256_sidecar(path: Path, size: int, mtime_ns: int) -> Optional[str]:
 
 
 def _write_sha256_sidecar(
-    path: Path, size: int, mtime_ns: int, digest: str
+    path: Path, size: int, mtime_ns: int, digest: str, *, kind: str
 ) -> None:
     sidecar = _sha256_sidecar_path(path)
     payload = json.dumps(
-        {"size": int(size), "mtime_ns": int(mtime_ns), "sha256": digest}
+        {
+            "size": int(size),
+            "mtime_ns": int(mtime_ns),
+            "kind": kind,
+            "sha256": digest,
+        }
     )
     try:
         tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
@@ -563,24 +576,67 @@ def _write_sha256_sidecar(
         pass
 
 
-def _file_sha256(
+def _sampled_file_digest(
     path: Path,
+    size: int,
+    mtime_ns: int,
     *,
     logger: Optional[logging.Logger] = None,
     label: Optional[str] = None,
 ) -> str:
-    st = path.stat()
-    size = st.st_size
-    mtime_ns = int(st.st_mtime_ns)
-    cached = _read_sha256_sidecar(path, size, mtime_ns)
-    if cached is not None:
-        if logger is not None and size >= _SHA256_PROGRESS_FLOOR_BYTES:
-            logger.info(
-                "[prs]   sha256 %s reused cached digest from sidecar (%.1f MiB)",
-                label or path.name,
-                size / (1 << 20),
-            )
-        return cached
+    h = hashlib.sha256()
+    h.update(_SAMPLED_DIGEST_TAG.encode("utf-8"))
+    h.update(str(size).encode("utf-8"))
+    h.update(b"|")
+    h.update(str(mtime_ns).encode("utf-8"))
+    h.update(b"|")
+    chunk = _SAMPLE_CHUNK_BYTES
+    if logger is not None:
+        logger.info(
+            "[prs]   sampled-digest %s start size=%.1f MiB "
+            "(head/tail %.1f MiB, %d interior probes)",
+            label or path.name,
+            size / (1 << 20),
+            chunk / (1 << 20),
+            _SAMPLE_INTERIOR_CHUNKS,
+        )
+    started = time.time()
+    offsets: list[int] = [0]
+    if size > 2 * chunk:
+        for i in range(1, _SAMPLE_INTERIOR_CHUNKS + 1):
+            off = (size * i) // (_SAMPLE_INTERIOR_CHUNKS + 1)
+            off = max(chunk, min(size - chunk, off))
+            offsets.append(off)
+        offsets.append(max(0, size - chunk))
+    else:
+        offsets = [0]
+    seen: set[int] = set()
+    with path.open("rb") as fh:
+        for off in offsets:
+            if off in seen:
+                continue
+            seen.add(off)
+            fh.seek(off)
+            data = fh.read(min(chunk, max(0, size - off)))
+            h.update(off.to_bytes(8, "big"))
+            h.update(len(data).to_bytes(8, "big"))
+            h.update(data)
+    if logger is not None:
+        logger.info(
+            "[prs]   sampled-digest %s done in %s",
+            label or path.name,
+            _format_seconds(time.time() - started),
+        )
+    return h.hexdigest()
+
+
+def _full_file_sha256(
+    path: Path,
+    size: int,
+    *,
+    logger: Optional[logging.Logger] = None,
+    label: Optional[str] = None,
+) -> str:
     h = hashlib.sha256()
     log_progress = (
         logger is not None and size >= _SHA256_PROGRESS_FLOOR_BYTES
@@ -621,8 +677,36 @@ def _file_sha256(
             label or path.name,
             _format_seconds(time.time() - started),
         )
-    digest = h.hexdigest()
-    _write_sha256_sidecar(path, size, mtime_ns, digest)
+    return h.hexdigest()
+
+
+def _file_sha256(
+    path: Path,
+    *,
+    logger: Optional[logging.Logger] = None,
+    label: Optional[str] = None,
+) -> str:
+    st = path.stat()
+    size = st.st_size
+    mtime_ns = int(st.st_mtime_ns)
+    kind = "sampled" if size >= _HUGE_FILE_THRESHOLD_BYTES else "full"
+    cached = _read_sha256_sidecar(path, size, mtime_ns, kind=kind)
+    if cached is not None:
+        if logger is not None and size >= _SHA256_PROGRESS_FLOOR_BYTES:
+            logger.info(
+                "[prs]   %s %s reused cached digest from sidecar (%.1f MiB)",
+                "sampled-digest" if kind == "sampled" else "sha256",
+                label or path.name,
+                size / (1 << 20),
+            )
+        return cached
+    if kind == "sampled":
+        digest = _sampled_file_digest(
+            path, size, mtime_ns, logger=logger, label=label
+        )
+    else:
+        digest = _full_file_sha256(path, size, logger=logger, label=label)
+    _write_sha256_sidecar(path, size, mtime_ns, digest, kind=kind)
     return digest
 
 
