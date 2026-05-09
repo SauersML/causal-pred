@@ -90,7 +90,7 @@ def test_fit_smoke(monkeypatch):
     )
 
     assert seen["survival_likelihood"] == "location-scale"
-    assert seen["baseline_target"] == "gompertz-makeham"
+    assert seen["baseline_target"] == "linear"
     assert seen["config"] == {"noise_formula": "1"}
     assert seen["df_columns"] == ("entry", "exit", "event", "sex", "BMI")
     assert seen["formula"] == "Surv(entry, exit, event) ~ sex + BMI"

@@ -440,7 +440,9 @@ def test_prs_cache_names_hash_genotype_score_and_scorer(tmp_path, monkeypatch):
 
     scorer_a = {"available": True, "path": "/bin/gnomon-a", "sha256": "a"}
     scorer_b = {"available": True, "path": "/bin/gnomon-b", "sha256": "b"}
-    monkeypatch.setattr(pipeline, "_gnomon_scorer_fingerprint", lambda: scorer_a)
+    monkeypatch.setattr(
+        pipeline, "_gnomon_scorer_fingerprint", lambda **_kwargs: scorer_a
+    )
     base_panel = pipeline._prs_panel_cache_filename(bed, [score], people)
     base_sscore = pipeline._gnomon_score_cache_filename(bed, [score])
 
@@ -456,7 +458,9 @@ def test_prs_cache_names_hash_genotype_score_and_scorer(tmp_path, monkeypatch):
     assert score_changed != base_panel
 
     score.write_text("score-a\n")
-    monkeypatch.setattr(pipeline, "_gnomon_scorer_fingerprint", lambda: scorer_b)
+    monkeypatch.setattr(
+        pipeline, "_gnomon_scorer_fingerprint", lambda **_kwargs: scorer_b
+    )
     scorer_changed = pipeline._prs_panel_cache_filename(bed, [score], people)
     scorer_sscore_changed = pipeline._gnomon_score_cache_filename(bed, [score])
     assert scorer_changed != base_panel

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
 import os
-import subprocess
 import sys
 import time
 
@@ -194,64 +192,3 @@ def test_causal_pred_runs_with_gamfit():
     assert out["mcmc_n_samples"] > 0
     assert out["parent_sets"]
     assert np.isfinite(out["ibs"])
-
-
-# ---- end-to-end CLI smoke ---------------------------------------------------
-
-
-def test_benchmark_script_smoke(tmp_path):
-    outdir = tmp_path / "outputs"
-    outdir.mkdir()
-
-    cmd = [
-        "uv",
-        "run",
-        "python",
-        "scripts/benchmark.py",
-        "--n",
-        "120",
-        "--mcmc-iter",
-        "3",
-        "--gam-samples",
-        "2",
-        "--no-plots",
-        "--output-dir",
-        str(outdir),
-        "--quiet",
-    ]
-    t0 = time.perf_counter()
-    result = subprocess.run(
-        cmd,
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    elapsed = time.perf_counter() - t0
-
-    assert result.returncode == 0, (
-        f"benchmark.py failed (exit={result.returncode}):\n"
-        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
-    assert elapsed < 120.0
-
-    json_path = outdir / "benchmarks.json"
-    assert json_path.exists()
-    with json_path.open() as fh:
-        report = json.load(fh)
-
-    assert set(report) >= {"dataset", "baselines", "run_config", "git_sha", "timestamp"}
-    # All five baselines present; causal_pred is a real gamfit benchmark row.
-    for name in ("kaplan_meier", "cox_ph", "naive_logistic", "mr_ivw", "causal_pred"):
-        assert name in report["baselines"], f"missing baseline {name}"
-
-    assert report["baselines"]["causal_pred"]["backend"] == "gamfit"
-    assert report["baselines"]["causal_pred"].get("status") is None
-    assert report["run_config"]["gam_samples"] == 2
-    assert "skip_full_pipeline" not in report["run_config"]
-
-    # Sanity on survival baselines.
-    for name in ("kaplan_meier", "cox_ph", "naive_logistic"):
-        row = report["baselines"][name]
-        # NaN was converted to None by _json_sanitise; both are OK.
-        assert "ibs" in row

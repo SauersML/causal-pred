@@ -1,10 +1,10 @@
 """Survival GAM wrapper over the gamfit Python library.
 
 The module is intentionally a thin wrapper over ``gamfit`` (PyO3 bindings to
-SauersML/gam's Rust engine). gamfit fits the right-censored
-Gompertz-Makeham GAMLSS survival model and evaluates survival curves and
-response-scale standard errors at requested horizons. Bayesian model averaging
-adds structural uncertainty across parent sets.
+SauersML/gam's Rust engine). gamfit fits a right-censored location-scale
+GAMLSS survival model and evaluates survival curves and response-scale
+standard errors at requested horizons. Bayesian model averaging adds
+structural uncertainty across parent sets.
 """
 
 from __future__ import annotations
@@ -24,10 +24,10 @@ ProgressCallback = Callable[[str], None]
 
 _SURVIVAL_ENTRY_ORIGIN = 1.0
 _SURVIVAL_LIKELIHOOD = "location-scale"
-_SURVIVAL_BASELINE_TARGET = "gompertz-makeham"
+_SURVIVAL_BASELINE_TARGET = "linear"
 _SURVIVAL_NOISE_FORMULA = "1"
-_SURVIVAL_MODEL_FAMILY = "gamlss-gompertz-makeham"
-_UNCERTAINTY_MODE = "gamfit_gompertz_makeham_gamlss_delta_method_response_se"
+_SURVIVAL_MODEL_FAMILY = "gamlss-location-scale"
+_UNCERTAINTY_MODE = "gamfit_gamlss_delta_method_response_se"
 _UNCERTAINTY_SOURCE = "gamfit.SurvivalPrediction.survival_se_at"
 
 
@@ -70,7 +70,7 @@ def _fit_gam(
     location_formula: Optional[str] = None,
     noise_formula: Optional[str] = None,
 ) -> _SubmodelFit:
-    """Fit a gamfit Gompertz-Makeham GAMLSS survival model."""
+    """Fit a gamfit location-scale GAMLSS survival model."""
 
     time = np.asarray(time, dtype=float)
     event = np.asarray(event, dtype=float)
@@ -270,15 +270,18 @@ def _predict_survival_grid(
     if not with_uncertainty:
         return S_mean, None
     values = pred.survival_se_at(backend_t_grid)
-    if values is None:
-        raise RuntimeError("gamfit did not return survival_se for survival prediction")
-    S_se = _validate_gamfit_surface(
-        values,
-        n_new=n_new,
-        n_t=n_t,
-        label="survival_se",
-    )
-    return S_mean, np.clip(S_se, 0.0, None)
+    if values is not None:
+        return S_mean, np.clip(
+            _validate_gamfit_surface(
+                values,
+                n_new=n_new,
+                n_t=n_t,
+                label="survival_se",
+            ),
+            0.0,
+            None,
+        )
+    return S_mean, _predict_survival_se_grid(fit, X_new, t_grid)
 
 
 def _predict_survival_matrix(
@@ -311,9 +314,36 @@ def _predict_survival_surfaces(
     return S_mean, S_se
 
 
+def _predict_survival_se_grid(
+    fit: _SubmodelFit,
+    X_new: np.ndarray,
+    t_grid: np.ndarray,
+) -> np.ndarray:
+    n_new = int(X_new.shape[0])
+    S_se = np.empty((n_new, int(t_grid.size)), dtype=float)
+    for j, t in enumerate(t_grid):
+        t_one = np.array([float(t)], dtype=float)
+        pred = fit.model.predict(
+            _prediction_frame(fit, X_new, t_one),
+            with_uncertainty=True,
+        )
+        raw = getattr(pred, "survival_se", None)
+        if raw is None:
+            raw = pred.survival_se_at(_SURVIVAL_ENTRY_ORIGIN + t_one)
+        if raw is None:
+            raise RuntimeError("gamfit did not return survival_se for survival prediction")
+        S_se[:, j] = _validate_gamfit_surface(
+            raw,
+            n_new=n_new,
+            n_t=1,
+            label="survival_se",
+        )[:, 0]
+    return np.clip(S_se, 0.0, None)
+
+
 @dataclass
 class SurvivalGAM:
-    """Fitted gamfit Gompertz-Makeham GAMLSS survival model."""
+    """Fitted gamfit location-scale GAMLSS survival model."""
 
     columns: Tuple[str, ...]
     diagnostics: Dict[str, Any]
@@ -469,7 +499,7 @@ def fit_survival_gam(
     location_formula: Optional[str] = None,
     noise_formula: Optional[str] = None,
 ) -> SurvivalGAM:
-    """Fit a right-censored Gompertz-Makeham GAMLSS survival model via gamfit."""
+    """Fit a right-censored location-scale GAMLSS survival model via gamfit."""
 
     time = np.asarray(time, dtype=float)
     event = np.asarray(event, dtype=float)

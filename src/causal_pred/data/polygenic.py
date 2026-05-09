@@ -38,6 +38,7 @@ import os
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -912,6 +913,24 @@ def augment_synthetic_with_real_pgs(
         node_types=dataset.node_types,
         ground_truth_adj=dataset.ground_truth_adj.copy(),
     )
+
+
+def _main(argv: Sequence[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args != ["check"]:
+        print("usage: python -m causal_pred.data.polygenic check")
+        return 2
+    try:
+        path = _locate_gnomon()
+    except PolygenicToolMissing:
+        print("gnomon NOT FOUND")
+        return 1
+    print(f"gnomon {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
 
 
 __all__ = [

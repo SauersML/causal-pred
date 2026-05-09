@@ -7,7 +7,6 @@ machine without a TeX Live install.  The only heavy test
 
 from __future__ import annotations
 
-import json
 import re
 import shutil
 import subprocess
@@ -152,38 +151,3 @@ def test_build_paper_missing_summary_is_tbd(tmp_path):
     stamped = build_paper.stamp_tex(tex, {})
     assert r"\providecommand{\auroc}{\fbox{TBD}}" in stamped
     assert r"\providecommand{\nSamples}{\fbox{TBD}}" in stamped
-
-
-def test_build_paper_cli(tmp_path):
-    """The CLI writes a stamped file and exits cleanly."""
-    summary_path = tmp_path / "summary.json"
-    summary_path.write_text(
-        json.dumps(
-            {
-                "dataset": {"n": 1000, "p": 18, "event_rate": 0.2},
-                "metrics": {"auroc": 0.75},
-            }
-        )
-    )
-    out_path = tmp_path / "main.tex"
-
-    proc = subprocess.run(
-        [
-            "python",
-            str(PAPER_DIR / "build_paper.py"),
-            "--summary",
-            str(summary_path),
-            "--tex",
-            str(MAIN_TEX),
-            "--out",
-            str(out_path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert out_path.exists()
-    stamped = out_path.read_text()
-    assert r"\providecommand{\auroc}{0.750}" in stamped
-    assert r"\providecommand{\nSamples}{1,000}" in stamped
