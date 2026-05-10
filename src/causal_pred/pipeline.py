@@ -3448,7 +3448,17 @@ def _survival_time_grid(time_arr: np.ndarray) -> np.ndarray:
     if not np.all(np.isfinite(t)) or np.any(t <= 0.0):
         raise ValueError("survival GAM requires finite positive follow-up times")
     t_min = max(float(np.quantile(t, 0.02)), 1e-3)
-    t_max = float(np.max(t))
+    # Stay strictly inside the spline support: gamfit's I-spline basis
+    # collapses to identically zero on rows whose log-time hits the
+    # rightmost knot (knotvec[-1] == log(max(observed_event_time))),
+    # which makes calibration metrics catastrophically bad even when the
+    # PIRLS fit converges. Cap at the 99th percentile of follow-up so
+    # eval rows land strictly inside the support.
+    t_max_raw = float(np.max(t))
+    t_max = float(np.quantile(t, 0.99))
+    if t_max >= t_max_raw:
+        # Tiny cohorts can have q99 == max; nudge below max by a hair.
+        t_max = max(t_min, t_max_raw * (1.0 - 1e-3))
     if t_max <= t_min:
         raise ValueError("survival follow-up times have no usable range")
     return np.linspace(t_min, t_max, SURVIVAL_TIME_GRID_POINTS)

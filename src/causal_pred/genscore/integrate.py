@@ -355,6 +355,24 @@ def select_shared_features(
         * np.maximum(neg_margin, 0.0)
     )
 
+    # Drop features whose raw_score is non-positive: that means at least one
+    # of (cross_gain, stability, neg_margin) was zero, i.e. the feature
+    # failed a structural quality test (cross-modal predictivity / split-
+    # half stability / matched-vs-shuffled margin). Without this guard the
+    # eligible-pool walk happily promotes score==0 features in arbitrary
+    # index order whenever the eligible pool is smaller than n_promote,
+    # and those features are exactly the quasi-separation candidates that
+    # blow up the downstream survival GAM.
+    eligible_score = raw_score[eligible_idx]
+    keep = eligible_score > 0
+    if not bool(keep.any()):
+        raise RuntimeError(
+            "no eligible shared feature has positive raw_score; every "
+            "candidate failed at least one of cross_gain / stability / "
+            "neg_margin. Train longer, widen the shared bank, or relax "
+            "the activation_rate floor."
+        )
+    eligible_idx = eligible_idx[keep]
     order = eligible_idx[np.argsort(raw_score[eligible_idx])[::-1]]
     chosen: list[int] = []
     penalties = np.ones(model.d, dtype=float)
