@@ -2654,6 +2654,44 @@ def _load_or_run_genscore_features(
         GENSCORE_N_PROMOTE,
         eligible_pool,
     )
+
+    # Resolve human-readable labels for all top loadings before formatting.
+    # PGS Catalog metadata + OMOP concept names land in their own JSON caches
+    # so we only pay the network/BQ cost once per unique ID across the lifetime
+    # of the local checkout.
+    from .genscore.labels import (
+        extract_pgs_id,
+        label_ehr_entry,
+        label_genome_entry,
+        resolve_omop_concepts,
+        resolve_pgs_metadata,
+    )
+
+    pgs_ids: set[str] = set()
+    omop_ids: set[str] = set()
+    for entries in top_genome_loadings.values():
+        for entry in entries[:3]:
+            pid = extract_pgs_id(str(entry["feature"]))
+            if pid is not None:
+                pgs_ids.add(pid)
+    for entries in top_ehr_loadings.values():
+        for entry in entries[:3]:
+            feat = str(entry["feature"])
+            if ":" in feat:
+                prefix, ident = feat.split(":", 1)
+                if prefix in ("cond", "drug") and ident.isdigit():
+                    omop_ids.add(ident)
+
+    pgs_meta = resolve_pgs_metadata(
+        pgs_ids,
+        Path(DEFAULT_CACHE_DIR) / PGS_PANEL_DIRNAME / "_pgs_metadata.json",
+    )
+    omop_meta = resolve_omop_concepts(
+        omop_ids,
+        Path(DEFAULT_CACHE_DIR) / "omop" / "concept_names.json",
+        cdr=_workspace_cdr(),
+    )
+
     for name, idx, share, rate, score, neg_margin in zip(
         sel.names,
         sel.indices.tolist(),
@@ -2664,11 +2702,17 @@ def _load_or_run_genscore_features(
     ):
         top_g = top_genome_loadings.get(str(name), [])[:3]
         top_e = top_ehr_loadings.get(str(name), [])[:3]
-        g_summary = ",".join(
-            f"{entry['feature']}={entry['weight']:+.2f}" for entry in top_g
+        g_summary = ", ".join(
+            label_genome_entry(
+                str(entry["feature"]),
+                float(entry["weight"]),
+                pgs_meta,
+            )
+            for entry in top_g
         )
-        e_summary = ",".join(
-            f"{entry['feature']}={entry['weight']:+.2f}" for entry in top_e
+        e_summary = ", ".join(
+            label_ehr_entry(str(entry["feature"]), float(entry["weight"]), omop_meta)
+            for entry in top_e
         )
         logger.info(
             "[genscore]   %s idx=%d score=%.6g r_G=%.3f rate=%.4f "
