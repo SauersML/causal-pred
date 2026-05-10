@@ -99,8 +99,12 @@ log "git pull --ff-only"
 git pull --ff-only
 
 # 5. python deps -------------------------------------------------------------
-log "uv sync --locked --dev"
-uv sync --locked --dev
+# Lock everything else to the committed pins, but always pull the newest
+# gamfit available on PyPI. The Rust survival GAM is the most actively
+# evolving dependency in the stack, and we never want a stale wheel
+# silently masking fixes that have been published since the last `uv lock`.
+log "uv sync --upgrade-package gamfit --dev (gamfit pinned to latest)"
+uv sync --upgrade-package gamfit --dev
 
 # 5. gnomon ------------------------------------------------------------------
 log "installing gnomon via install.sh"

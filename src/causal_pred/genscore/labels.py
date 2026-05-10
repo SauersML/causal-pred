@@ -230,3 +230,50 @@ def label_ehr_entry(
         if name:
             return f"{feature_name}={weight:+.2f} ({_truncate(name)})"
     return f"{feature_name}={weight:+.2f}"
+
+
+def label_genome_column(name: str, pgs_meta: dict[str, dict]) -> str:
+    """Human-readable label for a PGS panel column (used as plot tick label)."""
+    pgs_id = extract_pgs_id(name)
+    if pgs_id is None:
+        return str(name)
+    trait = pgs_meta.get(pgs_id, {}).get("trait", "")
+    if trait:
+        return f"{pgs_id} {_truncate(trait, 30)}"
+    return pgs_id
+
+
+def label_ehr_column(name: str, omop_meta: dict[str, dict]) -> str:
+    """Human-readable label for an EHR panel column (used as plot tick label)."""
+    name = str(name)
+    if ":" not in name:
+        return name
+    prefix, ident = name.split(":", 1)
+    if prefix in ("cond", "drug") and ident.isdigit():
+        concept = omop_meta.get(ident, {}).get("name", "")
+        if concept:
+            return f"{prefix}:{ident} {_truncate(concept, 30)}"
+    return name
+
+
+def collect_pgs_ids(names: Iterable[str]) -> set[str]:
+    """Extract canonical PGS IDs from a column-name iterable."""
+    out: set[str] = set()
+    for n in names:
+        pid = extract_pgs_id(str(n))
+        if pid is not None:
+            out.add(pid)
+    return out
+
+
+def collect_omop_concept_ids(names: Iterable[str]) -> set[str]:
+    """Extract OMOP concept IDs from ``cond:`` / ``drug:`` column names."""
+    out: set[str] = set()
+    for n in names:
+        n = str(n)
+        if ":" not in n:
+            continue
+        prefix, ident = n.split(":", 1)
+        if prefix in ("cond", "drug") and ident.isdigit():
+            out.add(ident)
+    return out

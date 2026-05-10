@@ -2271,14 +2271,42 @@ def _render_genscore_plots_async(
                 int(model.k),
             )
             _log_rss(logger, "genscore-plots before save_all")
+
+            from .genscore.labels import (
+                collect_omop_concept_ids,
+                collect_pgs_ids,
+                label_ehr_column,
+                label_genome_column,
+                resolve_omop_concepts,
+                resolve_pgs_metadata,
+            )
+
+            raw_prs_cols = tuple(str(c) for c in prs_df.columns)
+            raw_ehr_cols = tuple(str(c) for c in ehr_panel.feature_names)
+            pgs_meta = resolve_pgs_metadata(
+                collect_pgs_ids(raw_prs_cols),
+                Path(DEFAULT_CACHE_DIR) / PGS_PANEL_DIRNAME / "_pgs_metadata.json",
+            )
+            omop_meta = resolve_omop_concepts(
+                collect_omop_concept_ids(raw_ehr_cols),
+                Path(DEFAULT_CACHE_DIR) / "omop" / "concept_names.json",
+                cdr=_workspace_cdr(),
+            )
+            prs_columns_labelled = tuple(
+                label_genome_column(c, pgs_meta) for c in raw_prs_cols
+            )
+            ehr_columns_labelled = tuple(
+                label_ehr_column(c, omop_meta) for c in raw_ehr_cols
+            )
+
             saved = save_all_genscore_plots(
                 plots_dir,
                 GenscorePlotInputs(
                     model=model,
                     panels=panels,
                     selection=selection,
-                    prs_columns=tuple(str(c) for c in prs_df.columns),
-                    ehr_columns=tuple(str(c) for c in ehr_panel.feature_names),
+                    prs_columns=prs_columns_labelled,
+                    ehr_columns=ehr_columns_labelled,
                     ehr_kinds=tuple(str(k) for k in ehr_panel.feature_kinds),
                     history=history,
                 ),

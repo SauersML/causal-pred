@@ -1,4 +1,4 @@
-"""Tests for the documentation trio: ARCHITECTURE.md, CLAUDE.md, RUNBOOK.md.
+"""Tests for the documentation pair: ARCHITECTURE.md and RUNBOOK.md.
 
 These are smoke-level contract tests.  They do NOT check prose quality -- they
 check that the files exist, cover the non-negotiable topics documented in the
@@ -30,18 +30,6 @@ def test_architecture_exists():
     text = _read(path)
     assert len(text) >= 2000, (
         f"docs/ARCHITECTURE.md is only {len(text)} chars; expected >= 2000"
-    )
-
-
-def test_claude_md_mentions_uv_and_gam():
-    path = os.path.join(REPO_ROOT, "CLAUDE.md")
-    assert os.path.exists(path), "CLAUDE.md is missing at the repo root"
-    text = _read(path)
-    assert "uv run" in text, "CLAUDE.md must instruct teammates to use `uv run`"
-    assert "gam" in text, "CLAUDE.md must mention the `gam` library"
-    assert "gnomon" in text, "CLAUDE.md must mention the `gnomon` CLI"
-    assert "pygam" not in text.lower(), (
-        "CLAUDE.md must NOT reintroduce `pygam` -- it is a tripwire"
     )
 
 
@@ -81,5 +69,5 @@ def test_runbook_is_executable():
 def test_readme_points_to_docs():
     path = os.path.join(REPO_ROOT, "README.md")
     text = _read(path)
-    for doc in ("docs/ARCHITECTURE.md", "CLAUDE.md", "docs/RUNBOOK.md"):
+    for doc in ("docs/ARCHITECTURE.md", "docs/RUNBOOK.md"):
         assert doc in text, f"README.md must link to {doc}"

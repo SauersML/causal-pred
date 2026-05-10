@@ -87,33 +87,76 @@ def _bar_chart(baselines: Dict[str, dict], out_path: str) -> None:
         print(f"[bench] skipping plot: matplotlib unavailable ({exc})")
         return
 
-    rows = []
+    surv_rows = []
+    edge_rows = []
     for name, m in baselines.items():
         if m.get("status") in ("skipped", "failed"):
             continue
-        r2 = m.get("nagelkerke_at_10y", float("nan"))
-        td = m.get("time_dep_auc", {})
-        ia = td.get("integrated_auc", float("nan"))
-        ibs = m.get("ibs", float("nan"))
-        rows.append((name, r2, ia, ibs))
+        r2 = m.get("nagelkerke_at_10y")
+        td = m.get("time_dep_auc", {}) or {}
+        ia = td.get("integrated_auc")
+        ibs = m.get("ibs")
+        if any(v is not None and np.isfinite(v) for v in (r2, ia, ibs)):
+            surv_rows.append(
+                (
+                    name,
+                    float(r2) if r2 is not None else float("nan"),
+                    float(ia) if ia is not None else float("nan"),
+                    float(ibs) if ibs is not None else float("nan"),
+                )
+            )
+        auroc = m.get("edge_auroc")
+        auprc = m.get("edge_auprc")
+        if auroc is not None or auprc is not None:
+            edge_rows.append(
+                (
+                    name,
+                    float(auroc) if auroc is not None else float("nan"),
+                    float(auprc) if auprc is not None else float("nan"),
+                )
+            )
 
-    if not rows:
+    if not surv_rows and not edge_rows:
         print("[bench] no rows to plot")
         return
 
-    names = [r[0] for r in rows]
-    data = np.array([[r[1], r[2], r[3]] for r in rows], dtype=float)
+    n_surv = 3 if surv_rows else 0
+    n_edge = 2 if edge_rows else 0
+    n_panels = n_surv + n_edge
+    fig, axes = plt.subplots(
+        1, n_panels, figsize=(4 * n_panels, 4.2), constrained_layout=True
+    )
+    if n_panels == 1:
+        axes = [axes]
+    panel_idx = 0
 
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    titles = ["Nagelkerke R^2 @ 10y", "Integrated td-AUC", "IBS (lower=better)"]
-    for k, ax in enumerate(axes):
-        ax.bar(range(len(names)), data[:, k])
-        ax.set_xticks(range(len(names)))
-        ax.set_xticklabels(names, rotation=30, ha="right")
-        ax.set_title(titles[k])
-        ax.grid(True, axis="y", alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=120)
+    if surv_rows:
+        s_names = [r[0] for r in surv_rows]
+        s_data = np.array([[r[1], r[2], r[3]] for r in surv_rows], dtype=float)
+        s_titles = ["Nagelkerke $R^2$ @ 10y", "Integrated td-AUC", "IBS (lower = better)"]
+        for k in range(3):
+            ax = axes[panel_idx + k]
+            ax.bar(range(len(s_names)), s_data[:, k], color="#4C72B0")
+            ax.set_xticks(range(len(s_names)))
+            ax.set_xticklabels(s_names, rotation=30, ha="right")
+            ax.set_title(s_titles[k])
+            ax.grid(True, axis="y", alpha=0.3)
+        panel_idx += 3
+
+    if edge_rows:
+        e_names = [r[0] for r in edge_rows]
+        e_data = np.array([[r[1], r[2]] for r in edge_rows], dtype=float)
+        e_titles = ["Edge AUROC", "Edge AUPRC"]
+        for k in range(2):
+            ax = axes[panel_idx + k]
+            ax.bar(range(len(e_names)), e_data[:, k], color="#55A868")
+            ax.set_xticks(range(len(e_names)))
+            ax.set_xticklabels(e_names, rotation=30, ha="right")
+            ax.set_ylim(0.0, 1.0)
+            ax.set_title(e_titles[k])
+            ax.grid(True, axis="y", alpha=0.3)
+
+    fig.savefig(out_path, dpi=140)
     plt.close(fig)
 
 

@@ -19,8 +19,6 @@ which makes the validation framework meaningful even on synthetic data.
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — install, run, regenerate, troubleshoot.
 - [`docs/MATHEMATICAL_NOTES.md`](docs/MATHEMATICAL_NOTES.md) — equation-level
   transcription of MrDAG and DAGSLAM with all approximations labelled.
-- [`CLAUDE.md`](CLAUDE.md) — notes for future Claude sessions; start here if
-  you are automating work on this repo.
 
 ## Pipeline
 
