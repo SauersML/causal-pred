@@ -84,7 +84,7 @@ PRS_PANEL_CACHE_DIRNAME = "prs_panel_cache"
 GNOMON_OUT_DIRNAME = "gnomon_score"
 GENOTYPE_CACHE_DIR = str(Path.home() / "causal-pred" / "genomes")
 
-PIPELINE_CONFIG_VERSION = "2026-05-09.survival-censoring-gamfit-uncertainty.1"
+PIPELINE_CONFIG_VERSION = "2026-05-09.survival-censoring-gamfit-uncertainty.2"
 PIPELINE_SEED = 20260416
 PIPELINE_VERBOSE = False
 
@@ -2992,6 +2992,24 @@ def _structural_allowed_edges(
             allowed[feat, pgs] = False
         for target in target_like:
             allowed[target, feat] = False
+
+    # Forbid edges *within* the crosscoder-feature subset.
+    # Each feat_k = TopK(W_e[:,k] @ panel + b_enc[k]) is a deterministic
+    # projection of the same panel input, so two features j, k are
+    # statistically dependent through their shared input columns and
+    # through TopK co-activation -- not through any causal mechanism
+    # between them. With n=100k+ the BGe likelihood detects that
+    # dependence and locks pairwise feat->feat edges into the posterior
+    # at probability 1.0, crowding the clinically meaningful edges out
+    # of the top of the marginal-edge ranking. The correct generative
+    # parents of feat_k are the panel inputs (PRS columns + EHR
+    # features), which are already encoded by base->feat being allowed
+    # but feat->feat being forbidden. This rule converts that into a
+    # hard structural prior.
+    for j in feature_idx:
+        for k in feature_idx:
+            if j != k:
+                allowed[j, k] = False
 
     return allowed
 
