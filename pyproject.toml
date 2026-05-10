@@ -21,6 +21,7 @@ dependencies = [
     "db-dtypes>=1.2",
     "torch>=2.3",
     "gamfit>=0.1.19",
+    "umap-learn>=0.5",
 ]
 
 [dependency-groups]

@@ -2106,6 +2106,8 @@ def _render_genscore_plots_async(
     person_ids: np.ndarray,
     genscore_meta: dict[str, Any],
     logger: logging.Logger,
+    event: Optional[np.ndarray] = None,
+    target_name: str = "T2D",
 ) -> None:
     """Render crosscoder figures in a background thread.
 
@@ -2309,6 +2311,8 @@ def _render_genscore_plots_async(
                     ehr_columns=ehr_columns_labelled,
                     ehr_kinds=tuple(str(k) for k in ehr_panel.feature_kinds),
                     history=history,
+                    event=event,
+                    target_name=target_name,
                 ),
             )
             _log_rss(logger, "genscore-plots after save_all")
@@ -4064,6 +4068,8 @@ def run_pipeline() -> PipelineResult:
         kept_person_ids,
         genscore_meta,
         logger,
+        event=np.asarray(data.event, dtype=int) if data.event is not None else None,
+        target_name=SURVIVAL_TARGET_COLUMN,
     )
 
     _log_rss(logger, "before mrdag")

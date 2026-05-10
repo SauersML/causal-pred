@@ -44,7 +44,14 @@ from matplotlib import patches
 from matplotlib.colors import LinearSegmentedColormap, Normalize
 from matplotlib.figure import Figure
 
-from .crosscoder import TopKCrosscoder, encode, feature_stream_share
+from .crosscoder import (
+    BANK_EHR_PRIVATE,
+    BANK_GENOME_PRIVATE,
+    BANK_SHARED,
+    TopKCrosscoder,
+    encode,
+    feature_stream_share,
+)
 from .integrate import AlignedPanels, FeatureSelection
 
 
@@ -1241,6 +1248,178 @@ def activation_ridgeline(
 # ---------------------------------------------------------------------------
 
 
+def participant_umap(
+    z: np.ndarray,
+    event: Optional[np.ndarray] = None,
+    *,
+    target_name: str = "event",
+    sample_size: int = 12000,
+    n_neighbors: int = 30,
+    min_dist: float = 0.10,
+    seed: int = 0,
+) -> Figure:
+    """UMAP of participant latent embeddings ``z = (n, d)``.
+
+    Coloured by ``event`` (0/1) when provided so the cohort can be
+    eyeballed for separation between the outcome positive and negative
+    classes in crosscoder space. Subsampled to ``sample_size`` rows by
+    default because UMAP on n>50k is wall-clock dominated by the
+    nearest-neighbour graph build.
+    """
+    import umap  # type: ignore[import-not-found]
+
+    n = int(z.shape[0])
+    rng = np.random.default_rng(seed)
+    if sample_size and n > sample_size:
+        idx = rng.choice(n, size=sample_size, replace=False)
+        z_sub = np.ascontiguousarray(z[idx], dtype=np.float32)
+        ev_sub = np.asarray(event)[idx] if event is not None else None
+    else:
+        z_sub = np.ascontiguousarray(z, dtype=np.float32)
+        ev_sub = np.asarray(event) if event is not None else None
+
+    reducer = umap.UMAP(
+        n_neighbors=n_neighbors,
+        min_dist=min_dist,
+        metric="cosine",
+        random_state=seed,
+        verbose=False,
+    )
+    emb = reducer.fit_transform(z_sub)
+
+    fig, ax = _new_axes((9.5, 7.5))
+    if ev_sub is not None:
+        non_event = ev_sub.astype(int) == 0
+        is_event = ev_sub.astype(int) == 1
+        ax.scatter(
+            emb[non_event, 0], emb[non_event, 1],
+            s=3, c="#9AA5B1", alpha=0.30, linewidths=0,
+            label=f"non-{target_name} (n={int(non_event.sum()):,})",
+        )
+        ax.scatter(
+            emb[is_event, 0], emb[is_event, 1],
+            s=8, c=GENOME_COLOR, alpha=0.75, linewidths=0,
+            label=f"{target_name} case (n={int(is_event.sum()):,})",
+        )
+        ax.legend(loc="best", frameon=True, framealpha=0.85, fontsize=9)
+    else:
+        ax.scatter(
+            emb[:, 0], emb[:, 1], s=3, c=GENOME_COLOR,
+            alpha=0.30, linewidths=0,
+        )
+    _style_axes(ax)
+    ax.set_xlabel("UMAP 1", fontsize=10, color=TEXT_COLOR)
+    ax.set_ylabel("UMAP 2", fontsize=10, color=TEXT_COLOR)
+    ax.set_title(
+        f"Participant latent space (UMAP, n={int(z_sub.shape[0]):,} of {n:,})",
+        fontsize=12, color=TEXT_COLOR,
+    )
+    return fig
+
+
+def feature_umap(
+    model: TopKCrosscoder,
+    selection: FeatureSelection,
+    *,
+    n_neighbors: int = 15,
+    min_dist: float = 0.08,
+    seed: int = 0,
+) -> Figure:
+    """UMAP of crosscoder features in their decoder-vector space.
+
+    Each point is one of the ``d`` latent features; coordinates come from
+    UMAP applied to the concatenated decoder rows ``[W_d_G[j] | W_d_E[j]]``
+    (cosine metric). Colour encodes ``r_G`` so genome-decoder-dominant
+    features land at one end of the colour bar and EHR-decoder-dominant
+    at the other; promoted features are drawn larger with a black star
+    marker so the chosen subset is visible against the background of all
+    learned features. Dead features (zero decoder norm) are filtered out.
+    """
+    import umap  # type: ignore[import-not-found]
+
+    W = np.concatenate([model.W_d_G, model.W_d_E], axis=1)
+    norm = np.linalg.norm(W, axis=1)
+    alive = norm > 1e-8
+    W_alive = np.ascontiguousarray(W[alive], dtype=np.float32)
+    if W_alive.shape[0] < 4:
+        fig, ax = _new_axes((6.0, 4.0))
+        ax.text(0.5, 0.5, "too few alive features for UMAP",
+                ha="center", va="center", color=TEXT_COLOR)
+        ax.set_axis_off()
+        return fig
+
+    g_norm_sq = np.sum(model.W_d_G ** 2, axis=1)
+    e_norm_sq = np.sum(model.W_d_E ** 2, axis=1)
+    total = np.where(g_norm_sq + e_norm_sq > 0, g_norm_sq + e_norm_sq, 1.0)
+    r_g_full = g_norm_sq / total
+    r_g = r_g_full[alive]
+
+    bank = np.asarray(model.latent_bank)[alive]
+    idx_alive = np.flatnonzero(alive)
+    promoted_set = set(int(i) for i in selection.indices)
+    is_promoted = np.array(
+        [int(j) in promoted_set for j in idx_alive], dtype=bool
+    )
+
+    reducer = umap.UMAP(
+        n_neighbors=min(n_neighbors, max(2, W_alive.shape[0] - 1)),
+        min_dist=min_dist,
+        metric="cosine",
+        random_state=seed,
+        verbose=False,
+    )
+    emb = reducer.fit_transform(W_alive)
+
+    fig, ax = _new_axes((10.5, 7.5))
+
+    bank_marker = {
+        BANK_SHARED: "o",
+        BANK_GENOME_PRIVATE: "s",
+        BANK_EHR_PRIVATE: "^",
+    }
+    bank_label = {
+        BANK_SHARED: "shared bank",
+        BANK_GENOME_PRIVATE: "genome-private",
+        BANK_EHR_PRIVATE: "EHR-private",
+    }
+    sc = None
+    for b, marker in bank_marker.items():
+        sel = (bank == b) & ~is_promoted
+        if not bool(sel.any()):
+            continue
+        sc = ax.scatter(
+            emb[sel, 0], emb[sel, 1],
+            c=r_g[sel], cmap=DIVERGING_CMAP,
+            norm=Normalize(vmin=0.0, vmax=1.0),
+            s=14, alpha=0.75, edgecolor="none", marker=marker,
+            label=f"{bank_label[b]} (n={int(sel.sum())})",
+        )
+    if bool(is_promoted.any()):
+        ax.scatter(
+            emb[is_promoted, 0], emb[is_promoted, 1],
+            c=r_g[is_promoted], cmap=DIVERGING_CMAP,
+            norm=Normalize(vmin=0.0, vmax=1.0),
+            s=130, alpha=1.0, edgecolor="black", linewidth=1.4,
+            marker="*", label=f"promoted (n={int(is_promoted.sum())})",
+            zorder=5,
+        )
+    if sc is not None:
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.035, pad=0.02)
+        cbar.set_label("genome share $r_G$", fontsize=10, color=TEXT_COLOR)
+        cbar.ax.tick_params(colors=AXIS_COLOR, labelsize=8)
+    ax.legend(loc="best", frameon=True, framealpha=0.9, fontsize=9)
+    _style_axes(ax)
+    ax.set_xlabel("UMAP 1", fontsize=10, color=TEXT_COLOR)
+    ax.set_ylabel("UMAP 2", fontsize=10, color=TEXT_COLOR)
+    ax.set_title(
+        f"Crosscoder features in decoder space "
+        f"({int(alive.sum())} of {int(model.d)} alive, "
+        f"colour = $r_G$, marker = bank, star = promoted)",
+        fontsize=12, color=TEXT_COLOR,
+    )
+    return fig
+
+
 def overview(
     model: TopKCrosscoder,
     *,
@@ -1431,6 +1610,8 @@ class GenscorePlotInputs:
     ehr_columns: Optional[Sequence[str]] = None
     ehr_kinds: Optional[Sequence[str]] = None
     history: Optional[Mapping[str, Sequence[float]]] = None
+    event: Optional[np.ndarray] = None
+    target_name: str = "T2D"
     band: Tuple[float, float] = (0.2, 0.8)
     min_activation_rate: float = 0.01
 
@@ -1586,6 +1767,34 @@ def save_all_genscore_plots(
         )
         saved["crosscoder_overview"] = _save(
             fig, outputs_dir, "crosscoder_00_overview")
+
+    # 11. participant UMAP (cohort latent space coloured by event status)
+    if z is not None:
+        try:
+            fig = participant_umap(
+                z,
+                event=inputs.event,
+                target_name=inputs.target_name,
+            )
+            saved["crosscoder_participant_umap"] = _save(
+                fig, outputs_dir, "crosscoder_10_participant_umap")
+        except Exception as exc:  # pragma: no cover - umap is optional
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "participant_umap failed: %s", exc, exc_info=True
+            )
+
+    # 12. feature UMAP (decoder-vector space, coloured by r_G)
+    if inputs.model is not None and inputs.selection is not None:
+        try:
+            fig = feature_umap(inputs.model, inputs.selection)
+            saved["crosscoder_feature_umap"] = _save(
+                fig, outputs_dir, "crosscoder_11_feature_umap")
+        except Exception as exc:  # pragma: no cover - umap is optional
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "feature_umap failed: %s", exc, exc_info=True
+            )
 
     return saved
 
