@@ -599,16 +599,16 @@ def decoder_heatmap(
     ehr_columns: Sequence[str],
     *,
     ehr_kinds: Optional[Sequence[str]] = None,
-    max_columns_per_side: int = 80,
+    max_genome_rows: int = 25,
+    max_ehr_rows: int = 35,
 ) -> Figure:
-    """Signed decoder-weight heatmap over the full PRS + EHR vocabulary.
-
-    Rows: promoted features, sorted by genome share descending (genome-
-    heavy at the top). Columns: PRS columns followed by EHR columns; a
-    vertical divider marks the split. If the EHR side is too wide, only
-    the columns with the largest absolute promoted-feature loading are
-    shown. A coloured kind-bar above the EHR columns indicates which
-    feature kind each column belongs to.
+    """Signed decoder-weight heatmap over the most informative PRS + EHR
+    columns, *transposed* relative to a conventional feature-vs-variable
+    matrix: promoted features run along the x-axis (so all 14-32 of them
+    fit comfortably), variables run down the y-axis with full readable
+    labels, EHR columns grouped by kind. A signed cell value is drawn
+    inside whenever ``|weight| >= 0.05`` so the dominant loadings are
+    legible without zooming.
     """
     idx = np.asarray(selection.indices, dtype=int)
     order = np.argsort(-selection.genome_share)
@@ -619,114 +619,158 @@ def decoder_heatmap(
     Wg = model.W_d_G[idx]   # (n_promote, m_G)
     We = model.W_d_E[idx]   # (n_promote, m_E)
 
-    # Optionally trim columns by greatest absolute weight across promoted features
-    def _pick(W: np.ndarray, names: Sequence[str], cap: int) -> Tuple[np.ndarray, np.ndarray]:
-        if W.shape[1] <= cap:
-            return np.arange(W.shape[1]), np.asarray(names)
+    # Pick the columns with the strongest absolute loading on at least
+    # one promoted feature. Sort genome side by max-abs descending so the
+    # most-influential PRS rises to the top of its block; EHR side groups
+    # by kind first, then by max-abs within kind.
+    def _topk_by_max_abs(W: np.ndarray, k: int) -> np.ndarray:
         score = np.max(np.abs(W), axis=0)
-        keep = np.argsort(-score)[:cap]
-        keep_sorted = np.sort(keep)
-        return keep_sorted, np.asarray(names)[keep_sorted]
+        n = min(int(k), int(W.shape[1]))
+        if n <= 0:
+            return np.array([], dtype=int)
+        return np.argsort(-score)[:n]
 
-    g_keep, g_names = _pick(Wg, prs_columns, max_columns_per_side)
-    e_keep, e_names = _pick(We, ehr_columns, max_columns_per_side)
-    Wg_show = Wg[:, g_keep]
-    We_show = We[:, e_keep]
-    if ehr_kinds is not None:
-        e_kinds_show = np.asarray(ehr_kinds)[e_keep]
+    g_keep = _topk_by_max_abs(Wg, max_genome_rows)
+    g_keep = g_keep[np.argsort(-np.max(np.abs(Wg[:, g_keep]), axis=0))]
+    g_names = np.asarray(prs_columns)[g_keep] if g_keep.size else np.array([], dtype=object)
+
+    e_keep_pre = _topk_by_max_abs(We, max_ehr_rows)
+    if e_keep_pre.size and ehr_kinds is not None:
+        e_kinds_arr = np.asarray(ehr_kinds)
+        e_kinds_pre = e_kinds_arr[e_keep_pre]
+        kind_order = ["condition", "drug", "lab_mean", "lab_min", "lab_max",
+                      "lab_slope", "lab_missing", "utilisation"]
+        order_keys = []
+        for j, idx_keep in enumerate(e_keep_pre):
+            kind = str(e_kinds_pre[j])
+            kind_rank = kind_order.index(kind) if kind in kind_order else len(kind_order)
+            score = float(np.max(np.abs(We[:, idx_keep])))
+            order_keys.append((kind_rank, -score, idx_keep))
+        order_keys.sort()
+        e_keep = np.array([k[2] for k in order_keys], dtype=int)
     else:
-        e_kinds_show = None
+        e_keep = e_keep_pre
+    e_names = np.asarray(ehr_columns)[e_keep] if e_keep.size else np.array([], dtype=object)
+    e_kinds_show = np.asarray(ehr_kinds)[e_keep] if (
+        ehr_kinds is not None and e_keep.size
+    ) else None
 
-    H = np.concatenate([Wg_show, We_show], axis=1)
-    vmax = np.max(np.abs(H)) if H.size else 1.0
-    n_g_cols = Wg_show.shape[1]
+    Wg_show = Wg[:, g_keep] if g_keep.size else np.zeros((Wg.shape[0], 0))
+    We_show = We[:, e_keep] if e_keep.size else np.zeros((We.shape[0], 0))
 
-    n_rows = H.shape[0]
-    n_cols = H.shape[1]
-    fig_w = max(8.0, 0.18 * n_cols + 4.0)
-    fig_h = max(4.5, 0.30 * n_rows + 2.0)
+    # Stack rows: PRS block on top, EHR block below; transpose so the
+    # heatmap shows variables-as-rows, features-as-columns.
+    n_features = Wg.shape[0]
+    n_g_rows = Wg_show.shape[1]
+    n_e_rows = We_show.shape[1]
+    n_rows = n_g_rows + n_e_rows
+    if n_rows == 0:
+        # Defensive: render an empty placeholder rather than dividing by zero.
+        fig, ax = _new_axes((6.0, 3.0))
+        ax.text(0.5, 0.5, "no decoder loadings to plot",
+                ha="center", va="center", color=TEXT_COLOR)
+        ax.set_axis_off()
+        return fig
+    H = np.zeros((n_rows, n_features), dtype=float)
+    if n_g_rows:
+        H[:n_g_rows] = Wg_show.T
+    if n_e_rows:
+        H[n_g_rows:] = We_show.T
+    vmax = float(np.max(np.abs(H))) or 1.0
+
+    row_labels = [str(n) for n in g_names] + [str(n) for n in e_names]
+
+    # Layout: main heatmap centre, kind-color side strip on the left, r_G
+    # bar across the top of the feature columns, colorbar on the right.
+    fig_h = max(6.5, 0.32 * n_rows + 2.5)
+    fig_w = max(9.0, 0.55 * n_features + 5.5)
     fig = plt.figure(figsize=(fig_w, fig_h), dpi=_DPI, constrained_layout=True)
     gs = fig.add_gridspec(
-        nrows=2, ncols=2,
-        height_ratios=[0.05, 1.0],
-        width_ratios=[1.0, 0.10],
+        nrows=2, ncols=3,
+        height_ratios=[0.06, 1.0],
+        width_ratios=[0.04, 1.0, 0.05],
         hspace=0.02, wspace=0.02,
     )
-    ax_kind = fig.add_subplot(gs[0, 0])
-    ax_main = fig.add_subplot(gs[1, 0])
-    ax_rg = fig.add_subplot(gs[1, 1], sharey=ax_main)
+    ax_rg = fig.add_subplot(gs[0, 1])
+    ax_side = fig.add_subplot(gs[1, 0])
+    ax_main = fig.add_subplot(gs[1, 1], sharey=ax_side)
+    ax_cbar = fig.add_subplot(gs[1, 2])
 
-    # ---- kind / side bar above heatmap ------------------------------------
-    kind_row = np.zeros((1, n_cols, 3), dtype=float)
-    # genome side: solid genome color
-    kind_row[0, :n_g_cols] = matplotlib.colors.to_rgb(GENOME_COLOR)
-    # EHR side: per-column kind color or default
-    for j in range(n_g_cols, n_cols):
+    # ---- left side strip: kind-coloured band per row ----------------------
+    side_band = np.zeros((n_rows, 1, 3), dtype=float)
+    if n_g_rows:
+        side_band[:n_g_rows, 0] = matplotlib.colors.to_rgb(GENOME_COLOR)
+    for r in range(n_g_rows, n_rows):
         if e_kinds_show is not None:
-            kind = str(e_kinds_show[j - n_g_cols])
-            kind_row[0, j] = matplotlib.colors.to_rgb(
+            kind = str(e_kinds_show[r - n_g_rows])
+            side_band[r, 0] = matplotlib.colors.to_rgb(
                 EHR_KIND_COLORS.get(kind, EHR_COLOR)
             )
         else:
-            kind_row[0, j] = matplotlib.colors.to_rgb(EHR_COLOR)
-    ax_kind.imshow(kind_row, aspect="auto", interpolation="nearest")
-    ax_kind.set_xticks([])
-    ax_kind.set_yticks([])
-    for spine in ax_kind.spines.values():
+            side_band[r, 0] = matplotlib.colors.to_rgb(EHR_COLOR)
+    ax_side.imshow(side_band, aspect="auto", interpolation="nearest")
+    ax_side.set_xticks([])
+    ax_side.set_yticks(range(n_rows))
+    ax_side.set_yticklabels(row_labels, fontsize=8.5, color=TEXT_COLOR)
+    ax_side.tick_params(axis="y", length=0, pad=4)
+    for spine in ax_side.spines.values():
         spine.set_visible(False)
-    ax_kind.text(n_g_cols / 2 - 0.5, 0, "  genome (PRS)",
-                 ha="center", va="center", color="white",
-                 fontsize=9, fontweight="bold")
-    ax_kind.text((n_g_cols + n_cols) / 2 - 0.5, 0, "EHR",
-                 ha="center", va="center", color="white",
-                 fontsize=9, fontweight="bold")
 
-    # ---- main heatmap -----------------------------------------------------
+    # ---- top: r_G bar per feature column ---------------------------------
+    ax_rg.bar(
+        range(n_features), r_g_promoted,
+        color=[GENOME_COLOR if x >= 0.5 else EHR_COLOR for x in r_g_promoted],
+        edgecolor="white", linewidth=0.4, width=0.86,
+    )
+    ax_rg.axhline(0.5, color=AXIS_COLOR, linewidth=0.5, alpha=0.5, linestyle=":")
+    ax_rg.set_xlim(-0.5, n_features - 0.5)
+    ax_rg.set_ylim(0, 1.0)
+    ax_rg.set_yticks([0.0, 0.5, 1.0])
+    ax_rg.set_yticklabels(["0", "0.5", "1"], fontsize=7)
+    ax_rg.set_xticks([])
+    ax_rg.tick_params(axis="y", length=2, pad=2)
+    for spine in ("top", "right", "bottom"):
+        ax_rg.spines[spine].set_visible(False)
+    ax_rg.spines["left"].set_color(AXIS_COLOR)
+    ax_rg.spines["left"].set_linewidth(0.8)
+    ax_rg.set_ylabel("$r_G$", fontsize=8, color=TEXT_COLOR)
+
+    # ---- main heatmap ----------------------------------------------------
     im = ax_main.imshow(
         H, aspect="auto", cmap=DIVERGING_CMAP,
         norm=Normalize(vmin=-vmax, vmax=vmax), interpolation="nearest",
     )
-    ax_main.axvline(n_g_cols - 0.5, color="black", linewidth=1.0)
-    ax_main.set_yticks(range(n_rows))
-    ax_main.set_yticklabels(
-        [_short(n, 24) for n in feat_names], fontsize=8.5,
-        color=TEXT_COLOR,
-    )
-    col_names = list(g_names) + list(e_names)
-    ax_main.set_xticks(range(n_cols))
+    if n_g_rows and n_e_rows:
+        ax_main.axhline(n_g_rows - 0.5, color="black", linewidth=1.0)
+    ax_main.set_xticks(range(n_features))
     ax_main.set_xticklabels(
-        [_short(c, 18) for c in col_names],
-        rotation=70, ha="right", fontsize=7, color=TEXT_COLOR,
+        [str(n) for n in feat_names],
+        rotation=45, ha="right", fontsize=8.5, color=TEXT_COLOR,
     )
-    ax_main.tick_params(axis="x", length=2, pad=2)
-    ax_main.tick_params(axis="y", length=2)
+    ax_main.set_yticks([])
+    ax_main.tick_params(axis="x", length=2, pad=3)
     for spine in ax_main.spines.values():
         spine.set_color(AXIS_COLOR)
         spine.set_linewidth(0.8)
 
-    cbar = fig.colorbar(im, ax=ax_main, orientation="vertical",
-                        pad=0.10, fraction=0.025, shrink=0.7)
+    # ---- annotate strong cells ------------------------------------------
+    annotate_threshold = 0.05
+    for r in range(n_rows):
+        for c in range(n_features):
+            v = H[r, c]
+            if abs(v) >= annotate_threshold:
+                # White text on saturated colors, dark on faint cells.
+                txt_color = "white" if abs(v) / vmax > 0.55 else TEXT_COLOR
+                ax_main.text(
+                    c, r, f"{v:+.2f}",
+                    ha="center", va="center",
+                    fontsize=7.0, color=txt_color,
+                )
+
+    # ---- colorbar -------------------------------------------------------
+    cbar = fig.colorbar(im, cax=ax_cbar, orientation="vertical")
     cbar.set_label("decoder weight", fontsize=9, color=TEXT_COLOR)
     cbar.ax.tick_params(colors=AXIS_COLOR, labelsize=8)
-
-    # ---- right strip: r_G per row ----------------------------------------
-    ax_rg.barh(
-        range(n_rows), r_g_promoted,
-        color=[GENOME_COLOR if x >= 0.5 else EHR_COLOR for x in r_g_promoted],
-        edgecolor="white", linewidth=0.4, height=0.85,
-    )
-    ax_rg.axvline(0.5, color=AXIS_COLOR, linewidth=0.6, alpha=0.6,
-                  linestyle=":")
-    ax_rg.invert_yaxis()
-    ax_rg.set_xlim(0, 1.0)
-    ax_rg.set_xticks([0, 0.5, 1.0])
-    ax_rg.set_xticklabels(["0", "0.5", "1"], fontsize=8)
-    ax_rg.set_yticks([])
-    for spine in ("top", "right", "left"):
-        ax_rg.spines[spine].set_visible(False)
-    ax_rg.spines["bottom"].set_color(AXIS_COLOR)
-    ax_rg.spines["bottom"].set_linewidth(0.8)
-    ax_rg.set_xlabel("$r_G$", fontsize=9, color=TEXT_COLOR)
 
     fig.suptitle(
         "Promoted feature decoder weights",
