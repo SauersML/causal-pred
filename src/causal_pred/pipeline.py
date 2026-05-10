@@ -4184,60 +4184,170 @@ def run_pipeline() -> PipelineResult:
     }
     _log_validation_metrics(logger, edge_validation)
 
+    # ---- summary ---------------------------------------------------------
+    surv_metrics = survival_diagnostics.get("metrics") or {}
+    td = surv_metrics.get("time_dependent_auc") or {}
+    br = surv_metrics.get("brier") or {}
+    cal = surv_metrics.get("calibration_at_10y") or {}
+
+    def _flag(condition: bool, label: str) -> str:
+        return f"  [WARN: {label}]" if condition else ""
+
+    bar = "=" * 78
+    logger.info("[summary] " + bar)
     logger.info("[summary] === pipeline metrics ===")
+    logger.info("[summary] " + bar)
+
+    # cohort
     logger.info(
-        "[summary] cohort: n=%d p=%d events=%d event_rate=%.4f",
+        "[summary] cohort:    n=%d   p=%d   events=%d   event_rate=%.4f",
         data.n,
         data.p,
         int(data.event.sum()),
         float(np.mean(data.event)),
     )
+    promoted_names = list(genscore_meta.get("promoted_names", []))
     logger.info(
-        "[summary] timings: %s",
-        ", ".join(f"{k}={_format_seconds(float(v))}" for k, v in timings.items()),
+        "[summary] genscore:  base_n=%d  augmented_n=%d  promoted=%d %s",
+        int(genscore_meta.get("base_n", 0)),
+        int(genscore_meta.get("augmented_n", 0)),
+        len(promoted_names),
+        f"({', '.join(promoted_names[:8])}{'...' if len(promoted_names) > 8 else ''})"
+        if promoted_names else "",
     )
+
+    # timings, sorted longest-first so the bottleneck is obvious
+    sorted_timings = sorted(timings.items(), key=lambda kv: -float(kv[1]))
     logger.info(
-        "[summary] mrdag: max_rhat=%.3f candidate_edges=%d",
-        float(mrdag_diagnostics.get("max_rhat_on_allowed", float("nan"))),
+        "[summary] timings:   %s",
+        "  ".join(f"{k}={_format_seconds(float(v))}" for k, v in sorted_timings),
+    )
+
+    # mrdag
+    mrdag_max_rhat = float(mrdag_diagnostics.get("max_rhat_on_allowed", float("nan")))
+    logger.info(
+        "[summary] mrdag:     max_rhat=%.3f  candidate_edges=%d%s",
+        mrdag_max_rhat,
         int(mrdag_diagnostics.get("n_candidate_edges", 0)),
+        _flag(np.isfinite(mrdag_max_rhat) and mrdag_max_rhat > 1.10,
+              f"max_rhat={mrdag_max_rhat:.2f} > 1.10 (poor mixing)"),
     )
+
+    # dagslam
     logger.info(
-        "[summary] dagslam: log_score=%.3f n_edges=%d",
+        "[summary] dagslam:   log_score=%.3f  n_edges=%d",
         float(dagslam["log_score"]),
         int(dagslam["n_edges"]),
     )
+
+    # mcmc
     n_scored = int(allowed_edges.sum())
+    mcmc_acc = float(mcmc_diagnostics["accept_rate"].get("overall", float("nan")))
+    mcmc_acc_mh = float(
+        mcmc_diagnostics["accept_rate"].get("metropolis_hastings", float("nan"))
+    )
+    mcmc_max_rhat = float(mcmc_diagnostics.get("max_rhat_directed", float("nan")))
+    mcmc_min_ess = float(mcmc_diagnostics.get("min_ess", float("nan")))
     logger.info(
-        "[summary] mcmc: accept=%.3f accept_mh=%.3f max_rhat_directed=%.3f min_ess=%.1f "
-        "edges_above_%.2f=%d/%d",
-        float(mcmc_diagnostics["accept_rate"].get("overall", float("nan"))),
-        float(mcmc_diagnostics["accept_rate"].get("metropolis_hastings", float("nan"))),
-        float(mcmc_diagnostics.get("max_rhat_directed", float("nan"))),
-        float(mcmc_diagnostics.get("min_ess", float("nan"))),
+        "[summary] mcmc:      accept=%.3f  accept_mh=%.3f  max_rhat=%s  min_ess=%.1f  "
+        "edges_above_%.2f=%d/%d%s%s%s",
+        mcmc_acc,
+        mcmc_acc_mh,
+        ("inf" if not np.isfinite(mcmc_max_rhat) else f"{mcmc_max_rhat:.3f}"),
+        mcmc_min_ess,
         float(THRESHOLD_DEFAULT),
         int(np.sum(thresholded)),
         int(n_scored),
+        _flag(np.isfinite(mcmc_acc_mh) and mcmc_acc_mh < 0.10,
+              f"accept_mh={mcmc_acc_mh:.3f} < 0.10 (proposals largely rejected)"),
+        _flag(not np.isfinite(mcmc_max_rhat),
+              "max_rhat=inf (chain divergence on at least one edge)"),
+        _flag(np.isfinite(mcmc_min_ess) and mcmc_min_ess < 100.0,
+              f"min_ess={mcmc_min_ess:.0f} < 100 (effective-sample-size deficit)"),
     )
+
+    # top 10 posterior edges over the directed graph
+    if mcmc_samples.shape[0] > 0:
+        ep = np.asarray(edge_probs, dtype=float)
+        cols = list(data.columns)
+        flat = []
+        for i in range(ep.shape[0]):
+            for j in range(ep.shape[1]):
+                if i != j and np.isfinite(ep[i, j]) and ep[i, j] > 0:
+                    flat.append((ep[i, j], i, j))
+        flat.sort(reverse=True)
+        if flat:
+            top_edges = ", ".join(
+                f"{cols[i]}->{cols[j]}={p:.2f}" for p, i, j in flat[:10]
+            )
+            logger.info("[summary] top_edges: %s", top_edges)
+
+    # known-edge validation
     if "auroc" in edge_validation:
+        auroc = float(edge_validation["auroc"])
+        auprc = float(edge_validation["auprc"])
         logger.info(
-            "[summary] validation: AUROC=%.3f AUPRC=%.3f",
-            float(edge_validation["auroc"]),
-            float(edge_validation["auprc"]),
+            "[summary] validation: AUROC=%.3f  AUPRC=%.3f%s",
+            auroc, auprc,
+            _flag(np.isfinite(auroc) and auroc < 0.55,
+                  f"AUROC={auroc:.3f} ~ chance (no discrimination of known edges)"),
         )
-    surv_metrics = survival_diagnostics.get("metrics") or {}
-    if surv_metrics:
-        td = surv_metrics.get("time_dependent_auc") or {}
-        br = surv_metrics.get("brier") or {}
-        cal = surv_metrics.get("calibration_at_10y") or {}
+    known = edge_validation.get("known_edges") if isinstance(edge_validation, dict) else None
+    if isinstance(known, dict) and known:
+        items = sorted(known.items(), key=lambda kv: -float(kv[1]))
         logger.info(
-            "[summary] survival: integrated_AUC=%.3f integrated_Brier=%.4f "
-            "ECE_10y=%.4f Nagelkerke_R2_10y=%.3f",
-            float(td.get("integrated_auc", float("nan"))),
-            float(br.get("ibs", float("nan"))),
-            float(cal.get("ece", float("nan"))),
-            float(surv_metrics.get("nagelkerke_r2_at_10y", float("nan"))),
+            "[summary] known_edges: %s",
+            ", ".join(f"{k}={float(v):.2f}" for k, v in items[:8]),
         )
 
+    # survival
+    if surv_metrics:
+        ibs = float(br.get("ibs", float("nan")))
+        ece = float(cal.get("ece", float("nan")))
+        nag = float(surv_metrics.get("nagelkerke_r2_at_10y", float("nan")))
+        iauc = float(td.get("integrated_auc", float("nan")))
+        # baseline Brier for an event_rate-sized null model is event_rate*(1-event_rate)
+        ev_rate = float(np.mean(data.event))
+        null_brier = ev_rate * (1.0 - ev_rate)
+        logger.info(
+            "[summary] survival:  integrated_AUC=%.3f  integrated_Brier=%.4f  "
+            "ECE_10y=%.4f  Nagelkerke_R2_10y=%.3g%s%s%s%s",
+            iauc, ibs, ece, nag,
+            _flag(np.isfinite(ibs) and ibs > null_brier,
+                  f"IBS={ibs:.3f} > null Brier {null_brier:.3f} "
+                  "(model worse than baseline rate)"),
+            _flag(np.isfinite(ece) and ece > 0.10,
+                  f"ECE_10y={ece:.3f} > 0.10 (poor calibration)"),
+            _flag(np.isfinite(nag) and (nag < -1.0 or nag > 1.0),
+                  f"Nagelkerke_R2={nag:.3g} out of [-1, 1] (degenerate fit)"),
+            _flag(np.isfinite(iauc) and iauc < 0.55,
+                  f"integrated_AUC={iauc:.3f} ~ chance"),
+        )
+        # per-time AUC if available
+        per_time = td.get("per_time")
+        if isinstance(per_time, dict) and per_time:
+            entries = sorted(
+                ((float(t), float(v)) for t, v in per_time.items() if v is not None),
+                key=lambda tv: tv[0],
+            )
+            if entries:
+                logger.info(
+                    "[summary] survival_per_time_AUC: %s",
+                    ", ".join(f"t={t:g}: {v:.3f}" for t, v in entries),
+                )
+
+    # output artifacts
+    out_dir = Path(DEFAULT_OUTPUT_DIR)
+    if out_dir.is_dir():
+        plots_dir = out_dir / "plots"
+        n_plots = sum(1 for _ in plots_dir.glob("*.png")) if plots_dir.is_dir() else 0
+        logger.info(
+            "[summary] artefacts: %s  (plots=%d)",
+            str(out_dir.resolve()),
+            n_plots,
+        )
+
+    logger.info("[summary] " + bar)
     logger.info(
         "[pipeline] complete elapsed=%s n=%d p=%d",
         _format_seconds(time.time() - pipeline_started_at),
