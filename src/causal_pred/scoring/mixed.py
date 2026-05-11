@@ -149,12 +149,32 @@ def _score_cache_context_key(
     horizon = float(hyper.get("survival_horizon", _SURVIVAL_HORIZON_DEFAULT))
     survival_time = hyper.get("survival_time")
     survival_event = hyper.get("survival_event")
+    node_types_tup = tuple(str(t) for t in node_types)
+
+    # Fast path: if cache already saw the exact same arrays (by reference)
+    # and identical scalar hypers, skip the SHA-256 hash of the full data
+    # matrix. SHA-256 over ~50 MB AoU data is ~30-50 ms per call, multiplied
+    # by ~1800 calls in the first hill-climb iteration -- the main reason
+    # dagslam appears silent for minutes on biobank-scale runs.
+    if cache is not None:
+        existing = cache.get("__score_cache_context__")
+        if existing is not None:
+            if (
+                existing.get("data_ref") is data
+                and existing.get("survival_time_ref") is survival_time
+                and existing.get("survival_event_ref") is survival_event
+                and existing.get("node_types") == node_types_tup
+                and existing.get("alpha_mu") == alpha_mu
+                and existing.get("tau2") == tau2
+                and existing.get("survival_horizon") == horizon
+            ):
+                return existing["key"]
 
     payload = {
         "data_shape": tuple(int(x) for x in data.shape),
         "data_dtype": str(data.dtype),
         "data_sha256": _array_hash(data),
-        "node_types": tuple(str(t) for t in node_types),
+        "node_types": node_types_tup,
         "alpha_mu": alpha_mu,
         "tau2": tau2,
         "survival_horizon": horizon,
@@ -178,6 +198,16 @@ def _score_cache_context_key(
         cache["__score_cache_context__"] = {
             "payload": payload,
             "key": context_key,
+            # Reference-equality fast-path identifiers. Holding strong refs
+            # to the arrays keeps id() comparisons sound for the cache's
+            # lifetime.
+            "data_ref": data,
+            "survival_time_ref": survival_time,
+            "survival_event_ref": survival_event,
+            "node_types": node_types_tup,
+            "alpha_mu": alpha_mu,
+            "tau2": tau2,
+            "survival_horizon": horizon,
         }
     return context_key
 

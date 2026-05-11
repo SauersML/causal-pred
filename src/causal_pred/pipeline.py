@@ -34,7 +34,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Optional, Sequence, Tuple
+from typing import Any, Callable, Iterator, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -87,7 +87,6 @@ GENOTYPE_CACHE_DIR = str(Path.home() / "causal-pred" / "genomes")
 
 PIPELINE_CONFIG_VERSION = "2026-05-11.refactor-spine-graph-mcmc-names.1"
 PIPELINE_SEED = 20260416
-PIPELINE_VERBOSE = False
 
 COHORT_NAME = "complete"
 PRS_NODES = 8
@@ -482,7 +481,7 @@ class _AsyncUploader:
 PIPELINE_LOG_FILENAME = "pipeline.log"
 
 
-def _setup_logger(verbose: bool) -> logging.Logger:
+def _setup_logger() -> logging.Logger:
     # Attach handlers to the package parent so submodules (e.g.
     # ``causal_pred.data.polygenic``, ``causal_pred.genscore.panels``)
     # passthrough into the same stdout stream and pipeline.log file.
@@ -511,12 +510,12 @@ def _setup_logger(verbose: bool) -> logging.Logger:
             f"[pipeline] WARNING failed to attach file log under {log_dir}: {exc}\n"
         )
         log_path = None
-    parent.setLevel(logging.DEBUG if verbose else logging.INFO)
+    parent.setLevel(logging.INFO)
     parent.propagate = False
 
     logger = logging.getLogger("causal_pred.pipeline")
     logger.handlers.clear()
-    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    logger.setLevel(logging.INFO)
     logger.propagate = True
     if log_path is not None:
         logger.info(
@@ -2083,7 +2082,152 @@ def _augment_with_prs_nodes(
     return augmented, pid[keep], meta
 
 
+def _genscore_plots_cache_hit(
+    plots_dir: Path,
+    sentinel: Path,
+    genscore_key: str,
+    logger: logging.Logger,
+) -> bool:
+    """Return True if a valid local plots cache for ``genscore_key`` is on disk."""
+    if not sentinel.is_file():
+        return False
+    try:
+        existing = sentinel.read_text().strip()
+    except OSError:
+        return False
+    if existing != genscore_key:
+        return False
+    figures = sorted(plots_dir.glob("crosscoder_*.png"))
+    if not figures:
+        return False
+    logger.info(
+        "[genscore-plots] cache hit %s (%d figures already on disk; key=%s)",
+        plots_dir,
+        len(figures),
+        genscore_key,
+    )
+    return True
+
+
+def _restore_genscore_plots_from_workspace(
+    cache: WorkspaceCache,
+    archive_filename: str,
+    plots_dir: Path,
+    sentinel: Path,
+    genscore_key: str,
+    logger: logging.Logger,
+) -> bool:
+    """Try to restore the plots tarball from workspace cache; return True on success."""
+    import tarfile
+
+    archive_path = cache.fetch(archive_filename)
+    if not archive_path.is_file() or archive_path.stat().st_size == 0:
+        return False
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(archive_path, "r:gz") as tf:
+            tf.extractall(plots_dir)
+    except (tarfile.TarError, OSError) as exc:
+        logger.warning(
+            "[genscore-plots] failed to extract cached archive %s: %s",
+            archive_path,
+            exc,
+        )
+        return False
+    try:
+        sentinel.write_text(genscore_key)
+    except OSError:
+        pass
+    figures = sorted(plots_dir.glob("crosscoder_*.png"))
+    logger.info(
+        "[genscore-plots] restored %d figures from cached archive %s (key=%s)",
+        len(figures),
+        archive_path,
+        genscore_key,
+    )
+    return True
+
+
+def _persist_genscore_plots_cache(
+    cache: WorkspaceCache,
+    plots_dir: Path,
+    sentinel: Path,
+    archive_filename: str,
+    genscore_key: str,
+    logger: logging.Logger,
+) -> None:
+    """Write the sentinel and upload a tarball of the plots dir to workspace cache."""
+    import tarfile
+
+    try:
+        sentinel.write_text(genscore_key)
+    except OSError as exc:
+        logger.warning("[genscore-plots] failed to write sentinel %s: %s", sentinel, exc)
+        return
+
+    archive_local = cache.path(archive_filename)
+    archive_local.parent.mkdir(parents=True, exist_ok=True)
+    tmp = archive_local.with_name(archive_local.name + ".part")
+    if tmp.exists():
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    entries = [
+        p
+        for p in sorted(plots_dir.iterdir())
+        if p.is_file() and not p.name.startswith(".")
+    ]
+    raw_bytes = 0
+    for p in entries:
+        try:
+            raw_bytes += p.stat().st_size
+        except OSError:
+            pass
+    logger.info(
+        "[genscore-plots] building plots archive %s "
+        "(%d files, %.1f MiB raw)",
+        archive_local.name,
+        len(entries),
+        raw_bytes / (1024.0 * 1024.0),
+    )
+    tar_t0 = time.time()
+    try:
+        with tarfile.open(tmp, "w:gz") as tf:
+            for entry in entries:
+                tf.add(entry, arcname=entry.name)
+        os.replace(tmp, archive_local)
+    except (tarfile.TarError, OSError) as exc:
+        logger.warning(
+            "[genscore-plots] failed to build plots archive %s: %s",
+            archive_local,
+            exc,
+        )
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        return
+    logger.info(
+        "[genscore-plots] archive built %.1fMiB elapsed=%s",
+        _path_size_mib(archive_local),
+        _format_seconds(time.time() - tar_t0),
+    )
+
+    try:
+        cache.store(archive_local, archive_filename)
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            "[genscore-plots] failed to upload plots archive %s: %s",
+            archive_local,
+            exc,
+        )
+
+
 def _render_genscore_plots_async(
+    cache: WorkspaceCache,
+    genscore_key: str,
     model_bundle: dict[str, Any] | None,
     prs_df: pd.DataFrame,
     ehr_panel: EhrPanel,
@@ -2100,6 +2244,17 @@ def _render_genscore_plots_async(
     still running. Failures are logged and swallowed: plotting must not
     take down the pipeline.
     """
+    plots_dir = Path(DEFAULT_OUTPUT_DIR) / "plots"
+    sentinel = plots_dir / ".genscore_plots_key"
+    archive_filename = f"genscore-plots-{genscore_key}.tar.gz"
+
+    if _genscore_plots_cache_hit(plots_dir, sentinel, genscore_key, logger):
+        return
+    if _restore_genscore_plots_from_workspace(
+        cache, archive_filename, plots_dir, sentinel, genscore_key, logger
+    ):
+        return
+
     if model_bundle is None:
         logger.info(
             "[genscore-plots] no cached crosscoder weights; "
@@ -2306,6 +2461,14 @@ def _render_genscore_plots_async(
                 plots_dir,
                 time.time() - t0,
             )
+            _persist_genscore_plots_cache(
+                cache,
+                Path(plots_dir),
+                sentinel,
+                archive_filename,
+                genscore_key,
+                logger,
+            )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("[genscore-plots] rendering failed: %s", exc, exc_info=True)
 
@@ -2326,8 +2489,18 @@ def _join_background_plot_threads(
     logger: logging.Logger, timeout: float = 120.0
 ) -> None:
     """Block briefly so background plot threads finish before sync/exit."""
+    if not _BACKGROUND_PLOT_THREADS:
+        logger.info("[genscore-plots] no background plot threads to join")
+        return
+    alive = [t for t in _BACKGROUND_PLOT_THREADS if t.is_alive()]
+    logger.info(
+        "[genscore-plots] joining %d background plot thread(s) (%d still alive)",
+        len(_BACKGROUND_PLOT_THREADS),
+        len(alive),
+    )
     for t in list(_BACKGROUND_PLOT_THREADS):
         if t.is_alive():
+            join_t0 = time.time()
             logger.info(
                 "[genscore-plots] waiting up to %.0fs for background plot thread %s",
                 timeout,
@@ -2340,7 +2513,19 @@ def _join_background_plot_threads(
                     "timeout; continuing",
                     t.name,
                 )
+            else:
+                logger.info(
+                    "[genscore-plots] thread %s joined after %s",
+                    t.name,
+                    _format_seconds(time.time() - join_t0),
+                )
+        else:
+            logger.info(
+                "[genscore-plots] thread %s already finished, nothing to wait for",
+                t.name,
+            )
     _BACKGROUND_PLOT_THREADS.clear()
+    logger.info("[genscore-plots] all background plot threads joined")
 
 
 def _load_or_run_genscore_features(
@@ -2350,7 +2535,7 @@ def _load_or_run_genscore_features(
     prs_df: pd.DataFrame,
     ehr_panel: EhrPanel,
     logger: logging.Logger,
-) -> tuple[SyntheticDataset, np.ndarray, dict[str, Any], dict[str, Any] | None]:
+) -> tuple[SyntheticDataset, np.ndarray, dict[str, Any], dict[str, Any] | None, str]:
     key = _genscore_key(data, person_ids, prs_df, ehr_panel)
     filename = f"genscore-{key}.npz"
     path = cache.fetch(filename)
@@ -2388,7 +2573,7 @@ def _load_or_run_genscore_features(
                     "device": str(z["cc_device"].item()),
                     "promoted_indices": np.asarray(z["cc_promoted_indices"], dtype=int),
                 }
-            return dataset, z["person_id"].astype(str), meta, model_bundle
+            return dataset, z["person_id"].astype(str), meta, model_bundle, key
 
     logger.info("[genscore] training TopK crosscoder and promoting shared features")
     logger.info(
@@ -2749,7 +2934,7 @@ def _load_or_run_genscore_features(
         dataset.n,
         dataset.p,
     )
-    return dataset, aug_result.kept_person_id.astype(str), meta, model_bundle
+    return dataset, aug_result.kept_person_id.astype(str), meta, model_bundle, key
 
 
 def _gwas_fingerprint(gwas: Any, source: str) -> dict[str, Any]:
@@ -3072,7 +3257,146 @@ def _load_or_run_dagslam(
                 "[dagslam] ignoring cache with stale structural mask %s", path
             )
 
-    logger.info("[dagslam] running hill-climb")
+    logger.info(
+        "[dagslam] running hill-climb p=%d n=%d max_parents=%d max_iter=%d "
+        "restarts=%d",
+        data.X.shape[1],
+        data.X.shape[0],
+        DAGSLAM_MAX_PARENTS,
+        DAGSLAM_MAX_ITER,
+        DAGSLAM_RESTARTS,
+    )
+
+    def _dagslam_progress(payload: dict) -> None:
+        event = str(payload.get("event", "?"))
+        if event == "climb_init":
+            logger.info(
+                "[dagslam] restart %d/%d climb_init p=%d max_iter=%d "
+                "start_edges=%d cache=%d (scoring initial DAG ...)",
+                int(payload["restart"]) + 1,
+                int(payload["n_restarts"]),
+                int(payload["p"]),
+                int(payload["max_iter"]),
+                int(payload["start_n_edges"]),
+                int(payload["cache_size"]),
+            )
+        elif event == "restart_start":
+            logger.info(
+                "[dagslam] restart %d/%d start p=%d max_iter=%d "
+                "start_edges=%d start_score=%.3f cache=%d initial_score=%s",
+                int(payload["restart"]) + 1,
+                int(payload["n_restarts"]),
+                int(payload["p"]),
+                int(payload["max_iter"]),
+                int(payload["start_n_edges"]),
+                float(payload["start_score"]),
+                int(payload["cache_size"]),
+                _format_seconds(float(payload.get("initial_score_elapsed_s", 0.0))),
+            )
+        elif event == "iter_start":
+            logger.info(
+                "[dagslam] restart %d/%d iter=%d/%d START moves=%d "
+                "enumerate=%s edges=%d score=%.3f cache=%d elapsed=%s",
+                int(payload["restart"]) + 1,
+                int(payload["n_restarts"]),
+                int(payload["iter"]),
+                int(payload["max_iter"]),
+                int(payload["n_moves"]),
+                _format_seconds(float(payload["enumerate_elapsed_s"])),
+                int(payload["n_edges"]),
+                float(payload["cur_score"]),
+                int(payload["cache_size"]),
+                _format_seconds(float(payload["elapsed_s"])),
+            )
+        elif event == "scoring_heartbeat":
+            logger.info(
+                "[dagslam] restart %d/%d iter=%d scoring %d/%d "
+                "(%.1f mv/s) cache=%d (+%d) scoring_elapsed=%s elapsed=%s",
+                int(payload["restart"]) + 1,
+                int(payload["n_restarts"]),
+                int(payload["iter"]),
+                int(payload["scored"]),
+                int(payload["n_moves"]),
+                float(payload["moves_per_s"]),
+                int(payload["cache_size"]),
+                int(payload["cache_growth"]),
+                _format_seconds(float(payload["scoring_elapsed_s"])),
+                _format_seconds(float(payload["elapsed_s"])),
+            )
+        elif event == "iter_done":
+            if bool(payload.get("accepted", False)):
+                logger.info(
+                    "[dagslam] restart %d/%d iter=%d/%d accepted %s(%d->%d) "
+                    "delta=%+.3f score=%.3f best=%.3f edges=%d moves=%d "
+                    "scoring=%s cache=%d (+%d) elapsed=%s",
+                    int(payload["restart"]) + 1,
+                    int(payload["n_restarts"]),
+                    int(payload["iter"]),
+                    int(payload["max_iter"]),
+                    str(payload["chosen_kind"]),
+                    int(payload["chosen_i"]),
+                    int(payload["chosen_j"]),
+                    float(payload["delta"]),
+                    float(payload["cur_score"]),
+                    float(payload["best_score"]),
+                    int(payload["n_edges"]),
+                    int(payload["n_moves_considered"]),
+                    _format_seconds(float(payload["scoring_elapsed_s"])),
+                    int(payload["cache_size"]),
+                    int(payload["cache_growth"]),
+                    _format_seconds(float(payload["elapsed_s"])),
+                )
+            else:
+                logger.info(
+                    "[dagslam] restart %d/%d iter=%d/%d no improving move "
+                    "(stagnation %d/%d) score=%.3f edges=%d moves=%d "
+                    "scoring=%s cache=%d elapsed=%s",
+                    int(payload["restart"]) + 1,
+                    int(payload["n_restarts"]),
+                    int(payload["iter"]),
+                    int(payload["max_iter"]),
+                    int(payload["stagnation"]),
+                    int(payload["stagnation_limit"]),
+                    float(payload["cur_score"]),
+                    int(payload["n_edges"]),
+                    int(payload["n_moves_considered"]),
+                    _format_seconds(float(payload["scoring_elapsed_s"])),
+                    int(payload["cache_size"]),
+                    _format_seconds(float(payload["elapsed_s"])),
+                )
+        elif event == "restart_done":
+            logger.info(
+                "[dagslam] restart %d/%d done iters=%d accepted=%d "
+                "edges=%d best=%.3f final=%.3f cache=%d elapsed=%s",
+                int(payload["restart"]) + 1,
+                int(payload["n_restarts"]),
+                int(payload["n_iter"]),
+                int(payload["n_accepted"]),
+                int(payload["n_edges"]),
+                float(payload["best_score"]),
+                float(payload["final_score"]),
+                int(payload["cache_size"]),
+                _format_seconds(float(payload["elapsed_s"])),
+            )
+        # Real-time flush -- Jupyter buffers stdout/stderr and the default
+        # logging.StreamHandler doesn't always flush per emit. Without this
+        # the user sees minutes of nothing then a wall of catch-up logs.
+        for handler in logger.handlers:
+            try:
+                handler.flush()
+            except Exception:
+                pass
+        for parent in logging.getLogger().handlers:
+            try:
+                parent.flush()
+            except Exception:
+                pass
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+
     t0 = time.time()
     result = run_dagslam(
         data=data.X,
@@ -3081,9 +3405,9 @@ def _load_or_run_dagslam(
         max_iter=DAGSLAM_MAX_ITER,
         restarts=DAGSLAM_RESTARTS,
         rng=np.random.default_rng(PIPELINE_SEED + 2),
-        verbose=PIPELINE_VERBOSE,
         pi_prior=pi_prior,
         allowed_edges=allowed_edges,
+        progress=_dagslam_progress,
         survival_time=data.time,
         survival_event=data.event,
         survival_horizon=10.0,
@@ -4169,6 +4493,7 @@ def _run_genscore_stage(
             kept_person_ids,
             genscore_meta,
             genscore_model_bundle,
+            genscore_key,
         ) = _load_or_run_genscore_features(
             cache,
             data,
@@ -4189,6 +4514,8 @@ def _run_genscore_stage(
     # can inspect them while MrDAG / DAGSLAM / MCMC / GAM are still
     # running.
     _render_genscore_plots_async(
+        cache,
+        genscore_key,
         genscore_model_bundle,
         prs_df,
         ehr_panel,
@@ -4514,7 +4841,7 @@ def run_pipeline() -> PipelineResult:
     """Run the single production path."""
     logger = logging.getLogger("causal_pred.pipeline")
     if not logger.handlers:
-        logger = _setup_logger(PIPELINE_VERBOSE)
+        logger = _setup_logger()
     _install_signal_handlers(logger)
     cache = _cache()
     timings: dict[str, float] = {}
@@ -4981,108 +5308,184 @@ def save_result(
     run_config: Optional[dict[str, Any]] = None,
 ) -> dict[str, str]:
     """Serialise pipeline artefacts."""
+    logger = logging.getLogger("causal_pred.pipeline")
     out = Path(outdir) if outdir is not None else Path(DEFAULT_OUTPUT_DIR)
     out.mkdir(parents=True, exist_ok=True)
     paths: dict[str, str] = {}
     columns = list(result.columns)
+    save_t0 = time.time()
+    logger.info("[save] writing artefacts to %s", out)
 
-    paths["mrdag_pi"] = str(out / "mrdag_pi.npy")
-    np.save(paths["mrdag_pi"], result.mrdag_pi)
-    paths["mrdag_prior"] = str(out / "mrdag_prior.npy")
-    np.save(paths["mrdag_prior"], result.mrdag_prior)
+    def _step(label: str, fn: Callable[[], None]) -> None:
+        s0 = time.time()
+        fn()
+        logger.info("[save]   %s elapsed=%s", label, _format_seconds(time.time() - s0))
+
+    def _w_mrdag_pi() -> None:
+        paths["mrdag_pi"] = str(out / "mrdag_pi.npy")
+        np.save(paths["mrdag_pi"], result.mrdag_pi)
+    _step("mrdag_pi.npy", _w_mrdag_pi)
+
+    def _w_mrdag_prior() -> None:
+        paths["mrdag_prior"] = str(out / "mrdag_prior.npy")
+        np.save(paths["mrdag_prior"], result.mrdag_prior)
+    _step("mrdag_prior.npy", _w_mrdag_prior)
+
     if result.mrdag_pi.shape != (len(NODE_NAMES), len(NODE_NAMES)):
         raise ValueError(
             "mrdag_pi shape must match NODE_NAMES: "
             f"{result.mrdag_pi.shape} != {(len(NODE_NAMES), len(NODE_NAMES))}"
         )
-    paths["mrdag_pi_long_csv"] = str(out / "mrdag_pi_long.csv")
-    with open(paths["mrdag_pi_long_csv"], "w") as fh:
-        fh.write("parent,child,mrdag_pi\n")
-        for i, parent in enumerate(NODE_NAMES):
-            for j, child in enumerate(NODE_NAMES):
-                if i == j:
-                    continue
-                fh.write(f"{parent},{child},{float(result.mrdag_pi[i, j])}\n")
 
-    paths["mrdag_prior_long_csv"] = str(out / "mrdag_prior_long.csv")
-    with open(paths["mrdag_prior_long_csv"], "w") as fh:
-        fh.write("parent,child,mrdag_prior\n")
-        for parent, child, prob in _edge_prob_long(result.mrdag_prior, columns):
-            fh.write(f"{parent},{child},{prob}\n")
-    paths["dagslam_adjacency"] = str(out / "dagslam_adjacency.npy")
-    np.save(paths["dagslam_adjacency"], result.dagslam_adjacency)
-    paths["mcmc_edge_probs"] = str(out / "mcmc_edge_probs.npy")
-    np.save(paths["mcmc_edge_probs"], result.mcmc_edge_probs)
-    paths["mcmc_samples"] = str(out / "mcmc_samples.npy")
-    np.save(paths["mcmc_samples"], result.mcmc_samples)
-    paths["thresholded_adjacency"] = str(out / "thresholded_adjacency.npy")
-    np.save(paths["thresholded_adjacency"], result.thresholded_adjacency)
-    paths["survival_time_grid"] = str(out / "survival_time_grid.npy")
-    np.save(paths["survival_time_grid"], result.survival_time_grid)
-    paths["survival_mean"] = str(out / "survival_mean.npy")
-    np.save(paths["survival_mean"], result.survival_mean)
-    paths["survival_lower"] = str(out / "survival_lower.npy")
-    np.save(paths["survival_lower"], result.survival_lower)
-    paths["survival_upper"] = str(out / "survival_upper.npy")
-    np.save(paths["survival_upper"], result.survival_upper)
-    paths["disease_risk_mean"] = str(out / "disease_risk_mean.npy")
-    np.save(paths["disease_risk_mean"], 1.0 - result.survival_mean)
+    def _w_mrdag_pi_long() -> None:
+        paths["mrdag_pi_long_csv"] = str(out / "mrdag_pi_long.csv")
+        with open(paths["mrdag_pi_long_csv"], "w") as fh:
+            fh.write("parent,child,mrdag_pi\n")
+            for i, parent in enumerate(NODE_NAMES):
+                for j, child in enumerate(NODE_NAMES):
+                    if i == j:
+                        continue
+                    fh.write(f"{parent},{child},{float(result.mrdag_pi[i, j])}\n")
+    _step("mrdag_pi_long.csv", _w_mrdag_pi_long)
 
-    paths["greedy_edges_csv"] = str(out / "greedy_edges.csv")
-    with open(paths["greedy_edges_csv"], "w") as fh:
-        fh.write("parent,child\n")
-        for parent, child in _adj_to_edge_list(result.dagslam_adjacency, columns):
-            fh.write(f"{parent},{child}\n")
+    def _w_mrdag_prior_long() -> None:
+        paths["mrdag_prior_long_csv"] = str(out / "mrdag_prior_long.csv")
+        with open(paths["mrdag_prior_long_csv"], "w") as fh:
+            fh.write("parent,child,mrdag_prior\n")
+            for parent, child, prob in _edge_prob_long(result.mrdag_prior, columns):
+                fh.write(f"{parent},{child},{prob}\n")
+    _step("mrdag_prior_long.csv", _w_mrdag_prior_long)
 
-    paths["mcmc_thresholded_edges_csv"] = str(out / "mcmc_thresholded_edges.csv")
-    with open(paths["mcmc_thresholded_edges_csv"], "w") as fh:
-        fh.write("parent,child\n")
-        for parent, child in _adj_to_edge_list(result.thresholded_adjacency, columns):
-            fh.write(f"{parent},{child}\n")
+    def _w_dagslam() -> None:
+        paths["dagslam_adjacency"] = str(out / "dagslam_adjacency.npy")
+        np.save(paths["dagslam_adjacency"], result.dagslam_adjacency)
+    _step("dagslam_adjacency.npy", _w_dagslam)
 
-    paths["mcmc_edge_probabilities_long_csv"] = str(
-        out / "mcmc_edge_probabilities_long.csv"
+    def _w_mcmc_probs() -> None:
+        paths["mcmc_edge_probs"] = str(out / "mcmc_edge_probs.npy")
+        np.save(paths["mcmc_edge_probs"], result.mcmc_edge_probs)
+    _step("mcmc_edge_probs.npy", _w_mcmc_probs)
+
+    def _w_mcmc_samples() -> None:
+        paths["mcmc_samples"] = str(out / "mcmc_samples.npy")
+        np.save(paths["mcmc_samples"], result.mcmc_samples)
+    _step(
+        f"mcmc_samples.npy ({result.mcmc_samples.nbytes / (1024 * 1024):.1f}MiB)",
+        _w_mcmc_samples,
     )
-    with open(paths["mcmc_edge_probabilities_long_csv"], "w") as fh:
-        fh.write("parent,child,posterior_edge_probability\n")
-        for parent, child, prob in _edge_prob_long(result.mcmc_edge_probs, columns):
-            fh.write(f"{parent},{child},{prob}\n")
 
-    paths["survival_curves_long_csv"] = str(out / "survival_curves_long.csv")
-    with open(paths["survival_curves_long_csv"], "w") as fh:
-        fh.write(
-            "person_id,time,survival_mean,survival_lower,survival_upper,"
-            "disease_risk_mean\n"
+    def _w_thresh() -> None:
+        paths["thresholded_adjacency"] = str(out / "thresholded_adjacency.npy")
+        np.save(paths["thresholded_adjacency"], result.thresholded_adjacency)
+    _step("thresholded_adjacency.npy", _w_thresh)
+
+    def _w_surv_arrays() -> None:
+        paths["survival_time_grid"] = str(out / "survival_time_grid.npy")
+        np.save(paths["survival_time_grid"], result.survival_time_grid)
+        paths["survival_mean"] = str(out / "survival_mean.npy")
+        np.save(paths["survival_mean"], result.survival_mean)
+        paths["survival_lower"] = str(out / "survival_lower.npy")
+        np.save(paths["survival_lower"], result.survival_lower)
+        paths["survival_upper"] = str(out / "survival_upper.npy")
+        np.save(paths["survival_upper"], result.survival_upper)
+        paths["disease_risk_mean"] = str(out / "disease_risk_mean.npy")
+        np.save(paths["disease_risk_mean"], 1.0 - result.survival_mean)
+    _step(
+        f"survival arrays (shape {result.survival_mean.shape})",
+        _w_surv_arrays,
+    )
+
+    def _w_greedy() -> None:
+        paths["greedy_edges_csv"] = str(out / "greedy_edges.csv")
+        with open(paths["greedy_edges_csv"], "w") as fh:
+            fh.write("parent,child\n")
+            for parent, child in _adj_to_edge_list(result.dagslam_adjacency, columns):
+                fh.write(f"{parent},{child}\n")
+    _step("greedy_edges.csv", _w_greedy)
+
+    def _w_mcmc_thresh_edges() -> None:
+        paths["mcmc_thresholded_edges_csv"] = str(out / "mcmc_thresholded_edges.csv")
+        with open(paths["mcmc_thresholded_edges_csv"], "w") as fh:
+            fh.write("parent,child\n")
+            for parent, child in _adj_to_edge_list(
+                result.thresholded_adjacency, columns
+            ):
+                fh.write(f"{parent},{child}\n")
+    _step("mcmc_thresholded_edges.csv", _w_mcmc_thresh_edges)
+
+    def _w_mcmc_long() -> None:
+        paths["mcmc_edge_probabilities_long_csv"] = str(
+            out / "mcmc_edge_probabilities_long.csv"
         )
-        for row_idx, person_id in enumerate(result.person_ids):
-            for time_idx, t in enumerate(result.survival_time_grid):
-                s_mean = float(result.survival_mean[row_idx, time_idx])
-                s_lower = float(result.survival_lower[row_idx, time_idx])
-                s_upper = float(result.survival_upper[row_idx, time_idx])
-                fh.write(
-                    f"{person_id},{float(t)},{s_mean},{s_lower},{s_upper},"
-                    f"{1.0 - s_mean}\n"
-                )
+        with open(paths["mcmc_edge_probabilities_long_csv"], "w") as fh:
+            fh.write("parent,child,posterior_edge_probability\n")
+            for parent, child, prob in _edge_prob_long(result.mcmc_edge_probs, columns):
+                fh.write(f"{parent},{child},{prob}\n")
+    _step("mcmc_edge_probabilities_long.csv", _w_mcmc_long)
 
-    paths["causal_pathways_csv"] = str(out / "causal_pathway_probabilities.csv")
-    with open(paths["causal_pathways_csv"], "w") as fh:
-        fh.write("rank,path,posterior_probability,marginal_edge_product\n")
-        for rank, row in enumerate(result.causal_pathways, start=1):
-            path_txt = " -> ".join(row["path"])
+    n_persons = len(result.person_ids)
+    n_times = int(result.survival_time_grid.size)
+    surv_rows = n_persons * n_times
+    logger.info(
+        "[save]   writing survival_curves_long.csv (%d persons x %d timepoints "
+        "= %d rows; line-by-line Python writer, this is usually the slow step)",
+        n_persons,
+        n_times,
+        surv_rows,
+    )
+
+    def _w_surv_long() -> None:
+        paths["survival_curves_long_csv"] = str(out / "survival_curves_long.csv")
+        report_every = max(1, n_persons // 10)
+        last_report = time.time()
+        with open(paths["survival_curves_long_csv"], "w") as fh:
             fh.write(
-                f"{rank},{path_txt},{row['posterior_probability']},"
-                f"{row['marginal_edge_product']}\n"
+                "person_id,time,survival_mean,survival_lower,survival_upper,"
+                "disease_risk_mean\n"
             )
+            for row_idx, person_id in enumerate(result.person_ids):
+                for time_idx, t in enumerate(result.survival_time_grid):
+                    s_mean = float(result.survival_mean[row_idx, time_idx])
+                    s_lower = float(result.survival_lower[row_idx, time_idx])
+                    s_upper = float(result.survival_upper[row_idx, time_idx])
+                    fh.write(
+                        f"{person_id},{float(t)},{s_mean},{s_lower},{s_upper},"
+                        f"{1.0 - s_mean}\n"
+                    )
+                if (row_idx + 1) % report_every == 0 and time.time() - last_report > 5.0:
+                    last_report = time.time()
+                    logger.info(
+                        "[save]     survival_curves_long.csv: %d/%d persons "
+                        "(%.0f%%) written",
+                        row_idx + 1,
+                        n_persons,
+                        100.0 * (row_idx + 1) / max(1, n_persons),
+                    )
+    _step("survival_curves_long.csv", _w_surv_long)
 
-    paths["crosscoder_features_json"] = str(out / "crosscoder_features.json")
-    with open(paths["crosscoder_features_json"], "w") as fh:
-        json.dump(
-            _json_sanitise(result.genscore_features),
-            fh,
-            indent=2,
-            sort_keys=True,
-            allow_nan=False,
-        )
+    def _w_paths() -> None:
+        paths["causal_pathways_csv"] = str(out / "causal_pathway_probabilities.csv")
+        with open(paths["causal_pathways_csv"], "w") as fh:
+            fh.write("rank,path,posterior_probability,marginal_edge_product\n")
+            for rank, row in enumerate(result.causal_pathways, start=1):
+                path_txt = " -> ".join(row["path"])
+                fh.write(
+                    f"{rank},{path_txt},{row['posterior_probability']},"
+                    f"{row['marginal_edge_product']}\n"
+                )
+    _step("causal_pathway_probabilities.csv", _w_paths)
+
+    def _w_cc_json() -> None:
+        paths["crosscoder_features_json"] = str(out / "crosscoder_features.json")
+        with open(paths["crosscoder_features_json"], "w") as fh:
+            json.dump(
+                _json_sanitise(result.genscore_features),
+                fh,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+    _step("crosscoder_features.json", _w_cc_json)
 
     diagnostics = {
         k: v
@@ -5107,48 +5510,93 @@ def save_result(
         "timings": result.timings,
         "genscore_features": result.genscore_features,
     }
-    paths["summary_json"] = str(out / "summary.json")
-    with open(paths["summary_json"], "w") as fh:
-        json.dump(
-            _json_sanitise(summary), fh, indent=2, sort_keys=True, allow_nan=False
-        )
+
+    def _w_summary() -> None:
+        paths["summary_json"] = str(out / "summary.json")
+        with open(paths["summary_json"], "w") as fh:
+            json.dump(
+                _json_sanitise(summary), fh, indent=2, sort_keys=True, allow_nan=False
+            )
+    _step("summary.json", _w_summary)
 
     config = _pipeline_config() if run_config is None else run_config
-    paths["run_config_json"] = str(out / "run_config.json")
-    with open(paths["run_config_json"], "w") as fh:
-        json.dump(_json_sanitise(config), fh, indent=2, sort_keys=True, allow_nan=False)
 
+    def _w_config() -> None:
+        paths["run_config_json"] = str(out / "run_config.json")
+        with open(paths["run_config_json"], "w") as fh:
+            json.dump(
+                _json_sanitise(config), fh, indent=2, sort_keys=True, allow_nan=False
+            )
+    _step("run_config.json", _w_config)
+
+    logger.info(
+        "[save] wrote %d artefacts to %s total_elapsed=%s",
+        len(paths),
+        out,
+        _format_seconds(time.time() - save_t0),
+    )
     return paths
 
 
 def _sync_outputs_to_workspace(outdir: Path) -> None:
+    logger = logging.getLogger("causal_pred.pipeline")
     bucket = _workspace_bucket()
     if bucket is None:
+        logger.info("[sync] no workspace bucket set; skipping outputs sync")
         return
     dst = f"{bucket}/{WORKSPACE_RESULTS_PREFIX}"
+    file_count = 0
+    total_bytes = 0
+    for p in outdir.rglob("*"):
+        if p.is_file():
+            file_count += 1
+            try:
+                total_bytes += p.stat().st_size
+            except OSError:
+                pass
+    logger.info(
+        "[sync] starting gsutil -m rsync -r %s -> %s (%d files, %.1f MiB)",
+        outdir,
+        dst,
+        file_count,
+        total_bytes / (1024.0 * 1024.0),
+    )
+    sync_t0 = time.time()
     proc = subprocess.run(
         ["gsutil", "-m", "rsync", "-r", str(outdir), dst],
         check=False,
         capture_output=True,
         text=True,
     )
+    elapsed = _format_seconds(time.time() - sync_t0)
     if proc.returncode != 0:
+        logger.error(
+            "[sync] gsutil rsync FAILED exit_code=%d elapsed=%s",
+            proc.returncode,
+            elapsed,
+        )
         raise RuntimeError(
             "gsutil rsync of outputs failed exit_code=%d src=%s dst=%s\n"
             "stderr (last 4KiB):\n%s"
             % (proc.returncode, outdir, dst, (proc.stderr or "")[-4096:])
         )
+    logger.info("[sync] gsutil rsync complete elapsed=%s", elapsed)
 
 
 def main() -> int:
-    logger = _setup_logger(PIPELINE_VERBOSE)
+    logger = _setup_logger()
     _install_signal_handlers(logger)
     started_at = time.time()
     try:
         result = run_pipeline()
+        logger.info("[pipeline] run_pipeline returned; entering save_result")
         save_result(result)
+        logger.info("[pipeline] save_result returned; joining background plot threads")
         _join_background_plot_threads(logger)
         outdir = Path(DEFAULT_OUTPUT_DIR)
+        logger.info(
+            "[pipeline] background plot threads joined; syncing outputs to workspace"
+        )
         _sync_outputs_to_workspace(outdir)
         logger.info(
             "[pipeline] artefacts written to %s total_elapsed=%s",

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -134,6 +136,7 @@ def _configure_tiny_pipeline(monkeypatch, tmp_path):
                 "ehr_feature_count": int(_ehr_panel.m),
             },
             None,
+            "test-genscore-key",
         )
 
     def _fake_survival(_cache, _key, data, _samples, _logger):
@@ -1030,6 +1033,8 @@ def test_genscore_plot_thread_is_daemon(monkeypatch):
     pipeline._BACKGROUND_PLOT_THREADS.clear()
 
     pipeline._render_genscore_plots_async(
+        cache=pipeline.WorkspaceCache(Path(tempfile.mkdtemp(prefix="plots-cache-")), None),
+        genscore_key="thread-test-key",
         model_bundle={"unused": np.array([0])},
         prs_df=pd.DataFrame(index=["1"]),
         ehr_panel=EhrPanel(

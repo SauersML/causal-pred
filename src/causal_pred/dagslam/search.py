@@ -44,7 +44,7 @@ Algorithm
 Public API mirrors the docstring in :mod:`causal_pred.dagslam.__init__`:
 
     run_dagslam(data, node_types, max_parents=6, max_iter=500,
-                restarts=5, tabu_tenure=10, rng=None, verbose=False,
+                restarts=5, tabu_tenure=10, rng=None,
                 pi_prior=None, **hyper) -> DAGSLAMResult
 
 References
@@ -59,7 +59,8 @@ References
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+import time
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -311,9 +312,12 @@ def _single_climb(
     tabu_tenure: int,
     cache: dict,
     hyper: dict,
-    verbose: bool,
     edge_logit: np.ndarray,
     allowed_edges: np.ndarray,
+    progress: Optional[Callable[[dict], None]] = None,
+    restart_idx: int = 0,
+    n_restarts: int = 1,
+    progress_interval_s: float = 1.5,
 ) -> Tuple[np.ndarray, float, dict]:
     """One hill-climb from ``start_adj``.  Mutates ``cache``.
 
@@ -321,11 +325,30 @@ def _single_climb(
     """
     p = data.shape[1]
     adj = start_adj.astype(np.int64, copy=True)
+    climb_t0 = time.time()
+
+    # Surface entry into the climb BEFORE the (potentially slow) initial
+    # score_dag pass so the caller sees something immediately.
+    if progress is not None:
+        progress(
+            {
+                "event": "climb_init",
+                "restart": int(restart_idx),
+                "n_restarts": int(n_restarts),
+                "p": int(p),
+                "max_iter": int(max_iter),
+                "start_n_edges": int(adj.sum()),
+                "cache_size": len(cache),
+            }
+        )
+
     # Anchor the running score once; then maintain it via delta updates.
+    initial_score_t0 = time.time()
     cur_score = float(
         score_dag(adj, data, node_types, cache=cache, **hyper)
         + _relative_log_prior(adj, edge_logit)
     )
+    initial_score_elapsed = time.time() - initial_score_t0
 
     best_adj = adj.copy()
     best_score = cur_score
@@ -335,20 +358,63 @@ def _single_climb(
     path_scores: List[float] = [cur_score]
     skipped_moves: List[dict] = []
     n_iter = 0
+    last_progress_t = time.time()
+    n_accepted = 0
+
+    if progress is not None:
+        progress(
+            {
+                "event": "restart_start",
+                "restart": int(restart_idx),
+                "n_restarts": int(n_restarts),
+                "p": int(p),
+                "max_iter": int(max_iter),
+                "start_n_edges": int(adj.sum()),
+                "start_score": float(cur_score),
+                "cache_size": len(cache),
+                "initial_score_elapsed_s": float(initial_score_elapsed),
+            }
+        )
 
     for it in range(max_iter):
         n_iter = it + 1
+        iter_t0 = time.time()
         moves = _enumerate_moves(adj, max_parents, allowed_edges)
+        enumerate_elapsed = time.time() - iter_t0
         if not moves:
-            if verbose:
-                print(f"[dagslam] iter {it}: no structurally legal move.")
             break
+
+        # Iter-start beacon for the first few iters (always) and on the
+        # configured cadence thereafter, so the caller sees the inner loop
+        # actually start work instead of staring at silence while the first
+        # iteration grinds through O(p^2) fresh score_node calls.
+        if progress is not None and (it < 3 or (time.time() - last_progress_t) >= progress_interval_s):
+            progress(
+                {
+                    "event": "iter_start",
+                    "restart": int(restart_idx),
+                    "n_restarts": int(n_restarts),
+                    "iter": int(it + 1),
+                    "max_iter": int(max_iter),
+                    "n_moves": int(len(moves)),
+                    "enumerate_elapsed_s": float(enumerate_elapsed),
+                    "n_edges": int(adj.sum()),
+                    "cur_score": float(cur_score),
+                    "cache_size": int(len(cache)),
+                    "elapsed_s": float(time.time() - climb_t0),
+                }
+            )
+            last_progress_t = time.time()
 
         tabu_set = {_reverse_move(m) for m in tabu}
 
         non_tabu_best: Optional[Tuple[float, Tuple[str, int, int], int]] = None
         tabu_best: Optional[Tuple[float, Tuple[str, int, int], int]] = None
 
+        scoring_t0 = time.time()
+        scored = 0
+        cache_size_at_iter_start = len(cache)
+        n_moves_total = len(moves)
         for m in moves:
             try:
                 d = _delta_of_move(m, adj, data, node_types, cache, hyper, edge_logit)
@@ -360,6 +426,7 @@ def _single_climb(
                         "reason": f"{type(exc).__name__}: {exc}",
                     }
                 )
+                scored += 1
                 continue
             if not np.isfinite(d):
                 skipped_moves.append(
@@ -369,7 +436,36 @@ def _single_climb(
                         "reason": f"non-finite delta {d}",
                     }
                 )
+                scored += 1
                 continue
+
+            scored += 1
+            # Mid-iteration heartbeat. The first hill-climb iteration can
+            # spend many seconds scoring O(p^2) moves with no cache hits;
+            # without this the caller stares at silence between iter_start
+            # and iter_done. Cadence-gated so quiet iters stay quiet.
+            if progress is not None:
+                now = time.time()
+                if now - last_progress_t >= progress_interval_s:
+                    last_progress_t = now
+                    cache_hits_so_far = len(cache) - cache_size_at_iter_start
+                    elapsed_scoring = now - scoring_t0
+                    rate = scored / elapsed_scoring if elapsed_scoring > 0 else 0.0
+                    progress(
+                        {
+                            "event": "scoring_heartbeat",
+                            "restart": int(restart_idx),
+                            "n_restarts": int(n_restarts),
+                            "iter": int(it + 1),
+                            "scored": int(scored),
+                            "n_moves": int(n_moves_total),
+                            "cache_size": int(len(cache)),
+                            "cache_growth": int(cache_hits_so_far),
+                            "moves_per_s": float(rate),
+                            "scoring_elapsed_s": float(elapsed_scoring),
+                            "elapsed_s": float(now - climb_t0),
+                        }
+                    )
 
             if m[0] == "add":
                 n_edge_delta = 1
@@ -405,12 +501,38 @@ def _single_climb(
             if tabu_best[0] > 0 and tabu_best[0] > nt_val + 1.0:
                 chosen = tabu_best
 
+        scoring_elapsed = time.time() - scoring_t0
+
         if chosen is None:
             stagnation += 1
             path_scores.append(cur_score)
+            # Stagnation tick: surface even on rejected iters so the caller
+            # can tell the climb is plateauing rather than hung.
+            if progress is not None:
+                progress(
+                    {
+                        "event": "iter_done",
+                        "restart": int(restart_idx),
+                        "n_restarts": int(n_restarts),
+                        "iter": int(it + 1),
+                        "max_iter": int(max_iter),
+                        "accepted": False,
+                        "chosen_kind": None,
+                        "delta": 0.0,
+                        "cur_score": float(cur_score),
+                        "best_score": float(best_score),
+                        "n_edges": int(adj.sum()),
+                        "n_moves_considered": int(n_moves_total),
+                        "stagnation": int(stagnation),
+                        "stagnation_limit": int(stagnation_limit),
+                        "scoring_elapsed_s": float(scoring_elapsed),
+                        "cache_size": int(len(cache)),
+                        "cache_growth": int(len(cache) - cache_size_at_iter_start),
+                        "elapsed_s": float(time.time() - climb_t0),
+                    }
+                )
+                last_progress_t = time.time()
             if stagnation >= stagnation_limit:
-                if verbose:
-                    print(f"[dagslam] iter {it}: stagnated; stop.")
                 break
             continue
 
@@ -419,6 +541,7 @@ def _single_climb(
         cur_score += d
         path_scores.append(cur_score)
         stagnation = 0
+        n_accepted += 1
 
         tabu.append(move)
         if len(tabu) > tabu_tenure:
@@ -428,11 +551,35 @@ def _single_climb(
             best_score = cur_score
             best_adj = adj.copy()
 
-        if verbose:
-            print(
-                f"[dagslam] iter {it}: {move} d={d:+.4f} "
-                f"score={cur_score:.4f} best={best_score:.4f}"
+        # Always emit iter_done so the caller has per-iteration visibility
+        # of timing + chosen move + score progression. Cheap (~50 bytes per
+        # iter); the noise tradeoff is much smaller than the value of
+        # knowing whether the climb is actually advancing.
+        if progress is not None:
+            progress(
+                {
+                    "event": "iter_done",
+                    "restart": int(restart_idx),
+                    "n_restarts": int(n_restarts),
+                    "iter": int(it + 1),
+                    "max_iter": int(max_iter),
+                    "accepted": True,
+                    "chosen_kind": str(move[0]),
+                    "chosen_i": int(move[1]),
+                    "chosen_j": int(move[2]),
+                    "delta": float(d),
+                    "cur_score": float(cur_score),
+                    "best_score": float(best_score),
+                    "n_edges": int(adj.sum()),
+                    "n_accepted": int(n_accepted),
+                    "n_moves_considered": int(n_moves_total),
+                    "scoring_elapsed_s": float(scoring_elapsed),
+                    "cache_size": int(len(cache)),
+                    "cache_growth": int(len(cache) - cache_size_at_iter_start),
+                    "elapsed_s": float(time.time() - climb_t0),
+                }
             )
+            last_progress_t = time.time()
 
     trace = {
         "best_score": float(best_score),
@@ -441,6 +588,21 @@ def _single_climb(
         "path_scores": np.asarray(path_scores, dtype=np.float64),
         "skipped_moves": skipped_moves,
     }
+    if progress is not None:
+        progress(
+            {
+                "event": "restart_done",
+                "restart": int(restart_idx),
+                "n_restarts": int(n_restarts),
+                "n_iter": int(n_iter),
+                "n_accepted": int(n_accepted),
+                "best_score": float(best_score),
+                "final_score": float(cur_score),
+                "n_edges": int(best_adj.sum()),
+                "cache_size": int(len(cache)),
+                "elapsed_s": float(time.time() - climb_t0),
+            }
+        )
     return best_adj, float(best_score), trace
 
 
@@ -457,9 +619,10 @@ def run_dagslam(
     restarts: int = 5,
     tabu_tenure: int = 10,
     rng=None,
-    verbose: bool = False,
     pi_prior: Optional[np.ndarray] = None,
     allowed_edges: Optional[np.ndarray] = None,
+    progress: Optional[Callable[[dict], None]] = None,
+    progress_interval_s: float = 1.5,
     **hyper,
 ) -> DAGSLAMResult:
     """DAGSLAM hill-climbing structure search.
@@ -482,8 +645,6 @@ def run_dagslam(
         Length of the tabu list.
     rng : numpy.random.Generator, optional
         If ``None``, ``np.random.default_rng()`` is used.
-    verbose : bool
-        If True, prints progress.
     pi_prior : array-like, shape (p, p), optional
         Per-edge MrDAG inclusion probabilities.  Finite entries add an
         independent Bernoulli log-odds prior to the greedy search objective;
@@ -548,9 +709,12 @@ def run_dagslam(
             tabu_tenure=tabu_tenure,
             cache=cache,
             hyper=hyper,
-            verbose=verbose,
             edge_logit=edge_logit,
             allowed_edges=allowed,
+            progress=progress,
+            restart_idx=r,
+            n_restarts=n_restarts,
+            progress_interval_s=progress_interval_s,
         )
 
         info["restart"] = r
