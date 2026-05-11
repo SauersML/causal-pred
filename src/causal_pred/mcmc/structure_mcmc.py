@@ -628,16 +628,38 @@ def _gibbs_resample_parents(
         for parents in combinations(candidates, size)
     ]
 
+    # Score parent sets in-process with the *shared* cache. The previous
+    # implementation handed each set to a joblib loky worker with
+    # ``cache=None``, which (a) repickled the full ~24 MB data array per
+    # task across the IPC pipe, (b) rebuilt the BGe workspace per worker
+    # from scratch, and (c) wrote nothing back to the parent's cache --
+    # so the next edge_gibbs move on the same target node redid every
+    # one of the 4526 score_node calls. cache_entries did not grow
+    # between consecutive enumerations of the same node. ThreadPoolExecutor
+    # keeps the cache shared (writes to disjoint keys are GIL-safe) and
+    # numpy/scipy BLAS releases the GIL on the heavy linear algebra inside
+    # score_node, so the workers actually run in parallel. We cap BLAS
+    # thread-count to 1 per worker via threadpoolctl to avoid the
+    # ``cpu_count()^2`` over-subscription that would otherwise pin every
+    # core to context-switching.
     n_workers = min(cpu_count(), len(parent_sets)) if parent_sets else 1
-    arg_tuples = [
-        (int(j), parents, data, tuple(node_types), hyper) for parents in parent_sets
-    ]
-    scores = parallel_call(
-        _score_node_worker,
-        arg_tuples,
-        n_workers=n_workers,
-        threads_per_worker=1,
-    )
+    if n_workers <= 1 or len(parent_sets) <= 1:
+        scores = [
+            float(score_node(j, parents, data, node_types, cache=cache, **hyper))
+            for parents in parent_sets
+        ]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        from threadpoolctl import threadpool_limits
+
+        def _score_one(parents: Tuple[int, ...]) -> float:
+            return float(
+                score_node(j, parents, data, node_types, cache=cache, **hyper)
+            )
+
+        with threadpool_limits(limits=1):
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                scores = list(ex.map(_score_one, parent_sets))
     log_weights: List[float] = []
     for parents, score in zip(parent_sets, scores):
         prior = absent_prior + (
