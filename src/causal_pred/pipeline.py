@@ -3933,16 +3933,12 @@ def _causal_pathway_probabilities(
     return out
 
 
-def run_pipeline() -> PipelineResult:
-    """Run the single production path."""
-    logger = logging.getLogger("causal_pred.pipeline")
-    if not logger.handlers:
-        logger = _setup_logger(PIPELINE_VERBOSE)
-    _install_signal_handlers(logger)
-    cache = _cache()
-    timings: dict[str, float] = {}
-    pipeline_started_at = time.time()
-
+def _load_data_stage(
+    cache: WorkspaceCache,
+    timings: dict[str, float],
+    logger: logging.Logger,
+) -> tuple[Path, SyntheticDataset, np.ndarray]:
+    """Resolve the cohort CSV and load it as a SyntheticDataset."""
     with _phase(logger, "data"):
         t0 = time.time()
         logger.info(
@@ -3961,7 +3957,18 @@ def run_pipeline() -> PipelineResult:
             _format_seconds(timings["data"]),
             list(data.columns),
         )
+    return csv_path, data, person_ids
 
+
+def _build_prs_panel_stage(
+    cache: WorkspaceCache,
+    csv_path: Path,
+    data: SyntheticDataset,
+    person_ids: np.ndarray,
+    timings: dict[str, float],
+    logger: logging.Logger,
+) -> tuple[SyntheticDataset, np.ndarray, dict[str, Any], pd.DataFrame, str, int]:
+    """Load the cohort PRS panel and augment the dataset with PRS columns."""
     with _phase(logger, "prs"):
         t0 = time.time()
         logger.info("[prs] loading or building cohort PRS panel")
@@ -3980,7 +3987,17 @@ def run_pipeline() -> PipelineResult:
             _format_seconds(timings["prs"]),
             prs_meta["prs_node_names"],
         )
+    return data, kept_person_ids, prs_meta, prs_df, prs_path, person_id_rows_after_prs
 
+
+def _ensure_survival_outcome_stage(
+    cache: WorkspaceCache,
+    data: SyntheticDataset,
+    kept_person_ids: np.ndarray,
+    timings: dict[str, float],
+    logger: logging.Logger,
+) -> tuple[SyntheticDataset, np.ndarray, dict[str, Any]]:
+    """Apply OMOP survival outcome on top of the cohort if absent in the CSV."""
     survival_outcome_meta: dict[str, Any] = {
         "source": "cohort_csv",
         "n_input": int(data.n),
@@ -4011,13 +4028,33 @@ def run_pipeline() -> PipelineResult:
             data.n,
             int(data.event.sum()),
         )
+    return data, kept_person_ids, survival_outcome_meta
 
+
+def _build_ehr_panel_stage(
+    cache: WorkspaceCache,
+    kept_person_ids: np.ndarray,
+    timings: dict[str, float],
+    logger: logging.Logger,
+) -> EhrPanel:
     with _phase(logger, "ehr"):
         t0 = time.time()
         ehr_panel = _load_or_build_ehr_panel(cache, kept_person_ids, logger)
         timings["ehr"] = time.time() - t0
         logger.info("[ehr] complete elapsed=%s", _format_seconds(timings["ehr"]))
+    return ehr_panel
 
+
+def _run_genscore_stage(
+    cache: WorkspaceCache,
+    data: SyntheticDataset,
+    kept_person_ids: np.ndarray,
+    prs_df: pd.DataFrame,
+    ehr_panel: EhrPanel,
+    timings: dict[str, float],
+    logger: logging.Logger,
+) -> tuple[SyntheticDataset, np.ndarray, dict[str, Any], Any]:
+    """Augment the dataset with promoted crosscoder features."""
     with _phase(logger, "genscore"):
         t0 = time.time()
         (
@@ -4040,10 +4077,10 @@ def run_pipeline() -> PipelineResult:
             data.p,
             _format_seconds(timings["genscore"]),
         )
-
     # Render genscore figures immediately, before any downstream phase
-    # runs. The plots land in <DEFAULT_OUTPUT_DIR>/plots/ so the user can
-    # inspect them while MrDAG / DAGSLAM / MCMC / GAM are still running.
+    # runs. The plots land in <DEFAULT_OUTPUT_DIR>/plots/ so the user
+    # can inspect them while MrDAG / DAGSLAM / MCMC / GAM are still
+    # running.
     _render_genscore_plots_async(
         genscore_model_bundle,
         prs_df,
@@ -4054,7 +4091,16 @@ def run_pipeline() -> PipelineResult:
         event=np.asarray(data.event, dtype=int) if data.event is not None else None,
         target_name=NODES[NODE_INDEX[SURVIVAL_TARGET_COLUMN]].label,
     )
+    return data, kept_person_ids, genscore_meta, genscore_model_bundle
 
+
+def _build_mrdag_prior_stage(
+    cache: WorkspaceCache,
+    data: SyntheticDataset,
+    timings: dict[str, float],
+    logger: logging.Logger,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Run MrDAG and reshape the (p, p) prior to data-column order."""
     _log_rss(logger, "before mrdag")
     with _phase(logger, "mrdag"):
         t0 = time.time()
@@ -4063,10 +4109,18 @@ def run_pipeline() -> PipelineResult:
         timings["mrdag"] = time.time() - t0
         _log_mrdag_diagnostics(logger, mrdag_pi, mrdag_diagnostics)
         logger.info("[mrdag] complete elapsed=%s", _format_seconds(timings["mrdag"]))
+    return mrdag_pi, mrdag_prior, mrdag_diagnostics
 
-    allowed_edges = _structural_allowed_edges(data.columns, data.node_types)
-    _log_structural_constraints(logger, allowed_edges, data.columns)
 
+def _run_dagslam_stage(
+    cache: WorkspaceCache,
+    data: SyntheticDataset,
+    mrdag_prior: np.ndarray,
+    allowed_edges: np.ndarray,
+    timings: dict[str, float],
+    logger: logging.Logger,
+) -> tuple[str, dict[str, Any]]:
+    """Run the DAGSLAM hill-climber to produce a warm-start adjacency."""
     _log_rss(logger, "before dagslam")
     with _phase(logger, "dagslam"):
         t0 = time.time()
@@ -4086,7 +4140,20 @@ def run_pipeline() -> PipelineResult:
             int(dagslam["n_edges"]),
         )
         _log_dagslam_top_edges(logger, dagslam["adjacency"], data.columns)
+    return key, dagslam
 
+
+def _run_structure_mcmc_stage(
+    cache: WorkspaceCache,
+    key: str,
+    data: SyntheticDataset,
+    dagslam: dict[str, Any],
+    mrdag_prior: np.ndarray,
+    allowed_edges: np.ndarray,
+    timings: dict[str, float],
+    logger: logging.Logger,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Run the structure MCMC sampler over DAGs."""
     _log_rss(logger, "before mcmc")
     with _phase(logger, "mcmc"):
         t0 = time.time()
@@ -4118,13 +4185,18 @@ def run_pipeline() -> PipelineResult:
             float(THRESHOLD_DEFAULT),
             allowed_edges=allowed_edges,
         )
+    return edge_probs, mcmc_samples, mcmc_diagnostics
 
-    thresholded = _acyclic_threshold_from_edge_probs(
-        edge_probs,
-        THRESHOLD_DEFAULT,
-        allowed_edges=allowed_edges,
-    )
 
+def _fit_survival_gam_stage(
+    cache: WorkspaceCache,
+    key: str,
+    data: SyntheticDataset,
+    mcmc_samples: np.ndarray,
+    timings: dict[str, float],
+    logger: logging.Logger,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[str, ...], dict[str, Any]]:
+    """Fit per-parent-set survival GAMs and BMA-blend them."""
     with _phase(logger, "gam"):
         t0 = time.time()
         (
@@ -4144,30 +4216,33 @@ def run_pipeline() -> PipelineResult:
             int(survival_diagnostics.get("n_parent_sets", 0)),
         )
         _log_survival_metrics(logger, survival_diagnostics)
-
-    if CAUSAL_PATH_TARGET in data.columns and mcmc_samples.shape[0] > 0:
-        causal_pathways = _causal_pathway_probabilities(
-            edge_probs,
-            mcmc_samples,
-            data.columns,
-        )
-    else:
-        causal_pathways = []
-    _log_causal_pathways(logger, causal_pathways)
-
-    edge_validation = _validate_edges(
-        edge_probs,
-        data.columns,
-        rng=np.random.default_rng(PIPELINE_SEED + 4),
-        allowed_edges=allowed_edges,
+    return (
+        survival_time_grid,
+        survival_mean,
+        survival_lower,
+        survival_upper,
+        survival_parent_columns,
+        survival_diagnostics,
     )
-    validation = {
-        "known_edge_recovery": edge_validation,
-        "survival": survival_diagnostics.get("metrics", {}),
-    }
-    _log_validation_metrics(logger, edge_validation)
 
-    # ---- summary ---------------------------------------------------------
+
+def _log_pipeline_summary(
+    data: SyntheticDataset,
+    timings: dict[str, float],
+    genscore_meta: dict[str, Any],
+    mrdag_diagnostics: dict[str, Any],
+    dagslam: dict[str, Any],
+    mcmc_diagnostics: dict[str, Any],
+    edge_probs: np.ndarray,
+    mcmc_samples: np.ndarray,
+    thresholded: np.ndarray,
+    allowed_edges: np.ndarray,
+    edge_validation: dict[str, Any],
+    survival_diagnostics: dict[str, Any],
+    pipeline_started_at: float,
+    logger: logging.Logger,
+) -> None:
+    """Render the multi-line summary block at the end of run_pipeline."""
     surv_metrics = survival_diagnostics.get("metrics") or {}
     td = surv_metrics.get("time_dependent_auc") or {}
     br = surv_metrics.get("brier") or {}
@@ -4181,7 +4256,6 @@ def run_pipeline() -> PipelineResult:
     logger.info("[summary] === pipeline metrics ===")
     logger.info("[summary] " + bar)
 
-    # cohort
     logger.info(
         "[summary] cohort:    n=%d   p=%d   events=%d   event_rate=%.4f",
         data.n,
@@ -4199,14 +4273,12 @@ def run_pipeline() -> PipelineResult:
         if promoted_names else "",
     )
 
-    # timings, sorted longest-first so the bottleneck is obvious
     sorted_timings = sorted(timings.items(), key=lambda kv: -float(kv[1]))
     logger.info(
         "[summary] timings:   %s",
         "  ".join(f"{k}={_format_seconds(float(v))}" for k, v in sorted_timings),
     )
 
-    # mrdag
     mrdag_max_rhat = float(mrdag_diagnostics.get("max_rhat_on_allowed", float("nan")))
     logger.info(
         "[summary] mrdag:     max_rhat=%.3f  candidate_edges=%d%s",
@@ -4216,14 +4288,12 @@ def run_pipeline() -> PipelineResult:
               f"max_rhat={mrdag_max_rhat:.2f} > 1.10 (poor mixing)"),
     )
 
-    # dagslam
     logger.info(
         "[summary] dagslam:   log_score=%.3f  n_edges=%d",
         float(dagslam["log_score"]),
         int(dagslam["n_edges"]),
     )
 
-    # mcmc
     n_scored = int(allowed_edges.sum())
     mcmc_acc = float(mcmc_diagnostics["accept_rate"].get("overall", float("nan")))
     mcmc_acc_mh = float(
@@ -4249,7 +4319,6 @@ def run_pipeline() -> PipelineResult:
               f"min_ess={mcmc_min_ess:.0f} < 100 (effective-sample-size deficit)"),
     )
 
-    # top 10 posterior edges over the directed graph
     if mcmc_samples.shape[0] > 0:
         ep = np.asarray(edge_probs, dtype=float)
         cols = list(data.columns)
@@ -4265,7 +4334,6 @@ def run_pipeline() -> PipelineResult:
             )
             logger.info("[summary] top_edges: %s", top_edges)
 
-    # known-edge validation
     if "auroc" in edge_validation:
         auroc = float(edge_validation["auroc"])
         auprc = float(edge_validation["auprc"])
@@ -4283,13 +4351,11 @@ def run_pipeline() -> PipelineResult:
             ", ".join(f"{k}={float(v):.2f}" for k, v in items[:8]),
         )
 
-    # survival
     if surv_metrics:
         ibs = float(br.get("ibs", float("nan")))
         ece = float(cal.get("ece", float("nan")))
         nag = float(surv_metrics.get("nagelkerke_r2_at_10y", float("nan")))
         iauc = float(td.get("integrated_auc", float("nan")))
-        # baseline Brier for an event_rate-sized null model is event_rate*(1-event_rate)
         ev_rate = float(np.mean(data.event))
         null_brier = ev_rate * (1.0 - ev_rate)
         logger.info(
@@ -4306,7 +4372,6 @@ def run_pipeline() -> PipelineResult:
             _flag(np.isfinite(iauc) and iauc < 0.55,
                   f"integrated_AUC={iauc:.3f} ~ chance"),
         )
-        # per-time AUC if available
         per_time = td.get("per_time")
         if isinstance(per_time, dict) and per_time:
             entries = sorted(
@@ -4319,7 +4384,6 @@ def run_pipeline() -> PipelineResult:
                     ", ".join(f"t={t:g}: {v:.3f}" for t, v in entries),
                 )
 
-    # output artifacts
     out_dir = Path(DEFAULT_OUTPUT_DIR)
     if out_dir.is_dir():
         plots_dir = out_dir / "plots"
@@ -4336,6 +4400,103 @@ def run_pipeline() -> PipelineResult:
         _format_seconds(time.time() - pipeline_started_at),
         data.n,
         data.p,
+    )
+
+
+def run_pipeline() -> PipelineResult:
+    """Run the single production path."""
+    logger = logging.getLogger("causal_pred.pipeline")
+    if not logger.handlers:
+        logger = _setup_logger(PIPELINE_VERBOSE)
+    _install_signal_handlers(logger)
+    cache = _cache()
+    timings: dict[str, float] = {}
+    pipeline_started_at = time.time()
+
+    csv_path, data, person_ids = _load_data_stage(cache, timings, logger)
+    (
+        data,
+        kept_person_ids,
+        prs_meta,
+        prs_df,
+        prs_path,
+        person_id_rows_after_prs,
+    ) = _build_prs_panel_stage(cache, csv_path, data, person_ids, timings, logger)
+    data, kept_person_ids, survival_outcome_meta = _ensure_survival_outcome_stage(
+        cache, data, kept_person_ids, timings, logger
+    )
+    ehr_panel = _build_ehr_panel_stage(cache, kept_person_ids, timings, logger)
+    data, kept_person_ids, genscore_meta, _genscore_model_bundle = (
+        _run_genscore_stage(
+            cache, data, kept_person_ids, prs_df, ehr_panel, timings, logger
+        )
+    )
+    mrdag_pi, mrdag_prior, mrdag_diagnostics = _build_mrdag_prior_stage(
+        cache, data, timings, logger
+    )
+
+    allowed_edges = _structural_allowed_edges(data.columns, data.node_types)
+    _log_structural_constraints(logger, allowed_edges, data.columns)
+
+    key, dagslam = _run_dagslam_stage(
+        cache, data, mrdag_prior, allowed_edges, timings, logger
+    )
+    edge_probs, mcmc_samples, mcmc_diagnostics = _run_structure_mcmc_stage(
+        cache, key, data, dagslam, mrdag_prior, allowed_edges, timings, logger
+    )
+
+    thresholded = _acyclic_threshold_from_edge_probs(
+        edge_probs,
+        THRESHOLD_DEFAULT,
+        allowed_edges=allowed_edges,
+    )
+
+    (
+        survival_time_grid,
+        survival_mean,
+        survival_lower,
+        survival_upper,
+        survival_parent_columns,
+        survival_diagnostics,
+    ) = _fit_survival_gam_stage(cache, key, data, mcmc_samples, timings, logger)
+
+    if CAUSAL_PATH_TARGET in data.columns and mcmc_samples.shape[0] > 0:
+        causal_pathways = _causal_pathway_probabilities(
+            edge_probs,
+            mcmc_samples,
+            data.columns,
+        )
+    else:
+        causal_pathways = []
+    _log_causal_pathways(logger, causal_pathways)
+
+    edge_validation = _validate_edges(
+        edge_probs,
+        data.columns,
+        rng=np.random.default_rng(PIPELINE_SEED + 4),
+        allowed_edges=allowed_edges,
+    )
+    validation = {
+        "known_edge_recovery": edge_validation,
+        "survival": survival_diagnostics.get("metrics", {}),
+    }
+    _log_validation_metrics(logger, edge_validation)
+
+    _log_pipeline_summary(
+        data,
+        timings,
+        genscore_meta,
+        mrdag_diagnostics,
+        dagslam,
+        mcmc_diagnostics,
+        edge_probs,
+        mcmc_samples,
+        thresholded,
+        allowed_edges,
+        edge_validation,
+        survival_diagnostics,
+        pipeline_started_at,
+        logger,
     )
 
     return PipelineResult(
