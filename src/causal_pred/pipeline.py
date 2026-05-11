@@ -3266,6 +3266,28 @@ def _load_or_run_dagslam(
         DAGSLAM_MAX_ITER,
         DAGSLAM_RESTARTS,
     )
+    # Defensive raw-stdout echo in case the logger handler chain is buffered
+    # or the user's harness swallows logger output. If this print appears
+    # but the logger.info line doesn't, the bug is upstream (logging config),
+    # not in dagslam.
+    print(
+        f"[dagslam] running hill-climb p={data.X.shape[1]} n={data.X.shape[0]} "
+        f"max_parents={DAGSLAM_MAX_PARENTS} max_iter={DAGSLAM_MAX_ITER} "
+        f"restarts={DAGSLAM_RESTARTS}",
+        flush=True,
+    )
+    _flush_log_handlers(logger)
+    try:
+        for log_name in ("causal_pred.pipeline", "causal_pred"):
+            for handler in logging.getLogger(log_name).handlers:
+                try:
+                    handler.flush()
+                except Exception:
+                    pass
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
 
     def _dagslam_progress(payload: dict) -> None:
         event = str(payload.get("event", "?"))
@@ -3378,17 +3400,23 @@ def _load_or_run_dagslam(
                 int(payload["cache_size"]),
                 _format_seconds(float(payload["elapsed_s"])),
             )
-        # Real-time flush -- Jupyter buffers stdout/stderr and the default
-        # logging.StreamHandler doesn't always flush per emit. Without this
-        # the user sees minutes of nothing then a wall of catch-up logs.
-        for handler in logger.handlers:
+        # Real-time flush -- the AoU/Jupyter harness block-buffers stdout
+        # when it isn't a TTY, so even logger emits sit in the OS pipe
+        # buffer until 4-8 KB accumulates. Walk every reachable handler
+        # (causal_pred parent and root) and force flushes; ALSO emit a
+        # bare print to stdout as a defensive secondary path, since the
+        # logger chain has too many failure modes to rely on alone.
+        try:
+            print(f"[dagslam-tick] {event}", flush=True)
+        except Exception:
+            pass
+        for log_name in ("causal_pred.pipeline", "causal_pred", ""):
             try:
-                handler.flush()
-            except Exception:
-                pass
-        for parent in logging.getLogger().handlers:
-            try:
-                parent.flush()
+                for handler in logging.getLogger(log_name).handlers:
+                    try:
+                        handler.flush()
+                    except Exception:
+                        pass
             except Exception:
                 pass
         try:

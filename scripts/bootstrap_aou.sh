@@ -113,6 +113,10 @@ export PATH="$HOME/.local/bin:$PATH"
 
 # 6. pipeline ----------------------------------------------------------------
 log "running real AoU causal pipeline"
-uv run python scripts/run_full_pipeline.py
+# -u forces unbuffered stdout/stderr. PYTHONUNBUFFERED is also set inside the
+# pipeline entrypoint as a belt-and-suspenders so progress logs from
+# DAGSLAM / MCMC / BMA appear in real time on this non-TTY harness instead
+# of sitting in the OS pipe buffer for minutes.
+PYTHONUNBUFFERED=1 uv run python -u scripts/run_full_pipeline.py
 
 log "done. artefacts in $REPO_DIR/outputs"
