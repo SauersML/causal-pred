@@ -54,32 +54,18 @@ is O(p^4) worst-case for the neighbourhood count on p ~ 20 but in
 practice dominated by the much smaller sparse graphs the sampler
 spends most of its time in.
 
-In addition to the single-edge moves, a **parent-set resample** hybrid
-move (Madigan & York 1995 Section 4) is proposed on a fraction
-``hybrid_prob`` of iterations.  The production path uses an exact Gibbs
-variant: one step picks a target node j uniformly, removes its incoming
-edges, enumerates the legal parent subsets under the configured parent
-limit, and samples the new parent set from its conditional posterior.
-This move is always accepted and is the main mixing path when the data
-posterior is too sharp for random structural proposals.
+In addition to the single-edge moves, a hybrid move set provides the
+mixing path the chain needs when the data posterior is too sharp for
+random add/delete/reverse proposals:
 
-The legacy random-flip variant remains available for unbounded toy runs:
-one step picks a target node j uniformly, flips each candidate edge
-(i, j) into/out of the parent set independently with probability
-``resample_flip``, rejects any proposal that would create a cycle, and
-otherwise accepts with
-
-    log alpha = log S(G'; j) - log S(G; j)
-              + sum_i [ I'(i,j) (log pi_ij - log(1-pi_ij))
-                       - I(i,j)  (log pi_ij - log(1-pi_ij)) ]
-
-where only S(G; j) (the local score at j) changes and the proposal
-density ratio is 1: each edge is flipped independently with the same
-probability in both directions, so the forward and reverse proposal
-densities coincide on the symmetric difference between old and new
-parent columns.  The move is a pure Metropolis-Hastings step and
-preserves detailed balance; with ``hybrid_prob = 0`` the sampler
-reduces to the single-edge chain.
+  * exact parent-set Gibbs (Madigan & York 1995 Section 4): pick a
+    target node j uniformly, enumerate the legal parent subsets under
+    the configured parent limit, and sample the new parent set from its
+    conditional posterior.  Always accepted.
+  * exact edge-pair Gibbs: pick an unordered pair {i, j}, enumerate the
+    three states (no edge, i -> j, j -> i) restricted to acyclic/legal
+    outcomes, and sample from the conditional posterior.  Always
+    accepted.
 
 Chains and diagnostics
 ----------------------
@@ -544,108 +530,14 @@ def _rhat_edgewise(chain_samples: Sequence[np.ndarray]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Hybrid random parent-set resample move (Madigan & York 1995 Section 4).
+# Exact parent-set Gibbs (Madigan & York 1995 Section 4).
 #
-# One iteration:
-#   1. pick target node j uniformly from 0..p-1.
-#   2. for every candidate i != j, flip the edge (i, j) independently w.p.
-#      resample_flip.
-#   3. if the resulting graph is acyclic, accept with MH probability
-#         alpha = exp( [log S(G'; j) - log S(G; j)]
-#                    + sum_i [I'(i,j) (log pi_ij - log(1-pi_ij))
-#                             - I(i,j)  (log pi_ij - log(1-pi_ij))] )
-#      (the proposal ratio log q(G|G')/q(G'|G) is zero because each flip is
-#      symmetric: q = (1/p) * 0.3^|F| * 0.7^(|C|-|F|) with F = symmetric
-#      difference between the old and new parent columns of j, which is the
-#      same set whether we go forward or backward).
-#
-# The move only touches the parent set of node j, so only S(G; j) changes
-# (other nodes' local scores cancel in the delta) and only column j of adj
-# changes -- so acyclicity can be checked on the whole graph with is_dag.
+# One iteration: pick target node j uniformly, enumerate the legal parent
+# subsets of size <= max_parents whose addition would not introduce a
+# cycle, evaluate the local score + Bernoulli prior for each, and sample
+# the new parent set from the resulting conditional posterior.  Since
+# only column j of adj changes the move is rejection-free.
 # ---------------------------------------------------------------------------
-
-
-def _hybrid_resample_parents(
-    adj: np.ndarray,
-    j: int,
-    data: np.ndarray,
-    node_types: Sequence[str],
-    log_pi: np.ndarray,
-    log_1m: np.ndarray,
-    resample_flip: float,
-    cache: dict,
-    rng: np.random.Generator,
-    hyper: dict,
-    max_parents: Optional[int] = None,
-    allowed_edges: Optional[np.ndarray] = None,
-) -> Tuple[bool, float, float]:
-    """Attempt a random parent-set resample at node ``j``.
-
-    Returns ``(accepted, d_score, d_prior)``.  If accepted, ``adj`` is
-    mutated in place; otherwise ``adj`` is unchanged.
-
-    Candidates are all ``i != j`` (uniform-fallback scheme).  Each flip is
-    independent with probability ``resample_flip``.  Cycle-creating
-    proposals are rejected (treated as alpha = 0).
-    """
-    p = adj.shape[0]
-    if allowed_edges is None:
-        allowed_col = np.ones(p, dtype=bool)
-        allowed_col[j] = False
-    else:
-        allowed_col = allowed_edges[:, j].astype(bool, copy=True)
-        allowed_col[j] = False
-    # Old parent column of j.
-    old_col = adj[:, j].copy()
-
-    # Flip each candidate edge with probability resample_flip.
-    # Candidates are all i != j; mask out the diagonal.
-    flip_draw = rng.random(p) < resample_flip
-    flip_draw &= allowed_col
-    new_col = old_col.copy()
-    new_col[flip_draw] ^= 1  # XOR flip
-    new_col[~allowed_col] = 0
-    if max_parents is not None and int(new_col.sum()) > int(max_parents):
-        return False, 0.0, 0.0
-
-    # If nothing flipped, proposal = current; alpha = 1 (no-op).  Count as
-    # accepted so the per-type rate reflects the true fraction of iterations
-    # that end at the proposal.
-    if not flip_draw.any():
-        return True, 0.0, 0.0
-
-    # Apply tentatively to adj and check acyclicity.
-    adj[:, j] = new_col
-    if not is_dag(adj):
-        # Reject: restore and bail.
-        adj[:, j] = old_col
-        return False, 0.0, 0.0
-
-    # Score delta at node j.
-    old_parents = np.flatnonzero(old_col).tolist()
-    new_parents = np.flatnonzero(new_col).tolist()
-    old_score = score_node(j, old_parents, data, node_types, cache=cache, **hyper)
-    new_score = score_node(j, new_parents, data, node_types, cache=cache, **hyper)
-    d_score = float(new_score - old_score)
-
-    # Prior delta at column j: independent Bernoulli over candidate edges.
-    # Non-candidate entries have log_pi = log_1m = 0 on the diagonal so the
-    # sum over all rows is equivalent to the sum over candidates.
-    new_mask = new_col.astype(bool)
-    old_mask = old_col.astype(bool)
-    new_prior_col = np.where(new_mask, log_pi[:, j], log_1m[:, j]).sum()
-    old_prior_col = np.where(old_mask, log_pi[:, j], log_1m[:, j]).sum()
-    d_prior = float(new_prior_col - old_prior_col)
-
-    # Proposal ratio is symmetric (see module docstring on this move) so
-    # log q(G|G') - log q(G'|G) = 0.
-    log_alpha = d_score + d_prior
-    log_u = np.log(rng.random() + 1e-300)
-    if log_u < log_alpha:
-        return True, d_score, d_prior
-    # Reject: restore old column.
-    adj[:, j] = old_col
-    return False, 0.0, 0.0
 
 
 def _gibbs_resample_parents(
