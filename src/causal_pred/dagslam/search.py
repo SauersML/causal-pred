@@ -63,6 +63,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from ..graph import is_dag, is_reachable, would_create_cycle
 from ..scoring.mixed import (
     score_dag,
     score_delta_add_edge,
@@ -83,55 +84,6 @@ class DAGSLAMResult:
     trace: List[dict] = field(default_factory=list)
     score_cache: dict = field(default_factory=dict)
     n_edges: int = 0
-
-
-# ---------------------------------------------------------------------------
-# Acyclicity utilities (DFS-based, exact)
-# ---------------------------------------------------------------------------
-
-
-def _is_reachable(adj: np.ndarray, src: int, dst: int) -> bool:
-    """Return True iff there is a directed path ``src -> ... -> dst`` in
-    ``adj``.  Exact DFS.  Self-reachability (``src == dst``) returns True.
-    """
-    if src == dst:
-        return True
-    p = adj.shape[0]
-    visited = np.zeros(p, dtype=bool)
-    visited[src] = True
-    stack = [int(src)]
-    while stack:
-        u = stack.pop()
-        for v in np.flatnonzero(adj[u]):
-            v = int(v)
-            if v == dst:
-                return True
-            if not visited[v]:
-                visited[v] = True
-                stack.append(v)
-    return False
-
-
-def _creates_cycle_if_add(adj: np.ndarray, i: int, j: int) -> bool:
-    """Adding i -> j creates a cycle iff j can already reach i."""
-    if i == j:
-        return True
-    return _is_reachable(adj, j, i)
-
-
-def _is_dag(adj: np.ndarray) -> bool:
-    """Kahn's algorithm; True iff the graph is acyclic."""
-    in_deg = adj.sum(axis=0).astype(int).copy()
-    stack = [i for i in range(adj.shape[0]) if in_deg[i] == 0]
-    seen = 0
-    while stack:
-        u = stack.pop()
-        seen += 1
-        for v in np.flatnonzero(adj[u]):
-            in_deg[v] -= 1
-            if in_deg[v] == 0:
-                stack.append(int(v))
-    return seen == adj.shape[0]
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +233,7 @@ def _enumerate_moves(
         if parent_counts[i] >= max_parents:
             continue
         adj[i, j] = 0
-        reaches = _is_reachable(adj, i, j)
+        reaches = is_reachable(adj, i, j)
         adj[i, j] = 1
         if not reaches:
             moves.append(("reverse", i, j))
@@ -299,7 +251,7 @@ def _enumerate_moves(
                 continue
             if not allowed_edges[i, j]:
                 continue
-            if not _creates_cycle_if_add(adj, i, j):
+            if not would_create_cycle(adj, i, j):
                 moves.append(("add", i, j))
 
     return moves
@@ -611,7 +563,7 @@ def run_dagslam(
             global_best_adj = best_adj_r.copy()
 
     # Strictly acyclic invariant (MCMC depends on it).
-    assert _is_dag(global_best_adj), (
+    assert is_dag(global_best_adj), (
         "DAGSLAM produced a non-acyclic graph -- internal invariant violated"
     )
 

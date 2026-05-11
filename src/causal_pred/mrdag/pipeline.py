@@ -108,6 +108,7 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 
 from ..data.nodes import NODE_NAMES
+from ..graph import apply_move, is_reachable, revert_move, would_create_cycle
 
 
 # ---------------------------------------------------------------------------
@@ -165,37 +166,6 @@ def _posterior_mean_weight(beta: float, se: float, W: float) -> float:
         return 0.0
     v = se * se
     return (W / (W + v)) * beta
-
-
-# ---------------------------------------------------------------------------
-# DAG / reachability utilities
-# ---------------------------------------------------------------------------
-
-
-def _is_reachable(adj: np.ndarray, src: int, dst: int) -> bool:
-    """True iff there is a directed path src -> ... -> dst in ``adj``."""
-    if src == dst:
-        return True
-    n = adj.shape[0]
-    visited = np.zeros(n, dtype=bool)
-    stack = [src]
-    visited[src] = True
-    while stack:
-        u = stack.pop()
-        for v in np.flatnonzero(adj[u]):
-            if v == dst:
-                return True
-            if not visited[v]:
-                visited[v] = True
-                stack.append(int(v))
-    return False
-
-
-def _creates_cycle_if_add(adj: np.ndarray, i: int, j: int) -> bool:
-    """Adding i -> j creates a cycle iff j can already reach i."""
-    if i == j:
-        return True
-    return _is_reachable(adj, j, i)
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +279,7 @@ def _legal_moves(adj: np.ndarray, allowed: np.ndarray) -> List[Tuple[str, int, i
         if not allowed[j, i] or adj[j, i] == 1:
             continue
         adj[i, j] = 0
-        ok = not _is_reachable(adj, i, j)
+        ok = not is_reachable(adj, i, j)
         adj[i, j] = 1
         if ok:
             legal.append(("reverse", i, j))
@@ -319,31 +289,9 @@ def _legal_moves(adj: np.ndarray, allowed: np.ndarray) -> List[Tuple[str, int, i
         j = int(j)
         if adj[i, j] == 1 or adj[j, i] == 1:
             continue
-        if not _is_reachable(adj, j, i):
+        if not would_create_cycle(adj, i, j):
             legal.append(("add", i, j))
     return legal
-
-
-def _apply_move(adj: np.ndarray, move: Tuple[str, int, int]) -> None:
-    mtype, i, j = move
-    if mtype == "add":
-        adj[i, j] = 1
-    elif mtype == "delete":
-        adj[i, j] = 0
-    elif mtype == "reverse":
-        adj[i, j] = 0
-        adj[j, i] = 1
-
-
-def _revert_move(adj: np.ndarray, move: Tuple[str, int, int]) -> None:
-    mtype, i, j = move
-    if mtype == "add":
-        adj[i, j] = 0
-    elif mtype == "delete":
-        adj[i, j] = 1
-    elif mtype == "reverse":
-        adj[j, i] = 0
-        adj[i, j] = 1
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +340,7 @@ def _run_chain(
         idx = int(rng.integers(0, cur_nmoves))
         move = cur_legal[idx]
 
-        _apply_move(adj, move)
+        apply_move(adj, move)
         new_legal = _legal_moves(adj, allowed)
         new_nmoves = len(new_legal)
         new_lp = _log_posterior(
@@ -417,7 +365,7 @@ def _run_chain(
             cur_nmoves = new_nmoves
             n_accept += 1
         else:
-            _revert_move(adj, move)
+            revert_move(adj, move)
 
         if it >= n_burn and ((it - n_burn) % thin == 0):
             samples.append(adj.copy())

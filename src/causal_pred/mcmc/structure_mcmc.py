@@ -124,6 +124,7 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from ..graph import is_dag
 from ..scoring.mixed import (
     score_dag,
     score_delta_add_edge,
@@ -177,53 +178,6 @@ def _progress_callback(progress: bool | ProgressCallback) -> Optional[ProgressCa
         )
 
     return _print_progress
-
-
-# ---------------------------------------------------------------------------
-# Acyclicity utilities
-# ---------------------------------------------------------------------------
-
-
-def _is_reachable(adj: np.ndarray, src: int, dst: int) -> bool:
-    """True iff there is a directed path ``src -> ... -> dst``.
-
-    ``src == dst`` returns True (self-reachable).  Uses a numpy-backed
-    DFS over the adjacency matrix.
-    """
-    if src == dst:
-        return True
-    p = adj.shape[0]
-    visited = np.zeros(p, dtype=bool)
-    visited[src] = True
-    stack: List[int] = [int(src)]
-    while stack:
-        u = stack.pop()
-        nbrs = np.flatnonzero(adj[u])
-        for v in nbrs:
-            vv = int(v)
-            if vv == dst:
-                return True
-            if not visited[vv]:
-                visited[vv] = True
-                stack.append(vv)
-    return False
-
-
-def _is_dag(adj: np.ndarray) -> bool:
-    """Kahn's algorithm DAG check."""
-    in_deg = adj.sum(axis=0).astype(int).copy()
-    p = adj.shape[0]
-    stack = [int(i) for i in range(p) if in_deg[i] == 0]
-    seen = 0
-    while stack:
-        u = stack.pop()
-        seen += 1
-        for v in np.flatnonzero(adj[u]):
-            vv = int(v)
-            in_deg[vv] -= 1
-            if in_deg[vv] == 0:
-                stack.append(vv)
-    return seen == p
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +435,7 @@ def _perturb_dag(
             if max_parents is not None and adj[:, j].sum() >= int(max_parents):
                 continue
             adj[i, j] = 1
-            if _is_dag(adj):
+            if is_dag(adj):
                 applied += 1
             else:
                 adj[i, j] = 0
@@ -507,12 +461,12 @@ def _perturb_dag(
                 continue
             adj[i, j] = 0
             adj[j, i] = 1
-            if _is_dag(adj):
+            if is_dag(adj):
                 applied += 1
             else:
                 adj[j, i] = 0
                 adj[i, j] = 1
-    assert _is_dag(adj), "perturbation produced a non-DAG"
+    assert is_dag(adj), "perturbation produced a non-DAG"
     return adj
 
 
@@ -607,7 +561,7 @@ def _rhat_edgewise(chain_samples: Sequence[np.ndarray]) -> np.ndarray:
 #
 # The move only touches the parent set of node j, so only S(G; j) changes
 # (other nodes' local scores cancel in the delta) and only column j of adj
-# changes -- so acyclicity can be checked on the whole graph with _is_dag.
+# changes -- so acyclicity can be checked on the whole graph with is_dag.
 # ---------------------------------------------------------------------------
 
 
@@ -662,7 +616,7 @@ def _hybrid_resample_parents(
 
     # Apply tentatively to adj and check acyclicity.
     adj[:, j] = new_col
-    if not _is_dag(adj):
+    if not is_dag(adj):
         # Reject: restore and bail.
         adj[:, j] = old_col
         return False, 0.0, 0.0
@@ -799,7 +753,7 @@ def _gibbs_resample_parents(
         new_col[list(new_parents)] = 1
 
     adj[:, j] = new_col
-    assert _is_dag(adj), "Gibbs parent-set update produced a non-DAG"
+    assert is_dag(adj), "Gibbs parent-set update produced a non-DAG"
 
     new_score = score_node(j, new_parents, data, node_types, cache=cache, **hyper)
     new_prior_col = float(
@@ -907,7 +861,7 @@ def _gibbs_resample_edge_pair(
         adj[i, j] = 1
     elif state == 2:
         adj[j, i] = 1
-    assert _is_dag(adj), "edge-pair Gibbs update produced a non-DAG"
+    assert is_dag(adj), "edge-pair Gibbs update produced a non-DAG"
 
     return True, float(new_score - old_score), float(new_prior - old_prior)
 
@@ -979,7 +933,7 @@ def _gibbs_resample_node_block(
             max_parents
         ):
             continue
-        if not _is_dag(cand):
+        if not is_dag(cand):
             continue
         score = 0.0
         for node in block:
@@ -1005,7 +959,7 @@ def _gibbs_resample_node_block(
         for v in block:
             if u != v:
                 adj[u, v] = new_adj[u, v]
-    assert _is_dag(adj), "node-block Gibbs update produced a non-DAG"
+    assert is_dag(adj), "node-block Gibbs update produced a non-DAG"
     return True, float(new_score - old_score), float(new_prior - old_prior)
 
 
@@ -1527,7 +1481,7 @@ def run_structure_mcmc(
     start_adj = np.asarray(start_adj, dtype=np.int64)
     if start_adj.shape != (p, p):
         raise ValueError(f"start_adj has shape {start_adj.shape}, expected ({p}, {p})")
-    if not _is_dag(start_adj):
+    if not is_dag(start_adj):
         raise ValueError("start_adj is not acyclic")
     allowed = _prepare_allowed_edges(allowed_edges, p)
     if np.any((start_adj != 0) & (~allowed)):
