@@ -59,6 +59,7 @@ from .data.nodes import CANONICAL_EDGES, NODES, NODE_INDEX, NODE_NAMES
 from .data.polygenic import parse_sscore, score_panel
 from .data.opengwas import load_live_gwas
 from .data.synthetic import SyntheticDataset
+from ._parallel import cpu_count, parallel_call
 from .dagslam import run_dagslam
 from .genscore.integrate import run_genscore
 from .genscore.panels import download_panel
@@ -3611,93 +3612,195 @@ def _survival_gam_fit_filename(key: str, parent_set: tuple[int, ...]) -> str:
     )
 
 
-def _load_or_run_survival_parent_fit(
-    cache: WorkspaceCache,
-    key: str,
-    data: SyntheticDataset,
-    parent_set: tuple[int, ...],
+def _fit_survival_parent_set_worker(
+    time_arr: np.ndarray,
+    event_arr: np.ndarray,
+    X: np.ndarray,
+    cols: tuple[str, ...],
     t_grid: np.ndarray,
-    logger: logging.Logger,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any], float]:
-    filename = _survival_gam_fit_filename(key, parent_set)
-    path = cache.fetch(filename)
-    if path.is_file():
-        with np.load(path, allow_pickle=False) as z:
-            logger.info("[gamfit] using fit cache %s", path)
-            return (
-                z["survival_mean"],
-                z["survival_variance"],
-                json.loads(str(z["diagnostics_json"].item())),
-                float(z["runtime_s"].item()),
-            )
+    """Worker entry point: fit one survival GAM and return predictions.
 
-    cols = tuple(data.columns[i] for i in parent_set)
-    X = data.X[:, list(parent_set)] if parent_set else np.zeros((data.n, 0))
+    No logger / cache plumbing — those live in the parent process.  gamfit's
+    Rust core still prints its REML / PIRLS diagnostics directly to stdout,
+    which is inherited from the parent.
+    """
     from .gam.survival import fit_survival_gam
 
     t0 = time.time()
     fit = fit_survival_gam(
-        data.time,
-        data.event,
+        time_arr,
+        event_arr,
         X,
         columns=cols,
         n_uncertainty_slices=GAM_N_SAMPLES,
-        progress=lambda message, cols=cols: logger.info(
-            "[gamfit] parents=%s %s",
-            ",".join(cols) if cols else "(intercept)",
-            message,
-        ),
+        progress=False,
     )
     mean = fit.predict_survival_mean(X, t_grid)
     variance = fit.predict_survival_variance(X, t_grid)
     runtime_s = time.time() - t0
     diag = fit.uncertainty_summary()
     diag["parent_columns"] = list(cols)
-    _atomic_npz(
-        path,
-        survival_mean=mean,
-        survival_variance=variance,
-        diagnostics_json=np.array(json.dumps(_json_sanitise(diag), allow_nan=False)),
-        runtime_s=np.array(runtime_s),
-    )
-    cache.store(path, filename)
-    logger.info(
-        "[gamfit] cached parent fit %s elapsed=%s",
-        path,
-        _format_seconds(runtime_s),
-    )
     return mean, variance, diag, runtime_s
 
 
-def _fit_survival_parent_set_holdout(
-    data: SyntheticDataset,
-    parent_set: tuple[int, ...],
-    train_idx: np.ndarray,
-    test_idx: np.ndarray,
+def _fit_survival_holdout_worker(
+    train_time: np.ndarray,
+    train_event: np.ndarray,
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    cols: tuple[str, ...],
     t_grid: np.ndarray,
-    logger: logging.Logger,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     from .gam.survival import fit_survival_gam
 
-    cols = tuple(data.columns[i] for i in parent_set)
-    X_all = data.X[:, list(parent_set)] if parent_set else np.zeros((data.n, 0))
-    X_train = X_all[train_idx]
-    X_test = X_all[test_idx]
     fit = fit_survival_gam(
-        data.time[train_idx],
-        data.event[train_idx],
+        train_time,
+        train_event,
         X_train,
         columns=cols,
         n_uncertainty_slices=GAM_N_SAMPLES,
-        progress=lambda message, cols=cols: logger.info(
-            "[gamfit-validation] parents=%s %s",
-            ",".join(cols) if cols else "(intercept)",
-            message,
-        ),
+        progress=False,
     )
     diag = fit.uncertainty_summary()
     diag["parent_columns"] = list(cols)
     return fit.predict_survival_mean(X_test, t_grid), diag
+
+
+def _bma_threads_per_worker(n_workers: int) -> int:
+    return max(1, cpu_count() // max(1, n_workers))
+
+
+def _run_survival_parent_fits(
+    cache: WorkspaceCache,
+    key: str,
+    data: SyntheticDataset,
+    parent_sets: Sequence[tuple[int, ...]],
+    t_grid: np.ndarray,
+    logger: logging.Logger,
+) -> list[tuple[np.ndarray, np.ndarray, dict[str, Any], float]]:
+    """Cached + parallel BMA training fits across parent_sets.
+
+    Cache hits short-circuit before dispatching to a worker.  The remaining
+    uncached fits run in parallel processes via joblib's loky backend; each
+    worker pins BLAS threads to a slice of the box so K parallel gamfit
+    Rust cores do not all try to grab every core.
+    """
+    results: list[Optional[tuple[np.ndarray, np.ndarray, dict[str, Any], float]]] = [
+        None
+    ] * len(parent_sets)
+
+    uncached: list[tuple[int, tuple[int, ...], Path]] = []
+    for idx, parent_set in enumerate(parent_sets):
+        filename = _survival_gam_fit_filename(key, parent_set)
+        path = cache.fetch(filename)
+        if path.is_file():
+            with np.load(path, allow_pickle=False) as z:
+                logger.info("[gamfit] using fit cache %s", path)
+                results[idx] = (
+                    z["survival_mean"],
+                    z["survival_variance"],
+                    json.loads(str(z["diagnostics_json"].item())),
+                    float(z["runtime_s"].item()),
+                )
+        else:
+            uncached.append((idx, parent_set, path))
+
+    if uncached:
+        n_workers = min(cpu_count(), len(uncached))
+        threads_per_worker = _bma_threads_per_worker(n_workers)
+        logger.info(
+            "[gamfit] dispatching %d parent-set fit(s) across %d worker(s) "
+            "with %d BLAS thread(s) each",
+            len(uncached),
+            n_workers,
+            threads_per_worker,
+        )
+        arg_tuples = []
+        for _idx, parent_set, _path in uncached:
+            cols = tuple(data.columns[i] for i in parent_set)
+            X = (
+                data.X[:, list(parent_set)]
+                if parent_set
+                else np.zeros((data.n, 0))
+            )
+            arg_tuples.append((data.time, data.event, X, cols, t_grid))
+        worker_results = parallel_call(
+            _fit_survival_parent_set_worker,
+            arg_tuples,
+            n_workers=n_workers,
+            threads_per_worker=threads_per_worker,
+        )
+        for (idx, parent_set, path), worker_result in zip(uncached, worker_results):
+            mean, variance, diag, runtime_s = worker_result
+            _atomic_npz(
+                path,
+                survival_mean=mean,
+                survival_variance=variance,
+                diagnostics_json=np.array(
+                    json.dumps(_json_sanitise(diag), allow_nan=False)
+                ),
+                runtime_s=np.array(runtime_s),
+            )
+            filename = _survival_gam_fit_filename(key, parent_set)
+            cache.store(path, filename)
+            logger.info(
+                "[gamfit] cached parent fit %s elapsed=%s",
+                path,
+                _format_seconds(runtime_s),
+            )
+            results[idx] = worker_result
+
+    out: list[tuple[np.ndarray, np.ndarray, dict[str, Any], float]] = []
+    for idx, value in enumerate(results):
+        if value is None:
+            raise RuntimeError(
+                f"survival GAM fit slot {idx} not populated (cache miss without worker result)"
+            )
+        out.append(value)
+    return out
+
+
+def _run_survival_parent_fits_holdout(
+    data: SyntheticDataset,
+    parent_sets: Sequence[tuple[int, ...]],
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    t_grid: np.ndarray,
+    logger: logging.Logger,
+) -> list[tuple[np.ndarray, dict[str, Any]]]:
+    """Parallel held-out validation BMA fits.
+
+    No cache layer (validation fits are recomputed every run).
+    """
+    if not parent_sets:
+        return []
+    n_workers = min(cpu_count(), len(parent_sets))
+    threads_per_worker = _bma_threads_per_worker(n_workers)
+    logger.info(
+        "[gamfit-validation] dispatching %d parent-set fit(s) across %d worker(s) "
+        "with %d BLAS thread(s) each",
+        len(parent_sets),
+        n_workers,
+        threads_per_worker,
+    )
+    train_time = data.time[train_idx]
+    train_event = data.event[train_idx]
+    arg_tuples = []
+    for parent_set in parent_sets:
+        cols = tuple(data.columns[i] for i in parent_set)
+        X_all = (
+            data.X[:, list(parent_set)] if parent_set else np.zeros((data.n, 0))
+        )
+        arg_tuples.append(
+            (train_time, train_event, X_all[train_idx], X_all[test_idx], cols, t_grid)
+        )
+    return parallel_call(
+        _fit_survival_holdout_worker,
+        arg_tuples,
+        n_workers=n_workers,
+        threads_per_worker=threads_per_worker,
+    )
 
 
 def _load_or_run_survival_gam(
@@ -3747,21 +3850,19 @@ def _load_or_run_survival_gam(
     fit_summaries = []
     t0 = time.time()
     logger.info("[gam] fitting %d gamfit survival parent-set models", len(parent_sets))
-    for parent_set, weight, count, source in zip(
-        parent_sets,
-        weights,
-        parent_set_counts,
-        parent_set_sources,
+    fit_results = _run_survival_parent_fits(
+        cache,
+        key,
+        data,
+        [tuple(ps) for ps in parent_sets],
+        t_grid,
+        logger,
+    )
+    for (parent_set, weight, count, source), (mean, variance, diag, _runtime) in zip(
+        zip(parent_sets, weights, parent_set_counts, parent_set_sources),
+        fit_results,
     ):
         cols = tuple(data.columns[i] for i in parent_set)
-        mean, variance, diag, _fit_runtime_s = _load_or_run_survival_parent_fit(
-            cache,
-            key,
-            data,
-            tuple(parent_set),
-            t_grid,
-            logger,
-        )
         per_model.append(mean)
         per_model_variance.append(variance)
         diag["posterior_parent_set_weight"] = float(weight)
@@ -3798,20 +3899,18 @@ def _load_or_run_survival_gam(
         int(train_idx.size),
         int(test_idx.size),
     )
-    for parent_set, weight, count, source in zip(
-        parent_sets,
-        weights,
-        parent_set_counts,
-        parent_set_sources,
+    holdout_results = _run_survival_parent_fits_holdout(
+        data,
+        [tuple(ps) for ps in parent_sets],
+        train_idx,
+        test_idx,
+        t_grid,
+        logger,
+    )
+    for (parent_set, weight, count, source), (pred, diag) in zip(
+        zip(parent_sets, weights, parent_set_counts, parent_set_sources),
+        holdout_results,
     ):
-        pred, diag = _fit_survival_parent_set_holdout(
-            data,
-            tuple(parent_set),
-            train_idx,
-            test_idx,
-            t_grid,
-            logger,
-        )
         validation_models.append(pred)
         diag["posterior_parent_set_weight"] = float(weight)
         diag["posterior_parent_set_count"] = int(count)

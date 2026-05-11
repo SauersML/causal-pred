@@ -110,6 +110,7 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .._parallel import cpu_count, parallel_call
 from ..graph import is_dag
 from ..scoring.mixed import (
     score_dag,
@@ -218,6 +219,24 @@ def _prepare_allowed_edges(allowed_edges: Optional[np.ndarray], p: int) -> np.nd
 # ---------------------------------------------------------------------------
 # Neighbourhood size |N(G)|.
 # ---------------------------------------------------------------------------
+
+
+def _score_node_worker(
+    j: int,
+    parents: Tuple[int, ...],
+    data: np.ndarray,
+    node_types: Tuple[str, ...],
+    hyper: dict,
+) -> float:
+    """Worker entry point for parallel parent-set scoring.
+
+    Returns the local marginal log-likelihood of node ``j`` with the given
+    ``parents``.  No shared cache: each worker computes from scratch, but
+    every parent subset enumerated in one Gibbs sweep is unique anyway, so
+    the cache only ever helped across sweeps (the parent process accumulates
+    scores in its own cache via the serial code paths).
+    """
+    return float(score_node(j, parents, data, node_types, cache=None, **hyper))
 
 
 def _ancestors_matrix(adj: np.ndarray) -> np.ndarray:
@@ -603,33 +622,29 @@ def _gibbs_resample_parents(
 
     absent_prior = float(log_1m[candidates, j].sum()) if candidates else 0.0
     log_odds = log_pi[:, j] - log_1m[:, j]
-    parent_sets: List[Tuple[int, ...]] = []
+    parent_sets: List[Tuple[int, ...]] = [
+        tuple(int(i) for i in parents)
+        for size in range(cap + 1)
+        for parents in combinations(candidates, size)
+    ]
+
+    n_workers = min(cpu_count(), len(parent_sets)) if parent_sets else 1
+    arg_tuples = [
+        (int(j), parents, data, tuple(node_types), hyper) for parents in parent_sets
+    ]
+    scores = parallel_call(
+        _score_node_worker,
+        arg_tuples,
+        n_workers=n_workers,
+        threads_per_worker=1,
+    )
     log_weights: List[float] = []
-    scored_sets = 0
-    last_parent_progress_at = parent_started_at
-    for size in range(cap + 1):
-        for parents in combinations(candidates, size):
-            parent_sets.append(tuple(int(i) for i in parents))
-            score = score_node(j, parents, data, node_types, cache=cache, **hyper)
-            prior = absent_prior + (
-                float(log_odds[list(parents)].sum()) if parents else 0.0
-            )
-            log_weights.append(float(score + prior))
-            scored_sets += 1
-            now = time.time()
-            if emit_parent_progress and now - last_parent_progress_at >= 10.0:
-                progress(
-                    {
-                        "event": "exact_parent_sets_progress",
-                        "target_node": int(j),
-                        "candidate_parents": int(len(candidates)),
-                        "parent_cap": int(cap),
-                        "parent_sets_scored": int(scored_sets),
-                        "parent_sets_total": n_parent_sets,
-                        "parent_elapsed_s": float(now - parent_started_at),
-                    }
-                )
-                last_parent_progress_at = now
+    for parents, score in zip(parent_sets, scores):
+        prior = absent_prior + (
+            float(log_odds[list(parents)].sum()) if parents else 0.0
+        )
+        log_weights.append(float(score + prior))
+    scored_sets = len(parent_sets)
 
     weights_log = np.asarray(log_weights, dtype=float)
     weights = np.exp(weights_log - float(weights_log.max()))

@@ -430,14 +430,6 @@ def test_rhat_diagnostic_is_bounded(medium_data):
     # samples per chain.  This medium fixture has a sharp, multi-modal
     # posterior, so R-hat is expected to report residual disagreement rather
     # than falsely claim convergence.
-    # The hybrid parent-set resample is enabled with a very small
-    # ``resample_flip``: this keeps each hybrid step close to a single-
-    # edge flip (so mixing across the Markov-equivalence class is not
-    # destabilised by long sojourns in unrepresentative graphs) while
-    # still giving the chain occasional multi-edge escapes.  Larger
-    # resample_flip can *hurt* skeleton R-hat on this synthetic target
-    # because the sampler's fast local mixing within an equivalence
-    # class gets swapped for slow inter-mode jumps.
     res = run_structure_mcmc(
         medium_data.X,
         medium_data.node_types,

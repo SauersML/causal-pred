@@ -90,10 +90,10 @@ def test_fit_smoke(monkeypatch):
     )
 
     assert seen["survival_likelihood"] == "location-scale"
-    assert seen["baseline_target"] == "linear"
-    assert seen["config"] == {"noise_formula": "1"}
+    assert seen["baseline_target"] == "gompertz-makeham"
+    assert seen["config"] == {"noise_formula": "s(sex) + s(bmi)"}
     assert seen["df_columns"] == ("entry", "exit", "event", "sex", "bmi")
-    assert seen["formula"] == "Surv(entry, exit, event) ~ sex + BMI"
+    assert seen["formula"] == "Surv(entry, exit, event) ~ s(sex) + s(bmi)"
     np.testing.assert_allclose(seen["df"][["sex", "bmi"]].mean(axis=0), 0.0)
     np.testing.assert_allclose(seen["df"][["sex", "bmi"]].std(axis=0, ddof=0), 1.0)
 
@@ -141,8 +141,12 @@ def test_predict_shape():
             columns=("bmi", "age"),
             n_train=10,
             n_events=4,
-            formula="Surv(entry, exit, event) ~ BMI + age",
+            formula="Surv(entry, exit, event) ~ s(bmi) + s(age)",
             train_summary={},
+            location_formula="s(bmi) + s(age)",
+            survival_likelihood="location-scale",
+            baseline_target="gompertz-makeham",
+            noise_formula="s(bmi) + s(age)",
             x_center=np.zeros(2),
             x_scale=np.ones(2),
         ),
@@ -204,9 +208,12 @@ def test_predict_survival_mean_uses_gamfit_surface():
         columns=("x",),
         n_train=10,
         n_events=3,
-        formula="Surv(entry, exit, event) ~ x",
+        formula="Surv(entry, exit, event) ~ s(x)",
         train_summary={},
+        location_formula="s(x)",
         survival_likelihood="location-scale",
+        baseline_target="gompertz-makeham",
+        noise_formula="s(x)",
         x_center=np.zeros(1),
         x_scale=np.ones(1),
     )
@@ -335,9 +342,12 @@ def test_survival_se_requires_gamfit_uncertainty():
             columns=("x",),
             n_train=4,
             n_events=2,
-            formula="Surv(entry, exit, event) ~ x",
+            formula="Surv(entry, exit, event) ~ s(x)",
             train_summary={},
+            location_formula="s(x)",
             survival_likelihood="location-scale",
+            baseline_target="gompertz-makeham",
+            noise_formula="s(x)",
             x_center=np.zeros(1),
             x_scale=np.ones(1),
         ),
