@@ -16,7 +16,21 @@ from joblib import Parallel, delayed
 
 
 def cpu_count() -> int:
-    return max(1, os.cpu_count() or 1)
+    """Return the number of CPUs the current process can actually run on.
+
+    ``os.cpu_count()`` returns the kernel-visible CPU count, which on
+    cgrouped containers (AoU JupyterLab, Kubernetes pods, etc.) can
+    over- or under-report depending on Python build flags.
+    ``sched_getaffinity`` asks the kernel for the affinity mask of the
+    current process -- the CPUs we are *actually allowed to run on*.
+    That's the right number for BLAS thread + worker heuristics: hand
+    more threads than that to BLAS or rayon and the OS oversubscribes,
+    so context-switch overhead eats the gain.
+
+    This pipeline only ever runs on Linux (AoU Researcher Workbench),
+    so we use sched_getaffinity unconditionally -- no fallback path.
+    """
+    return max(1, len(os.sched_getaffinity(0)))
 
 
 def _worker(func: Callable[..., Any], args: tuple, threads: int) -> Any:

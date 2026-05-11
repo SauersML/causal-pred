@@ -4121,7 +4121,43 @@ def _run_survival_parent_fits(
     return out
 
 
+def _survival_gam_holdout_filename(
+    key: str,
+    parent_set: tuple[int, ...],
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+) -> str:
+    """Cache filename for one held-out validation fit.
+
+    The hash binds (run_key, parent_set, train/test partition, gam config)
+    so changing the cohort, the parent set composition, the holdout split,
+    or any gam tuning knob produces a fresh fit -- and *only* those.
+    Stable across re-runs of the same pipeline configuration, which is
+    the point: the holdout fits are deterministic functions of those
+    inputs and were being recomputed every run for no good reason.
+    """
+    return (
+        "survival-gam-holdout-"
+        + _short_hash(
+            {
+                "key": key,
+                "parent_set": list(parent_set),
+                "gam": _pipeline_config()["gam"],
+                "train_idx_sha256": _array_hash(
+                    np.asarray(train_idx, dtype=np.int64)
+                ),
+                "test_idx_sha256": _array_hash(
+                    np.asarray(test_idx, dtype=np.int64)
+                ),
+            }
+        )
+        + ".npz"
+    )
+
+
 def _run_survival_parent_fits_holdout(
+    cache: WorkspaceCache,
+    key: str,
     data: SyntheticDataset,
     parent_sets: Sequence[tuple[int, ...]],
     train_idx: np.ndarray,
@@ -4129,38 +4165,98 @@ def _run_survival_parent_fits_holdout(
     t_grid: np.ndarray,
     logger: logging.Logger,
 ) -> list[tuple[np.ndarray, dict[str, Any]]]:
-    """Parallel held-out validation BMA fits.
+    """Parallel held-out validation BMA fits with disk + GCS caching.
 
-    No cache layer (validation fits are recomputed every run).
+    Cache hits short-circuit before dispatching a worker. The remaining
+    uncached fits run in parallel processes (same loky pool layout as the
+    training batch). On miss we write each fit's npz atomically and
+    mirror it to the workspace bucket so a subsequent run with the same
+    cohort + holdout split avoids the gamfit Rust solve entirely.
     """
     if not parent_sets:
         return []
-    n_workers = min(cpu_count(), len(parent_sets))
-    threads_per_worker = max(1, cpu_count() // n_workers)
-    logger.info(
-        "[gamfit-validation] dispatching %d parent-set fit(s) across %d worker(s) "
-        "with %d rayon thread(s) each",
-        len(parent_sets),
-        n_workers,
-        threads_per_worker,
+
+    results: list[Optional[tuple[np.ndarray, dict[str, Any]]]] = [None] * len(
+        parent_sets
     )
-    train_time = data.time[train_idx]
-    train_event = data.event[train_idx]
-    arg_tuples = []
-    for parent_set in parent_sets:
-        cols = tuple(data.columns[i] for i in parent_set)
-        X_all = (
-            data.X[:, list(parent_set)] if parent_set else np.zeros((data.n, 0))
+    uncached: list[tuple[int, tuple[int, ...], Path]] = []
+    for idx, parent_set in enumerate(parent_sets):
+        filename = _survival_gam_holdout_filename(
+            key, parent_set, train_idx, test_idx
         )
-        arg_tuples.append(
-            (train_time, train_event, X_all[train_idx], X_all[test_idx], cols, t_grid)
+        path = cache.fetch(filename)
+        if path.is_file():
+            with np.load(path, allow_pickle=False) as z:
+                logger.info("[gamfit-validation] using fit cache %s", path)
+                results[idx] = (
+                    z["survival_mean"],
+                    json.loads(str(z["diagnostics_json"].item())),
+                )
+        else:
+            uncached.append((idx, parent_set, path))
+
+    if uncached:
+        n_workers = min(cpu_count(), len(uncached))
+        threads_per_worker = max(1, cpu_count() // n_workers)
+        logger.info(
+            "[gamfit-validation] dispatching %d parent-set fit(s) across %d "
+            "worker(s) with %d rayon thread(s) each",
+            len(uncached),
+            n_workers,
+            threads_per_worker,
         )
-    return parallel_call(
-        _fit_survival_holdout_worker,
-        arg_tuples,
-        n_workers=n_workers,
-        threads_per_worker=threads_per_worker,
-    )
+        train_time = data.time[train_idx]
+        train_event = data.event[train_idx]
+        arg_tuples = []
+        for _idx, parent_set, _path in uncached:
+            cols = tuple(data.columns[i] for i in parent_set)
+            X_all = (
+                data.X[:, list(parent_set)]
+                if parent_set
+                else np.zeros((data.n, 0))
+            )
+            arg_tuples.append(
+                (
+                    train_time,
+                    train_event,
+                    X_all[train_idx],
+                    X_all[test_idx],
+                    cols,
+                    t_grid,
+                )
+            )
+        worker_results = parallel_call(
+            _fit_survival_holdout_worker,
+            arg_tuples,
+            n_workers=n_workers,
+            threads_per_worker=threads_per_worker,
+        )
+        for (idx, parent_set, path), worker_result in zip(
+            uncached, worker_results
+        ):
+            mean, diag = worker_result
+            _atomic_npz(
+                path,
+                survival_mean=mean,
+                diagnostics_json=np.array(
+                    json.dumps(_json_sanitise(diag), allow_nan=False)
+                ),
+            )
+            filename = _survival_gam_holdout_filename(
+                key, parent_set, train_idx, test_idx
+            )
+            cache.store(path, filename)
+            logger.info("[gamfit-validation] cached %s", path)
+            results[idx] = worker_result
+
+    out: list[tuple[np.ndarray, dict[str, Any]]] = []
+    for idx, entry in enumerate(results):
+        if entry is None:
+            raise RuntimeError(
+                f"holdout fit slot {idx} unfilled -- internal cache bug"
+            )
+        out.append(entry)
+    return out
 
 
 def _load_or_run_survival_gam(
@@ -4260,6 +4356,8 @@ def _load_or_run_survival_gam(
         int(test_idx.size),
     )
     holdout_results = _run_survival_parent_fits_holdout(
+        cache,
+        key,
         data,
         [tuple(ps) for ps in parent_sets],
         train_idx,
