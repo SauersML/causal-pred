@@ -103,13 +103,21 @@ DAGSLAM_MAX_PARENTS = 3
 DAGSLAM_MAX_ITER = 500
 DAGSLAM_RESTARTS = 3
 
-MCMC_SAMPLES = 500
-MCMC_BURN_IN = 250
+MCMC_SAMPLES = 1000
+MCMC_BURN_IN = 500
 MCMC_THIN = 2
-MCMC_CHAINS = 2
+MCMC_CHAINS = 4
 MCMC_EDGE_RESAMPLE_PROB = 0.9
 MCMC_PARENT_RESAMPLE_PROB = 0.05
 MCMC_PROGRESS_INTERVAL = 100
+# Random edge flips applied to start_adj to produce each chain's initial
+# graph (the first chain still starts from an exact copy of start_adj).
+# With Gibbs-only proposals the sampler is very local in DAG space, so
+# we want diverse chain starts to (a) make R-hat informative about mode
+# mixing and (b) cover posterior regions disconnected by single-edge
+# moves. ~15 flips is ~20% of an ~80-edge DAG -- aggressive enough to
+# test mixing without launching from absurdly-low-likelihood starts.
+MCMC_PERTURB_FLIPS = 15
 THRESHOLD_DEFAULT = 0.5
 
 VALIDATION_N_PERMUTE = 200
@@ -1069,6 +1077,7 @@ def _pipeline_config() -> dict[str, Any]:
             "edge_resample_prob": MCMC_EDGE_RESAMPLE_PROB,
             "parent_resample_prob": MCMC_PARENT_RESAMPLE_PROB,
             "progress_interval": MCMC_PROGRESS_INTERVAL,
+            "perturb_flips": MCMC_PERTURB_FLIPS,
             "max_parents": DAGSLAM_MAX_PARENTS,
         },
         "structural_constraints": {
@@ -3579,8 +3588,9 @@ def _load_or_run_mcmc(
     logger.info(
         "[mcmc] running posterior structure sampler n=%d p=%d "
         "start_edges=%d allowed_edges=%d samples_per_chain=%d burn_in=%d "
-        "thin=%d chains=%d total_iters=%d move_probs(edge_gibbs=%.2f "
-        "parent=%.2f single_edge=%.2f) max_parents=%d progress_interval=%d",
+        "thin=%d chains=%d perturb_flips=%d total_iters=%d "
+        "move_probs(edge_gibbs=%.2f parent=%.2f single_edge=%.2f) "
+        "max_parents=%d progress_interval=%d",
         data.n,
         data.p,
         int(np.asarray(start_adj, dtype=int).sum()),
@@ -3589,6 +3599,7 @@ def _load_or_run_mcmc(
         MCMC_BURN_IN,
         MCMC_THIN,
         MCMC_CHAINS,
+        MCMC_PERTURB_FLIPS,
         total_iters_per_chain * MCMC_CHAINS,
         float(MCMC_EDGE_RESAMPLE_PROB),
         float(MCMC_PARENT_RESAMPLE_PROB),
@@ -3607,6 +3618,7 @@ def _load_or_run_mcmc(
         burn_in=MCMC_BURN_IN,
         thin=MCMC_THIN,
         n_chains=MCMC_CHAINS,
+        perturb_flips=MCMC_PERTURB_FLIPS,
         rng=np.random.default_rng(PIPELINE_SEED + 3),
         progress=lambda payload: _log_mcmc_progress_event(logger, payload),
         progress_interval=MCMC_PROGRESS_INTERVAL,
@@ -4630,13 +4642,21 @@ def _run_structure_mcmc_stage(
         )
         del mcmc_runtime
         timings["mcmc"] = time.time() - t0
+        # Headline R-hat: the finite max across genuinely-mixing edges.
+        # The raw max_rhat_directed can be +inf when some edges have
+        # deterministic posterior (always 0 or always 1 within a chain --
+        # within-chain variance is exactly 0, so the R-hat ratio diverges).
+        # That's a sharp posterior, not a mixing failure; we report the
+        # count separately so the user can tell at a glance.
         logger.info(
-            "[mcmc] accept_overall=%.3f accept_mh=%.3f max_rhat_directed=%.3f min_ess=%.1f",
+            "[mcmc] accept_overall=%.3f accept_mh=%.3f "
+            "max_finite_rhat_directed=%.3f (+%d deterministic edges) min_ess=%.1f",
             float(mcmc_diagnostics["accept_rate"].get("overall", float("nan"))),
             float(
                 mcmc_diagnostics["accept_rate"].get("metropolis_hastings", float("nan"))
             ),
-            float(mcmc_diagnostics.get("max_rhat_directed", float("nan"))),
+            float(mcmc_diagnostics.get("max_finite_rhat_directed", float("nan"))),
+            int(mcmc_diagnostics.get("n_infinite_rhat_directed", 0)),
             float(mcmc_diagnostics.get("min_ess", float("nan"))),
         )
         _log_mcmc_diagnostics(
@@ -5086,11 +5106,29 @@ def _log_mcmc_diagnostics(
         "[mcmc] accept_per_move: %s",
         by_type or "(no proposals)",
     )
+    # Report the finite R-hat as the headline mixing diagnostic: edges whose
+    # within-chain variance is exactly 0 (deterministic posterior: always
+    # present or always absent in every sample of a chain) inflate the raw
+    # max R-hat to +inf. Those are *not* a mixing failure -- they're a
+    # sharp posterior. We count them separately so the log shows a useful
+    # finite number for the genuinely mixing edges plus a count of the
+    # deterministic ones.
+    n_inf_dir = int(diagnostics.get("n_infinite_rhat_directed", 0))
+    n_inf_skel = int(diagnostics.get("n_infinite_rhat_skeleton", 0))
+    finite_rhat_dir = float(
+        diagnostics.get("max_finite_rhat_directed", float("nan"))
+    )
+    finite_rhat_skel = float(
+        diagnostics.get("max_finite_rhat_skeleton", float("nan"))
+    )
     logger.info(
-        "[mcmc] max_rhat_directed=%.3f max_rhat_skeleton=%.3f min_ess=%.1f "
+        "[mcmc] max_finite_rhat_directed=%.3f (+%d deterministic edges) "
+        "max_finite_rhat_skeleton=%.3f (+%d deterministic) min_ess=%.1f "
         "n_samples_per_chain=%s mean_logpost_per_chain=%s",
-        float(diagnostics.get("max_rhat_directed", float("nan"))),
-        float(diagnostics.get("max_rhat_skeleton", float("nan"))),
+        finite_rhat_dir,
+        n_inf_dir,
+        finite_rhat_skel,
+        n_inf_skel,
         float(diagnostics.get("min_ess", float("nan"))),
         list(diagnostics.get("n_samples_per_chain", [])),
         [
