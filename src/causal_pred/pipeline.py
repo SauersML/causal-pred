@@ -876,8 +876,12 @@ def _gnomon_score_fingerprint(
             len(score_files),
         )
     score_fp = _score_files_fingerprint(score_files, logger=logger)
+    # Raw gnomon scoring is a deterministic function of (genotype PLINK
+    # fileset, gnomon scorer binary, PGS score files).  None of those
+    # change when downstream MrDAG/MCMC/GAM config is bumped, so we do
+    # NOT include PIPELINE_CONFIG_VERSION here -- doing so would force a
+    # ~3-minute fresh score rebuild on every release.
     return {
-        "version": PIPELINE_CONFIG_VERSION,
         "genotype": genotype_fp,
         "scorer": scorer_fp,
         "score_files": score_fp,
@@ -986,8 +990,11 @@ def _prs_panel_fingerprint_from_parts(
     scorer_fp: dict[str, Any],
     person_ids: Sequence[str],
 ) -> dict[str, Any]:
+    # The PRS panel is a pure function of (genotype, score files, gnomon
+    # scorer binary, cohort person ids).  Pipeline config bumps that touch
+    # only MrDAG / DAG-SLAM / MCMC / GAM must NOT invalidate this cache,
+    # so PIPELINE_CONFIG_VERSION is intentionally omitted.
     return {
-        "version": PIPELINE_CONFIG_VERSION,
         "genotype": genotype_fp,
         "score_files": score_fp,
         "scorer": scorer_fp,
@@ -1674,9 +1681,11 @@ def _has_survival_outcome(data: SyntheticDataset) -> bool:
 
 
 def _survival_outcome_key(person_ids: Sequence[str]) -> str:
+    # Raw OMOP survival-event extraction depends only on the AoU CDR
+    # snapshot and the cohort person ids.  Downstream config bumps must
+    # not invalidate this cache, so PIPELINE_CONFIG_VERSION is omitted.
     return _short_hash(
         {
-            "version": PIPELINE_CONFIG_VERSION,
             "cdr": _workspace_cdr(),
             "person_ids": [str(p) for p in person_ids],
         }
@@ -1794,9 +1803,12 @@ def _apply_survival_outcome(
 
 
 def _ehr_panel_key(person_ids: Sequence[str]) -> str:
+    # Raw EHR ETL depends only on the AoU CDR snapshot, cohort person
+    # ids, and the EHR-specific catalog/threshold constants below.
+    # Pipeline-version bumps that touch downstream stages must not
+    # invalidate this cache, so PIPELINE_CONFIG_VERSION is omitted.
     return _short_hash(
         {
-            "version": PIPELINE_CONFIG_VERSION,
             "cdr": _workspace_cdr(),
             "person_ids": [str(p) for p in person_ids],
             "fetch_drugs": EHR_FETCH_DRUGS,
