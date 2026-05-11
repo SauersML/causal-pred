@@ -84,7 +84,7 @@ PRS_PANEL_CACHE_DIRNAME = "prs_panel_cache"
 GNOMON_OUT_DIRNAME = "gnomon_score"
 GENOTYPE_CACHE_DIR = str(Path.home() / "causal-pred" / "genomes")
 
-PIPELINE_CONFIG_VERSION = "2026-05-09.survival-censoring-gamfit-uncertainty.2"
+PIPELINE_CONFIG_VERSION = "2026-05-11.gamlss-splines-gompertz-makeham.1"
 PIPELINE_SEED = 20260416
 PIPELINE_VERBOSE = False
 

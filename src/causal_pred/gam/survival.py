@@ -24,8 +24,7 @@ ProgressCallback = Callable[[str], None]
 
 _SURVIVAL_ENTRY_ORIGIN = 1.0
 _SURVIVAL_LIKELIHOOD = "location-scale"
-_SURVIVAL_BASELINE_TARGET = "linear"
-_SURVIVAL_NOISE_FORMULA = "1"
+_SURVIVAL_BASELINE_TARGET = "gompertz-makeham"
 _SURVIVAL_MODEL_FAMILY = "gamlss-location-scale"
 _UNCERTAINTY_MODE = "gamfit_gamlss_delta_method_response_se"
 _UNCERTAINTY_SOURCE = "gamfit.SurvivalPrediction.survival_se_at"
@@ -40,7 +39,15 @@ def _progress_callback(progress: bool | ProgressCallback) -> Optional[ProgressCa
 
 
 def _build_survival_formula(columns: Sequence[str]) -> str:
-    return " + ".join(columns) if columns else "1"
+    if not columns:
+        raise ValueError("survival GAM requires at least one parent column")
+    return " + ".join(f"s({c})" for c in columns)
+
+
+def _build_noise_formula(columns: Sequence[str]) -> str:
+    if not columns:
+        raise ValueError("survival GAM noise predictor requires at least one parent column")
+    return " + ".join(f"s({c})" for c in columns)
 
 
 @dataclass
@@ -53,12 +60,12 @@ class _SubmodelFit:
     n_events: int
     formula: str
     train_summary: Dict[str, Any]
-    location_formula: str = "1"
-    survival_likelihood: str = _SURVIVAL_LIKELIHOOD
-    baseline_target: str = _SURVIVAL_BASELINE_TARGET
-    noise_formula: str = _SURVIVAL_NOISE_FORMULA
-    x_center: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=float))
-    x_scale: np.ndarray = field(default_factory=lambda: np.ones(0, dtype=float))
+    location_formula: str
+    survival_likelihood: str
+    baseline_target: str
+    noise_formula: str
+    x_center: np.ndarray
+    x_scale: np.ndarray
 
 
 def _fit_gam(
@@ -99,7 +106,9 @@ def _fit_gam(
         if location_formula is None
         else str(location_formula)
     )
-    sigma_rhs = _SURVIVAL_NOISE_FORMULA if noise_formula is None else str(noise_formula)
+    sigma_rhs = (
+        _build_noise_formula(columns) if noise_formula is None else str(noise_formula)
+    )
     formula = f"Surv(entry, exit, event) ~ {location_rhs}"
     if X.shape[1] > 0:
         x_center = X.mean(axis=0)
