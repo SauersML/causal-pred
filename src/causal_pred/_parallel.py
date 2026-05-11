@@ -1,9 +1,10 @@
 """Process-pool helper for embarrassingly-parallel work.
 
-Single canonical path: joblib's loky backend with BLAS threads pinned per
-worker.  Pinning matters because the gamfit Rust core grabs as many BLAS
-threads as it can find; without per-worker pinning, K parallel fits ask
-for K * cpu_count threads on cpu_count cores and the scheduler thrashes.
+gamfit's Rust core dispatches via ``rayon`` (its linear algebra is
+``faer``, not OpenBLAS / MKL), so ``RAYON_NUM_THREADS`` is the only
+env var that actually constrains its thread fan-out.  Set it inside
+each worker so K parallel processes do not all spawn cpu_count rayon
+threads on a cpu_count-core box.
 """
 
 from __future__ import annotations
@@ -14,28 +15,12 @@ from typing import Any, Callable, Sequence
 from joblib import Parallel, delayed
 
 
-_BLAS_ENV_VARS = (
-    "OMP_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "RAYON_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-    "VECLIB_MAXIMUM_THREADS",
-)
-
-
 def cpu_count() -> int:
     return max(1, os.cpu_count() or 1)
 
 
-def _pin_blas_threads(threads: int) -> None:
-    val = str(max(1, int(threads)))
-    for var in _BLAS_ENV_VARS:
-        os.environ[var] = val
-
-
 def _worker(func: Callable[..., Any], args: tuple, threads: int) -> Any:
-    _pin_blas_threads(threads)
+    os.environ["RAYON_NUM_THREADS"] = str(max(1, int(threads)))
     return func(*args)
 
 
@@ -48,15 +33,13 @@ def parallel_call(
 ) -> list:
     """Run ``func(*args)`` for each ``args`` in ``arg_tuples`` in parallel.
 
-    Results are returned in input order.  Uses joblib's loky backend, so
+    Results are returned in input order.  Uses joblib's loky backend so
     workers are persistent across calls within the same parent process.
     """
     if not arg_tuples:
         return []
-    n_workers = max(1, int(n_workers))
-    threads_per_worker = max(1, int(threads_per_worker))
     return list(
-        Parallel(n_jobs=n_workers, backend="loky")(
+        Parallel(n_jobs=max(1, int(n_workers)), backend="loky")(
             delayed(_worker)(func, args, threads_per_worker) for args in arg_tuples
         )
     )

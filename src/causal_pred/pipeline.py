@@ -3667,10 +3667,6 @@ def _fit_survival_holdout_worker(
     return fit.predict_survival_mean(X_test, t_grid), diag
 
 
-def _bma_threads_per_worker(n_workers: int) -> int:
-    return max(1, cpu_count() // max(1, n_workers))
-
-
 def _run_survival_parent_fits(
     cache: WorkspaceCache,
     key: str,
@@ -3708,10 +3704,10 @@ def _run_survival_parent_fits(
 
     if uncached:
         n_workers = min(cpu_count(), len(uncached))
-        threads_per_worker = _bma_threads_per_worker(n_workers)
+        threads_per_worker = max(1, cpu_count() // n_workers)
         logger.info(
             "[gamfit] dispatching %d parent-set fit(s) across %d worker(s) "
-            "with %d BLAS thread(s) each",
+            "with %d rayon thread(s) each",
             len(uncached),
             n_workers,
             threads_per_worker,
@@ -3776,10 +3772,10 @@ def _run_survival_parent_fits_holdout(
     if not parent_sets:
         return []
     n_workers = min(cpu_count(), len(parent_sets))
-    threads_per_worker = _bma_threads_per_worker(n_workers)
+    threads_per_worker = max(1, cpu_count() // n_workers)
     logger.info(
         "[gamfit-validation] dispatching %d parent-set fit(s) across %d worker(s) "
-        "with %d BLAS thread(s) each",
+        "with %d rayon thread(s) each",
         len(parent_sets),
         n_workers,
         threads_per_worker,
