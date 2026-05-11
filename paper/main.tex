@@ -1,0 +1,401 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usepackage{natbib}
+\usepackage{hyperref}
+\usepackage{indentfirst}
+
+% ---------------------------------------------------------------------------
+% Dynamic numeric values.  These are overwritten at build time by
+% paper/build_paper.py, which reads outputs/summary.json.  The defaults
+% below keep the document compilable even without a pipeline run.
+% ---------------------------------------------------------------------------
+\providecommand{\nSamples}{1,500}
+\providecommand{\nNodes}{18}
+\providecommand{\eventRate}{0.425}
+\providecommand{\auroc}{\fbox{TBD}}
+\providecommand{\aurocFive}{\fbox{TBD}}
+\providecommand{\aurocTen}{\fbox{TBD}}
+\providecommand{\aurocFifteen}{\fbox{TBD}}
+\providecommand{\brier}{\fbox{TBD}}
+\providecommand{\ibs}{\fbox{TBD}}
+\providecommand{\nagelkerke}{\fbox{TBD}}
+\providecommand{\ece}{\fbox{TBD}}
+\providecommand{\edgeRecall}{\fbox{TBD}}
+\providecommand{\edgeAuroc}{\fbox{TBD}}
+\providecommand{\mcmcIter}{\fbox{TBD}}
+\providecommand{\mcmcChains}{\fbox{TBD}}
+\providecommand{\mcmcRhat}{\fbox{TBD}}
+\providecommand{\mcmcAccept}{\fbox{TBD}}
+\providecommand{\runtimeSeconds}{\fbox{TBD}}
+\providecommand{\benchKMNagelkerke}{-0.014}
+\providecommand{\benchKMTdAuc}{0.500}
+\providecommand{\benchKMIbs}{0.158}
+\providecommand{\benchCoxNagelkerke}{0.167}
+\providecommand{\benchCoxTdAuc}{0.741}
+\providecommand{\benchCoxIbs}{0.132}
+\providecommand{\benchLogisticNagelkerke}{0.186}
+\providecommand{\benchLogisticTdAuc}{0.745}
+\providecommand{\benchLogisticIbs}{0.141}
+\providecommand{\benchMRAuprc}{0.530}
+\providecommand{\benchMRAuroc}{0.709}
+\providecommand{\benchCausalPredNagelkerke}{0.245}
+\providecommand{\benchCausalPredTdAuc}{0.828}
+\providecommand{\benchCausalPredIbs}{0.127}
+\providecommand{\benchCausalPredEdgeAuprc}{0.546}
+% Convenient math shortcuts
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\DAG}{\mathcal{G}}
+\newcommand{\pa}{\mathrm{Pa}}
+
+\title{Causal Disease Modelling with Structural and Parametric Uncertainty; Type-2 Diabetes}
+
+\author{
+Will Beaumaster, Rabeh Masoud, Scott Sauers, Joseph Schaak, Patricia Setiani, Liwen Tang\\
+Department of Computer Science and Engineering \\
+University of Minnesota \\
+Minneapolis, MN 55455 \\
+\texttt{\{beaum045, masou023, sauer354, schaa140, setia033, tang0865\}@umn.edu}
+}
+
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Write after everything else.
+\end{abstract}
+
+\section{Introduction}
+
+Type 2 diabetes (T2D) is a major public-health problem whose effects extend far beyond the initial diagnosis. Because T2D is associated with cardiovascular disease, kidney disease, neuropathy, vision loss, and reduced quality of life, identifying individuals at elevated risk before disease onset is both clinically and socially important. Earlier identification can support screening, prevention, and targeted intervention, while also reducing long-term healthcare costs. From an artificial intelligence perspective, the central problem is to design an agent that can use large-scale biomedical data to predict individual disease risk while also representing uncertainty about the causal structure underlying that risk.
+
+Individual-level disease-risk prediction on biobank-scale data is often treated as a supervised learning problem. In this setting, an agent is given a collection of participant-level covariates, such as body mass index, blood pressure, lipid measurements, smoking behavior, glucose-related measurements, genetic information, and observed disease outcomes. The agent learns a mapping from these measurements to a predicted probability of developing T2D. While this approach can be useful for prediction, it often does not explicitly model causal relationships among risk factors. As a result, the model may identify statistical associations that are predictive in the observed dataset but difficult to interpret mechanistically or unreliable under changes in population, intervention, or measurement process.
+
+The broader problem addressed in this project is therefore not simply whether T2D can be predicted, but whether individual-level risk prediction can be improved and better contextualized by incorporating causal structure and uncertainty over that structure. The agent is assumed to have access to biobank-scale observational health data, such as participant-level measurements from the All of Us Research Program, along with external or derived causal evidence from the literature. The goal is for the agent to infer plausible causal relationships among T2D-related variables, propagate uncertainty over those relationships, and use this information to produce individualized disease-risk predictions. In this framing, the overall problem is disease-risk prediction, while the key subproblem is causal Bayesian network structure learning over mixed biomedical variables.
+
+This problem is challenging for several reasons. First, biomedical data are heterogeneous: relevant variables may be continuous, binary, categorical, or time-dependent. Second, the data are observational, so statistical dependence does not automatically imply causation. Third, many plausible causal structures may explain the same observed associations, meaning that committing to a single directed acyclic graph can underestimate uncertainty. Finally, biobank-scale datasets contain many participants and potentially many candidate variables, making exhaustive search over graph structures computationally infeasible. These characteristics make the problem well suited to AI methods for learning, inference, and approximate optimization.
+
+Recent work provides several tools for addressing these challenges. Mendelian randomization uses genetic variants as instruments to estimate causal effects between exposures and outcomes, providing evidence that can complement purely observational associations \citep{DaveySmith2014, Pearl2009}. Bayesian structure learning over directed acyclic graphs allows uncertainty over graph structures to be represented through a posterior distribution rather than a single learned network \citep{MadiganYork1995, Kuipers2014}. More recent approaches further suggest that external causal evidence, such as Mendelian randomization summary statistics, can be incorporated as prior information on edge inclusion \citep{Zuber2025}. DAGSLAM provides a scalable method for causal Bayesian network structure learning over mixed-type data, making it especially relevant for biomedical settings with both discrete and continuous variables \citep{Zhao2025DAGSLAM}.
+
+In this project, we combine these ideas into a causal prediction pipeline for T2D. First, we use DAGSLAM-like structure learning to obtain an initial candidate graph over T2D-related risk factors. This graph serves as a warm start for structure MCMC, allowing the agent to explore nearby plausible graph structures rather than relying on a single estimate. We then incorporate Mendelian randomization evidence as a prior on edge inclusion, so that graph structures consistent with external causal evidence are favored but not forced. Finally, posterior samples of parent sets are composed with a survival generalized additive model to produce individual-level survival curves. This allows the final predictions to reflect both uncertainty in participant-level risk and uncertainty in the underlying causal structure.
+
+The All of Us biobank is an appropriate data environment for this problem because it contains both the scale and variable diversity needed for causal risk modeling. The agent interacts with the environment by reading cleaned participant-level measurements, learning candidate dependencies among variables, sampling plausible causal graphs, and producing individualized T2D risk predictions. In a complete deployment, such an agent would not replace clinical judgment, but could support decision-making by identifying high-risk individuals and by highlighting which causal pathways contribute most to the prediction. Thus, the project studies the smaller technical subproblem of causal structure learning and uncertainty-aware prediction within the broader goal of interpretable and reliable disease-risk assessment. 
+
+
+\section{Background (finish/edit/delete this later)}
+
+Mendelian randomisation uses germline genotypes -- randomised at meiosis -- as instrumental variables to estimate causal effects between measured exposures \citep{DaveySmith2014, Corbin2016}. For metabolic-disease outcomes, well-replicated examples include BMI $\to$ type 2 diabetes \citep{Fall2015, Xue2018}, LDL $\to$ coronary disease \citep{Ference2017, Emdin2017}, blood pressure $\to$ cardiovascular outcomes \citep{Nazarzadeh2022}, and null/negative findings for alcohol intake \citep{Wootton2020}. Summary-data IVW estimates \citep{Glover1989} are straightforward to aggregate across thousands of variants and form the raw input to our structural prior.
+
+Bayesian structure learning over DAGs scores each candidate graph by a marginal likelihood with a conjugate structure prior \citep{Geiger2002, Kuipers2014} and explores the space via Markov chain Monte Carlo with neighbourhood-balanced proposals \citep{GiudiciCastelo2003, MadiganYork1995}. Bayesian model averaging over the posterior propagates structural uncertainty into downstream predictions \citep{Draper1995}.
+
+\section{Methods and Algortithms}
+This project uses a modular causal-prediction pipeline. The overall goal is to move from participant-level biomedical measurements to individualized type 2 diabetes risk predictions while preserving uncertainty about the underlying causal structure. The pipeline has five main components: data construction, Mendelian-randomization-informed edge priors, a DAGSLAM warm-start graph, structure MCMC over directed acyclic graphs, and a survival generalized additive model for individual-level risk prediction.
+
+
+\subsection{Data}
+
+The target disease is type 2 diabetes. The synthetic data generator produces a cohort of $n = \nSamples{}$ subjects measured on $p = \nNodes{}$ nodes with node-level event rate \eventRate{}. The column convention is designed to resemble large biomedical cohort resources such as All of Us \citep{AllofUs2024} and UK Biobank \citep{Bycroft2018}. Each row represents one subject, and each column represents a clinical, behavioral, genetic, or outcome variable.
+
+The node set is mixed-type. Continuous covariates include measurements such as body mass index, LDL cholesterol, HbA1c, and systolic blood pressure. Binary variables represent lifestyle or disease indicators, such as smoking status or type 2 diabetes status. The outcome is represented as a survival variable, allowing the model to estimate not only whether a subject develops T2D, but also how risk changes over time. This mixed-type setting motivates the use of algorithms that can score continuous, binary, and survival nodes within the same directed acyclic graph.
+
+Each subject also carries a polygenic score computed externally using the \texttt{gnomon} command-line interface. A polygenic score summarizes many genetic variants into a single risk score by weighting alleles according to their estimated associations with a trait \citep{Khera2018}. In this project, the polygenic score is treated as an observed subject-level covariate rather than learned directly by the graphical model. This allows genetic risk to contribute to individual prediction while keeping the structure-learning problem focused on the observed clinical and behavioral variables.
+
+\subsection{MrDAG: MR-Informed Edge-Inclusion Prior}
+
+The MrDAG component converts Mendelian randomization summary statistics into a prior over directed edges for the later graph-learning stages. Rather than treating every possible edge independently, our implementation follows the MrDAG idea of defining a posterior over DAGs on the MR trait set and then estimating posterior edge-inclusion probabilities from MCMC samples \citep{Zuber2025}. The resulting matrix of probabilities, denoted $\pi$, is used as an MR-informed edge prior in DAGSLAM and structure MCMC.
+
+The input to MrDAG is a collection of inverse-variance weighted MR summary statistics. For each exposure--outcome pair $(i,j)$, the data include an estimated effect $\hat{\beta}_{ij}$ and standard error $\hat{\sigma}_{ij}$. These observed MR cells define the candidate edge set: if a valid MR estimate is available for $i \to j$, then that directed edge is allowed; otherwise it is excluded from the MrDAG search. Self-loops are always forbidden.
+
+For a candidate DAG $G$, MrDAG distinguishes between direct and indirect effects. Let $B$ be a weighted adjacency matrix supported on the edges of $G$. The DAG-implied total-effect matrix is
+\[
+T(G,B) = (I - B)^{-1} - I.
+\]
+The entry $T_{ij}(G,B)$ represents the total effect from node $i$ to node $j$, including both direct paths and longer directed paths through intermediate variables. This is important because an MR association between two traits may be explained by an indirect path rather than by a direct causal edge.
+
+The implementation uses plug-in posterior mean edge weights to estimate the indirect-path contribution. For each observed MR cell, the residual
+\[
+r_{ij} = \hat{\beta}_{ij} - \mu_{ij}
+\]
+is computed after subtracting the indirect contribution $\mu_{ij}$ from other paths in the graph. The evidence for a direct edge $i \to j$ is then evaluated on this residual rather than on the raw MR estimate. Thus, an edge is favored when the MR effect cannot be explained well by
+indirect paths already present in the graph.
+
+For the direct edge effect, the model uses a competing-hypothesis spike-and-slab formulation. Under the non-negligible-effect hypothesis,
+\[
+H_1: \theta_{ij} \sim \mathcal{N}(0,W),
+\]
+while under the practical-null hypothesis,
+\[
+H_0: \theta_{ij} \sim \mathcal{N}(0,\epsilon^2),
+\]
+where $\epsilon^2$ is small. Integrating these Gaussian priors against the Gaussian MR likelihood gives a closed-form Wakefield-style log Bayes factor:
+\[
+\log \mathrm{BF}_{ij}
+=
+\frac{1}{2}
+\left[
+\log(\hat{\sigma}_{ij}^2 + \epsilon^2)
+-
+\log(\hat{\sigma}_{ij}^2 + W)
+\right]
++
+\frac{1}{2}r_{ij}^2
+\left[
+\frac{1}{\hat{\sigma}_{ij}^2 + \epsilon^2}
+-
+\frac{1}{\hat{\sigma}_{ij}^2 + W}
+\right].
+\]
+A large residual relative to its uncertainty supports a direct edge, while a small residual with a tight standard error can provide evidence against a non-negligible direct edge \citep{Wakefield2009}.
+
+The graph posterior combines this MR likelihood with a Bernoulli structure prior. If \(k(G)\) is the number of included candidate edges and \(K\) is the number of allowed candidate edges, then
+\[
+\log P(G)
+=
+k(G)\log(\pi_0) + (K-k(G))\log(1-\pi_0),
+\]
+where \(\pi_0\) is the baseline prior edge-inclusion probability. The target posterior is therefore
+\[
+\log P(G \mid \text{MR data})
+=
+C + \log P(G)
++
+\sum_{(i,j)\in \text{obs}}
+\left[
+\log \mathcal{N}
+\left(
+\hat{\beta}_{ij}
+\mid
+\mu_{ij},
+\hat{\sigma}_{ij}^2 + \epsilon^2
+\right)
++
+\mathbf{1}\{i \to j \in G\}
+\log \mathrm{BF}_{ij}
+\right].
+\]
+
+This posterior is explored using a Metropolis-Hastings sampler over DAGs. The proposal kernel uses local add, delete, and reverse moves, restricted to the allowed MR candidate edges and subject to the acyclicity constraint. Proposals are selected uniformly from the legal neighborhood \(N(G)\). Since different DAGs can have different numbers of legal neighbors, the acceptance probability includes the Giudici--Castelo neighborhood-size correction:
+\[
+\alpha(G \to G')
+=
+\min\left(
+1,
+\exp\{\Delta \log P(G \mid \text{MR data})\}
+\frac{|N(G)|}{|N(G')|}
+\right).
+\]
+This gives a valid Markov chain over the space of allowed acyclic graphs
+\citep{MadiganYork1995, GiudiciCastelo2003}.
+
+After burn-in and thinning, the sampled MR graphs are summarized by posterior edge-inclusion probabilities:
+\[
+\pi_{ij}
+=
+\frac{1}{M}
+\sum_{m=1}^M
+\mathbf{1}\{i \to j \in G^{(m)}\}.
+\]
+The final MrDAG output is a matrix \(\pi\) in the project node ordering. Entries corresponding to MR-supported candidate edges contain estimated posterior inclusion probabilities, entries without MR evidence are left as missing, and diagonal entries are set to zero. In the later DAGSLAM and structure MCMC stages, missing entries are treated as neutral prior probabilities, while finite MrDAG probabilities bias the search toward or away from MR-supported directed edges.
+
+
+\subsection{Mixed Type Graph Scoring}
+
+Both DAGSLAM and structure MCMC require a score for each candidate graph. Because the graph is a Bayesian network, the total graph score decomposes into local node-wise scores:
+
+\[
+s(G) = \sum_{k=1}^p s_k(\mathrm{Pa}_G(k)),
+\]
+where $\mathrm{Pa}_G(k)$ is the parent set of node $k$ in graph $G$. This decomposition is computationally useful because adding, deleting, or reversing an edge only changes the parent set of one or two nodes. Therefore, most local scores cancel when evaluating a candidate graph move, and previously computed scores can be cached and reused.
+
+The local scoring function depends on the type of the child node. Continuous nodes are scored using the exact Bayesian Gaussian equivalent (BGe) marginal likelihood under a Normal-Wishart prior \citep{Geiger2002, Kuipers2014}. For a continuous node $j$ with parent set $\mathrm{Pa}(j)$, the local score is computed as
+
+\[
+s_j(\mathrm{Pa}(j))
+=
+\log p(X_{\{j\} \cup \mathrm{Pa}(j)})
+-
+\log p(X_{\mathrm{Pa}(j)}).
+\]
+
+This score integrates over the parameters of a Gaussian local regression model rather than estimating a single set of regression coefficients. The implementation uses the Kuipers et al. correction to the Geiger and Heckerman BGe formula. Binary nodes are scored using a Laplace approximation to the marginal likelihood of a logistic regression model. For a binary child node, the parents define the design matrix of a logistic regression. The intercept has a flat prior, while the non-intercept coefficients have a Gaussian ridge prior,
+
+\[
+\beta_{\text{non-int}} \sim \mathcal{N}(0,\tau^2 I).
+\]
+
+The algorithm first finds the posterior mode, or MAP estimate, using Newton-IRLS. It then approximates the integral over regression coefficients by a Gaussian approximation centered at the MAP estimate:
+
+\[
+\log p(y \mid X)
+\approx
+\log p(y \mid X,\hat{\beta}_{MAP})
++
+\log p(\hat{\beta}_{MAP})
++
+\frac{k}{2}\log(2\pi)
+-
+\frac{1}{2}\log |H|,
+\]
+where $H$ is the negative Hessian of the log posterior at the MAP estimate. This allows the graph search to compare different parent sets for binary variables while still using an approximate Bayesian marginal likelihood rather than only a fitted likelihood. If the number of rows is too small relative to the number of coefficients, the implementation falls back to a BIC score for numerical stability.
+
+Survival nodes are not scored directly using the final survival GAM. Instead, during graph search, the survival outcome is converted into a fixed-horizon binary endpoint. Cases are subjects who experience the event before the chosen survival horizon, controls are subjects known to be event-free beyond the horizon, and subjects censored before the horizon are not incorrectly treated as controls. To account for censoring, the implementation uses inverse probability of censoring weights (IPCW). The resulting weighted binary endpoint is then scored with the same Laplace logistic marginal likelihood used for ordinary binary nodes.
+
+This scoring design separates graph learning from the final prediction model. DAGSLAM and MCMC use mixed-type local marginal likelihoods to evaluate graph structures efficiently, while the later \texttt{gamfit} stage uses the posterior parent sets to fit smooth time-to-event prediction models.
+
+
+\subsection{DAGSLAM warm start}
+
+We use a DAGSLAM-style hill-climbing structure search to obtain a high-scoring initial DAG for the later structure MCMC stage. A directed acyclic graph (DAG) represents variables as nodes and direct conditional dependencies as directed edges. The acyclicity constraint rules out feedback loops, which is necessary for the Bayesian network factorization. DAGSLAM is appropriate for this project because it is designed for causal Bayesian network structure learning with mixed-type biomedical data, including continuous and discrete risk factors \citep{Zhao2025DAGSLAM}.
+
+Our implementation is a tabu-augmented greedy hill climber. The first restart begins from the empty DAG. Additional restarts begin from random sparse DAGs generated by choosing a random topological ordering and then adding forward edges with small probability. This guarantees that the initial graph for each restart is acyclic. We use multiple restarts because greedy graph search can become trapped in local optima, and starting from several different graphs increases the chance of finding a better structure.
+
+At each iteration, the algorithm enumerates all structurally legal local moves. These moves include adding an edge, deleting an edge, or reversing an existing edge. Edge additions are only considered when the proposed child node has not exceeded the maximum parent limit and the new edge does not create a directed cycle. Edge deletions are always structurally valid. Edge reversals are allowed only when the flipped edge preserves acyclicity and respects the maximum parent constraint. The implementation also allows an optional structural mask, so that certain directed edges can be forbidden in advance.
+Each candidate move is scored by its change in objective value,
+
+\[
+\Delta = \Delta_{\text{score}} + \Delta_{\text{prior}}.
+\]
+The first term is the change in mixed-variable marginal likelihood score. The second term is the change in the MrDAG edge prior. If MR-derived edge-inclusion probabilities are supplied, each possible edge receives a Bernoulli log-odds prior. Edges with stronger MR support therefore increase the graph prior score, while edges with weak support are discouraged. If no MR evidence is available for an edge, the prior is treated as neutral.
+
+The score computation is local. Adding, deleting, or reversing an edge only changes the parent set of one or two nodes, so the full graph score does not need to be recomputed from scratch. Instead, the implementation uses cached score-delta functions for edge additions, deletions, and reversals. This is important because structure learning requires many repeated evaluations of similar parent sets, and caching makes repeated evaluations effectively constant time after the relevant local score has already been computed.
+
+The search uses a tabu list to reduce cycling. After a move is applied, the reverse of that move is temporarily forbidden for a fixed tabu tenure. For example, if the algorithm recently added $i \to j$, then immediately deleting $i \to j$ is tabu; if it recently reversed $i \to j$ into $j \to i$, then reversing it back is tabu. This prevents the search from repeatedly undoing and redoing the same local change. However, the implementation includes an aspiration criterion from tabu search: a tabu move can still be accepted if it improves the objective by more than one log unit beyond the best non-tabu alternative \citep{Glover1989}. This allows the search to override the tabu rule when a forbidden move is clearly better than the available alternatives.
+
+Among non-tabu improving moves, the algorithm applies the move with the largest positive score improvement. If two moves have the same score improvement, ties are broken in favor of the move that leaves fewer edges, which mildly encourages sparsity. The search stops when either the maximum number of iterations is reached or when no improving non-tabu move is found for $2p$ consecutive steps, where $p$ is the number of nodes.
+
+The final DAGSLAM output is the best-scoring DAG found across all restarts. This graph is not treated as the final causal model. Instead, it serves as a warm start $G_0$ for structure MCMC. In this role, DAGSLAM provides a computationally efficient way to find a plausible region of graph space before the MCMC sampler begins exploring posterior uncertainty over nearby and competing graph structures.
+
+
+\subsection{Structure MCMC with Giudici--Castelo correction}
+
+The DAGSLAM warm start provides one high-scoring graph, but it does not represent uncertainty over graph structure. Many different DAGs may explain the observed data nearly equally well, especially in observational biomedical settings where variables are correlated and edge directions may be weakly identified. To represent this uncertainty, we run a structure MCMC sampler over the space of directed acyclic graphs.
+
+The target distribution is the posterior distribution over graphs,
+\[
+\log P(G \mid D, \pi)
+=
+\log S(G,D) + \log P(G \mid \pi) + C,
+\]
+where $S(G,D)$ is the mixed-variable marginal-likelihood score and $P(G \mid \pi)$ is the MrDAG edge prior. The scoring term is the sum of local node scores: continuous nodes use the BGe score, while binary and survival nodes use Laplace-approximated logistic marginal likelihoods. The prior term is an independent Bernoulli prior over possible directed edges. For each ordered pair $(i,j)$, the prior probability of including $i \to j$ is $\pi_{ij}$ when MR evidence is available, and $0.5$ when no MR evidence is available. Self-loops are forbidden, and all sampled graphs are required to remain acyclic.
+
+The basic proposal kernel uses single-edge graph moves. At each single-edge step, the sampler proposes uniformly from the legal neighborhood $N(G)$ of the current graph. Legal moves include adding an edge, deleting an edge, or reversing an edge. Additions and reversals are only allowed if they preserve acyclicity and satisfy the configured maximum-parent constraint. If a structural mask is supplied, forbidden edges are never proposed.
+
+For a single-edge proposal $G \to G'$, the Metropolis-Hastings acceptance probability is
+\[
+\alpha(G \to G')
+=
+\min\left(
+1,\;
+\frac{S(G',D)P(G' \mid \pi)}
+{S(G,D)P(G \mid \pi)}
+\frac{|N(G)|}{|N(G')|}
+\right).
+\]
+The factor $|N(G)|/|N(G')|$ is the Giudici--Castelo neighborhood correction. It is needed because the proposal is uniform over the legal moves available from the current graph, and different graphs can have different numbers of legal neighboring graphs \citep{MadiganYork1995, GiudiciCastelo2003}. In the implementation, this ratio is computed in log space using the current and proposed neighborhood sizes. The score and prior ratios are also computed as local deltas, so the sampler does not need to rescore the entire graph after each proposed move.
+
+The implementation also includes hybrid moves to improve mixing when the posterior is too sharp for random single-edge proposals. With probability \texttt{hybrid\_prob}, the sampler performs a parent-set resampling move instead of a single-edge move. In the exact version, a target node $j$ is chosen uniformly, its incoming edges are temporarily removed, all legal parent subsets under the parent limit are enumerated, and a new parent set is sampled from its conditional posterior. Because this is an exact Gibbs update for the parent set of node $j$, the move is always accepted. This move can make larger jumps in graph space than add/delete/reverse moves and is useful when single-edge proposals have low acceptance.
+
+A legacy random-flip parent-set move is also available. In that version, a target node is chosen and each candidate parent edge into that node is flipped independently with probability \texttt{resample\_flip}. If the resulting graph is cyclic, the proposal is rejected. Otherwise, the move is accepted or rejected using a Metropolis-Hastings ratio based only on the changed local score for node $j$ and the changed Bernoulli edge-prior terms. The proposal is symmetric because the same independent flip probability is used in both directions, so no proposal-density correction is needed for that move.
+
+In addition to parent-set resampling, the sampler optionally supports two other Gibbs-style kernels. The edge-pair Gibbs move chooses an unordered node pair $\{i,j\}$ and samples among the legal states “no edge,” $i \to j$, and $j \to i$ from their conditional posterior. The block Gibbs move chooses a small block of nodes and samples the directed edges inside that block while holding the rest of the graph fixed. These moves are optional, but they provide additional ways to move through graph space when ordinary single-edge proposals mix slowly.
+
+We run \texttt{n\_chains} independent chains sequentially. The first chain starts from the DAGSLAM warm-start graph, while later chains begin from lightly perturbed acyclic copies of the warm start. Each chain uses its own random-number stream. After burn-in, one graph sample is retained every \texttt{thin} iterations until \texttt{n\_samples} posterior graph samples have been collected per chain.
+
+The posterior graph samples are summarized by edge-inclusion probabilities,
+\[
+\hat{P}(i \to j \mid D)
+=
+\frac{1}{M}\sum_{m=1}^M \mathbf{1}\{i \to j \in G^{(m)}\},
+\]
+where $G^{(m)}$ is a sampled DAG. These posterior edge probabilities are used to quantify structural uncertainty and to identify high-probability causal dependencies. The sampler also records the log posterior values of kept samples and reports diagnostics including per-move-type acceptance rates, mean log posterior per chain, Gelman--Rubin $\hat{R}$ for directed edge indicators, $\hat{R}$ for the undirected skeleton, and effective sample size per edge using Geyer's initial-positive-sequence estimator \citep{Geyer1992}. Directed-edge $\hat{R}$ is treated as the primary diagnostic because the project reports directed causal edge and path probabilities.
+
+\subsection{Validation}
+
+Write after code is complete.
+
+\section{Results (finish once we have full results)}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lr}
+\toprule
+Metric & Value \\
+\midrule
+Samples $n$                & \nSamples{} \\
+Nodes $p$                  & \nNodes{} \\
+Event rate                 & \eventRate{} \\
+AUROC                      & \auroc{} \\
+Time-dep.\ AUC @ 5y        & \aurocFive{} \\
+Time-dep.\ AUC @ 10y       & \aurocTen{} \\
+Time-dep.\ AUC @ 15y       & \aurocFifteen{} \\
+Brier                      & \brier{} \\
+Integrated Brier           & \ibs{} \\
+Nagelkerke $R^2$           & \nagelkerke{} \\
+Expected calibration error & \ece{} \\
+Edge recall                & \edgeRecall{} \\
+Edge AUROC                 & \edgeAuroc{} \\
+MCMC iterations/chain      & \mcmcIter{} \\
+MCMC chains                & \mcmcChains{} \\
+$\hat{R}_{\max}$           & \mcmcRhat{} \\
+Mean acceptance            & \mcmcAccept{} \\
+Runtime (s)                & \runtimeSeconds{} \\
+\bottomrule
+\end{tabular}
+\caption{Headline metrics, stamped from \texttt{outputs/summary.json} at
+build time.}
+\end{table}
+
+\subsection{Benchmark comparison}
+
+Table~\ref{tab:benchmarks} compares Causal-Pred to four standard baselines on the same synthetic cohort: Kaplan--Meier with no covariates, Cox proportional hazards over all covariates, a naive logistic regression trained on the ten-year event indicator, and a naive Bonferroni-thresholded MR--IVW edge classifier \citep{DaveySmith2014}. Kaplan--Meier is reported for completeness -- every individual shares the marginal survival curve, so its discrimination metrics are degenerate by construction. MR--IVW does not produce a survival curve and is included only on the edge-recovery column. Causal-Pred is the only entry that produces both individual-level survival and a structural-edge posterior.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Model & Nagelkerke $R^2$ @ 10y & td-AUC @ 10y & IBS & Edge AUPRC \\
+\midrule
+Kaplan--Meier            & \benchKMNagelkerke        & \benchKMTdAuc        & \benchKMIbs        & --- \\
+Cox PH                   & \benchCoxNagelkerke       & \benchCoxTdAuc       & \benchCoxIbs       & --- \\
+Naive logistic @ 10y     & \benchLogisticNagelkerke  & \benchLogisticTdAuc  & \benchLogisticIbs  & --- \\
+MR--IVW (Bonferroni)     & ---                       & ---                  & ---                & \benchMRAuprc \\
+\textbf{Causal-Pred}     & \textbf{\benchCausalPredNagelkerke} & \textbf{\benchCausalPredTdAuc} & \textbf{\benchCausalPredIbs} & \textbf{\benchCausalPredEdgeAuprc} \\
+\bottomrule
+\end{tabular}
+\caption{End-to-end benchmark table. Values are stamped at build time from \texttt{outputs/benchmarks.json}. Higher is better for Nagelkerke $R^2$, time-dependent AUC, and edge AUPRC; lower is better for the integrated Brier score (IBS).}
+\label{tab:benchmarks}
+\end{table}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{figures/benchmarks.png}
+\caption{Bar-chart comparison of the baseline models on Nagelkerke $R^2$ @ 10y, integrated time-dependent AUC, and integrated Brier score. Generated by \texttt{scripts/benchmark.py}.}
+\label{fig:benchmarks}
+\end{figure}
+
+\section{Discussion (finish once we have full results)}
+
+\paragraph{Limitations}
+All of Us individual-level data are only accessible inside the Researcher Workbench \citep{AllofUs2024}; the reported numbers are therefore on a synthetic biobank-shape cohort with a known ground-truth DAG. On real data, HbA1c is used both as a risk factor and, implicitly, in the adjudication of type 2 diabetes, which gives rise to a mild circularity; we flag this as a caveat and recommend using a pre-adjudication baseline HbA1c window in any real-data deployment.
+
+\paragraph{Prior work on causal priors}
+Our edge-inclusion prior is informed by published Mendelian-randomisation evidence (e.g.\ \citealt{Fall2015, Xue2018, Ference2017}). Where no published IVW estimate is available, the prior is left non-informative rather than imputed, so the structural posterior is never biased by unattributed prior claims \citep{DaveySmith2014}.
+
+\section{Reproducibility (check if needs changes later)}
+
+All code is pinned via \texttt{uv.lock}. The GAM backend is the Rust-based \texttt{SauersML/gam} package built through \texttt{rustup}. Polygenic scoring, HWE-PCA projection, and sample-term inference shell out to the \texttt{gnomon} CLI. Every stage accepts an explicit RNG and derives child seeds deterministically. A full run is reproduced by \texttt{uv run python scripts/run\_full\_pipeline.py} followed by \texttt{make -C paper paper}.
+
+\bibliographystyle{plainnat}
+\bibliography{bib}
+
+\end{document}
