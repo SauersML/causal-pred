@@ -118,6 +118,27 @@ MCMC_PROGRESS_INTERVAL = 100
 # moves. ~15 flips is ~20% of an ~80-edge DAG -- aggressive enough to
 # test mixing without launching from absurdly-low-likelihood starts.
 MCMC_PERTURB_FLIPS = 15
+
+# Cohort subsample for causal structure learning.
+# At biobank scale the per-edge log Bayes factor between competing parent
+# sets scales linearly with n and easily reaches the thousands, so the
+# structure-MCMC posterior collapses to a single DAG and BMA's
+# `variance_structural = Var_k[ E(S | parent_set_k) ]` degenerates to 0.
+# Subsampling reactivates structural uncertainty: multiple parent sets
+# become competitive, the BMA decomposition behaves as designed, and each
+# gamfit survival fit drops from ~7 minutes to ~1-2 minutes.
+#
+# Applied *after* genscore feature extraction (so the expensive crosscoder
+# cache still hits) but *before* DAGSLAM / MCMC / survival-BMA. Stratified
+# on event status so the event rate is preserved exactly -- the survival
+# likelihood depends on observed events, so locking the event count keeps
+# the gamfit objective well-conditioned.
+#
+# This is the production cohort size; the full-cohort run is not a config
+# option. If you want to validate against the full cohort, fork a branch.
+SUBSAMPLE_N = 10000
+SUBSAMPLE_SEED_OFFSET = 99
+
 THRESHOLD_DEFAULT = 0.5
 
 VALIDATION_N_PERMUTE = 200
@@ -1084,6 +1105,15 @@ def _pipeline_config() -> dict[str, Any]:
             "target_sink": SURVIVAL_TARGET_COLUMN,
             "exogenous_rule": "node-metadata-or-pgs-prefix",
             "promoted_crosscoder_features": "non_root_with_forbidden_target_to_feature_and_feature_to_pgs",
+        },
+        "subsample": {
+            # None when the full cohort is used. SUBSAMPLE_N is also folded
+            # implicitly into every downstream cache key via the data hash
+            # (data.X / data.time / data.event differ after subsampling), but
+            # we surface it here so an explicit config bump (e.g. seed change)
+            # forces a fresh causal-learning pass.
+            "n": SUBSAMPLE_N,
+            "seed_offset": SUBSAMPLE_SEED_OFFSET,
         },
         "threshold": THRESHOLD_DEFAULT,
         "gam": {
@@ -3209,6 +3239,98 @@ def _log_structural_constraints(
     )
 
 
+def _stratified_subsample(
+    data: SyntheticDataset,
+    n_target: int,
+    rng: np.random.Generator,
+    logger: logging.Logger,
+) -> SyntheticDataset:
+    """Stratified-on-event random subsample of the cohort.
+
+    At biobank scale the structure-MCMC posterior over DAGs collapses to a
+    single mode because per-edge log Bayes factors scale linearly with n.
+    Subsampling to a realistic clinical-cohort size reactivates structural
+    uncertainty: multiple parent sets become competitive, the BMA
+    `variance_structural` term becomes non-zero, and the pipeline's UQ
+    story works as designed.
+
+    We stratify on event status so the event rate of the subsample matches
+    the parent cohort exactly. Random subsampling at n=10000 from a 20%
+    event cohort has SD ~40 events; stratification removes that variance.
+    The survival likelihood depends on observed events, so locking the
+    event count keeps the gamfit objective well-conditioned at small n.
+
+    Raises if n_target is too small for stable downstream fitting:
+      * n_target < 100 -- gamfit needs nontrivial n at p=150.
+      * yielded event count < 50 -- survival fit becomes degenerate.
+    Returns the original dataset unchanged if n_target >= n.
+    """
+    n_full = int(data.n)
+    if n_target >= n_full:
+        logger.info(
+            "[subsample] target n=%d >= cohort n=%d; using full cohort",
+            int(n_target),
+            n_full,
+        )
+        return data
+    if int(n_target) < 100:
+        raise ValueError(
+            f"SUBSAMPLE_N={n_target} too small; need >=100 for stable "
+            "gamfit survival fits at biobank-shaped feature count"
+        )
+
+    event = np.asarray(data.event, dtype=int)
+    event_idx = np.flatnonzero(event == 1)
+    nonevent_idx = np.flatnonzero(event == 0)
+    n_events_full = int(event_idx.size)
+    n_nonevents_full = int(nonevent_idx.size)
+    if n_events_full == 0 or n_nonevents_full == 0:
+        raise RuntimeError(
+            "cohort has only one event stratum; refusing to stratify"
+        )
+
+    event_rate = n_events_full / n_full
+    n_events_target = int(round(int(n_target) * event_rate))
+    n_events_target = max(0, min(n_events_target, n_events_full))
+    n_nonevents_target = int(n_target) - n_events_target
+    n_nonevents_target = max(0, min(n_nonevents_target, n_nonevents_full))
+
+    if n_events_target < 50:
+        raise ValueError(
+            f"SUBSAMPLE_N={n_target} at event_rate={event_rate:.3f} yields "
+            f"only {n_events_target} events; need >=50 events for stable "
+            "survival fits. Increase SUBSAMPLE_N or accept the full cohort."
+        )
+
+    sampled_events = rng.choice(event_idx, size=n_events_target, replace=False)
+    sampled_nonevents = rng.choice(
+        nonevent_idx, size=n_nonevents_target, replace=False
+    )
+    combined = np.sort(np.concatenate([sampled_events, sampled_nonevents]))
+
+    sub = SyntheticDataset(
+        X=np.ascontiguousarray(data.X[combined]),
+        time=np.ascontiguousarray(data.time[combined]),
+        event=np.ascontiguousarray(data.event[combined]),
+        columns=data.columns,
+        node_types=data.node_types,
+        ground_truth_adj=data.ground_truth_adj,
+    )
+    realized_events = int((sub.event == 1).sum())
+    realized_rate = realized_events / sub.n
+    logger.info(
+        "[subsample] stratified n=%d -> n=%d  events %d -> %d  "
+        "rate %.3f -> %.3f",
+        n_full,
+        sub.n,
+        n_events_full,
+        realized_events,
+        event_rate,
+        realized_rate,
+    )
+    return sub
+
+
 def _cached_allowed_edges_match(
     z: Any,
     allowed_edges: Optional[np.ndarray],
@@ -5017,6 +5139,19 @@ def run_pipeline() -> PipelineResult:
 
     allowed_edges = _structural_allowed_edges(data.columns, data.node_types)
     _log_structural_constraints(logger, allowed_edges, data.columns)
+
+    # Stratified cohort subsample. Inserted here -- after genscore features
+    # are computed on the full cohort and after row-independent MrDAG and
+    # allowed_edges are built -- so the expensive upstream caches still
+    # hit. Only DAGSLAM / MCMC / survival-BMA see the smaller cohort. The
+    # cohort hash (data.X / data.time / data.event SHA-256) changes, which
+    # auto-invalidates dagslam / mcmc / survival-gam caches.
+    data = _stratified_subsample(
+        data,
+        n_target=SUBSAMPLE_N,
+        rng=np.random.default_rng(PIPELINE_SEED + SUBSAMPLE_SEED_OFFSET),
+        logger=logger,
+    )
 
     key, dagslam = _run_dagslam_stage(
         cache, data, mrdag_prior, allowed_edges, timings, logger
