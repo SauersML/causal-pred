@@ -89,7 +89,7 @@ def _covariate_matrix(data: SyntheticDataset) -> Tuple[np.ndarray, list]:
 
     Returns the (n, p-1) array and the matching column-name list.
     """
-    t2d_idx = NODE_INDEX["T2D"]
+    t2d_idx = NODE_INDEX["type2_diabetes"]
     cols = [i for i in range(data.X.shape[1]) if i != t2d_idx]
     X = data.X[:, cols].astype(float, copy=False)
     names = [data.columns[i] for i in cols]
@@ -652,7 +652,7 @@ def run_causal_pred(
         if mcmc.samples
         else np.zeros((0, data.p, data.p), dtype=np.int8)
     )
-    target_idx = NODE_INDEX["T2D"]
+    target_idx = NODE_INDEX["type2_diabetes"]
     parent_sets, weights, parent_counts = _sampled_parent_sets(
         samples,
         target_idx=target_idx,
@@ -684,8 +684,8 @@ def run_causal_pred(
             train_X_ps,
             columns=cols,
             n_uncertainty_slices=max(1, int(gam_samples)),
-            location_formula="1",
-            noise_formula=" + ".join(cols) if cols else "1",
+            location_formula=" + ".join(f"s({c})" for c in cols) if cols else "1",
+            noise_formula="1",
             progress=False,
         )
         per_model.append(fit.predict_survival_mean(test_X_ps, t_grid))

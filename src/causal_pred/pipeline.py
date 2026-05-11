@@ -84,7 +84,7 @@ PRS_PANEL_CACHE_DIRNAME = "prs_panel_cache"
 GNOMON_OUT_DIRNAME = "gnomon_score"
 GENOTYPE_CACHE_DIR = str(Path.home() / "causal-pred" / "genomes")
 
-PIPELINE_CONFIG_VERSION = "2026-05-11.gamlss-splines-gompertz-makeham.1"
+PIPELINE_CONFIG_VERSION = "2026-05-11.refactor-spine-graph-mcmc-names.1"
 PIPELINE_SEED = 20260416
 PIPELINE_VERBOSE = False
 
@@ -161,34 +161,11 @@ CAUSAL_PATH_TOP_K = 20
 CAUSAL_PATH_MIN_EDGE_PROB = 0.1
 CAUSAL_PATH_MAX_DEPTH = 5
 
-COHORT_TO_MR_NODE = {
-    "type2_diabetes": "T2D",
-    "age": "age",
-    "sex": "sex",
-    "ancestry_pc1": "ancestry_PC1",
-    "family_history_t2d": "family_history_T2D",
-    "years_smoking": "years_smoking",
-    "physical_activity": "physical_activity",
-    "diet_quality": "diet_quality",
-    "bmi": "BMI",
-    "hba1c": "HbA1c",
-    "ldl_cholesterol": "LDL",
-    "systolic_bp": "systolic_BP",
-    "hypertension": "hypertension",
-    "cardiovascular_disease": "cardiovascular_disease",
-    "pgs_t2d": "PGS_T2D",
-    "pgs_bmi": "PGS_BMI",
-    "pgs_ldl": "PGS_LDL",
-    "pgs_hba1c": "PGS_HbA1c",
-}
-
-MR_TO_COHORT_NODE = {v: k for k, v in COHORT_TO_MR_NODE.items()}
-
 PGS_ANCHOR_PRIORS = {
-    ("PGS_T2D", "T2D"): 0.95,
-    ("PGS_BMI", "BMI"): 0.95,
-    ("PGS_LDL", "LDL"): 0.95,
-    ("PGS_HbA1c", "HbA1c"): 0.95,
+    ("pgs_t2d", "type2_diabetes"): 0.95,
+    ("pgs_bmi", "bmi"): 0.95,
+    ("pgs_ldl", "ldl_cholesterol"): 0.95,
+    ("pgs_hba1c", "hba1c"): 0.95,
 }
 
 
@@ -2910,34 +2887,31 @@ def _mrdag_prior_for_data(mrdag_pi: np.ndarray, columns: Sequence[str]) -> np.nd
     p = len(columns)
     prior = np.full((p, p), np.nan, dtype=float)
     for i, parent in enumerate(columns):
-        mr_parent = COHORT_TO_MR_NODE.get(parent)
-        if mr_parent is None:
+        if parent not in NODE_INDEX:
             continue
         for j, child in enumerate(columns):
-            mr_child = COHORT_TO_MR_NODE.get(child)
-            if mr_child is None:
+            if child not in NODE_INDEX:
                 continue
-            pi = mrdag_pi[NODE_INDEX[mr_parent], NODE_INDEX[mr_child]]
+            pi = mrdag_pi[NODE_INDEX[parent], NODE_INDEX[child]]
             if np.isfinite(pi):
                 prior[i, j] = float(pi)
-            anchor = PGS_ANCHOR_PRIORS.get((mr_parent, mr_child))
+            anchor = PGS_ANCHOR_PRIORS.get((parent, child))
             if anchor is not None:
                 prior[i, j] = float(anchor)
-            reverse_anchor = PGS_ANCHOR_PRIORS.get((mr_child, mr_parent))
+            reverse_anchor = PGS_ANCHOR_PRIORS.get((child, parent))
             if reverse_anchor is not None:
                 prior[i, j] = 1.0 - float(reverse_anchor)
     np.fill_diagonal(prior, np.nan)
     return prior
 
 
-def _exogenous_mr_nodes() -> set[str]:
+def _exogenous_node_names() -> set[str]:
     return {node.name for node in NODES if node.exogenous}
 
 
 def _is_root_covariate(name: str) -> bool:
     lowered = str(name).lower()
-    mr_name = COHORT_TO_MR_NODE.get(str(name))
-    if mr_name in _exogenous_mr_nodes():
+    if str(name) in _exogenous_node_names():
         return True
     return lowered.startswith("pgs_")
 
@@ -3337,10 +3311,8 @@ def _known_edges_for_columns(columns: Sequence[str]) -> tuple[tuple[str, str], .
     available = set(columns)
     edges: list[tuple[str, str]] = []
     for parent, child in CANONICAL_EDGES:
-        p = MR_TO_COHORT_NODE.get(parent)
-        c = MR_TO_COHORT_NODE.get(child)
-        if p in available and c in available:
-            edges.append((p, c))
+        if parent in available and child in available:
+            edges.append((parent, child))
     return tuple(edges)
 
 
@@ -4080,7 +4052,7 @@ def run_pipeline() -> PipelineResult:
         genscore_meta,
         logger,
         event=np.asarray(data.event, dtype=int) if data.event is not None else None,
-        target_name=SURVIVAL_TARGET_COLUMN,
+        target_name=NODES[NODE_INDEX[SURVIVAL_TARGET_COLUMN]].label,
     )
 
     _log_rss(logger, "before mrdag")

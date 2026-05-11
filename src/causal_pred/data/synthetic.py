@@ -93,17 +93,17 @@ def simulate(
         rng = np.random.default_rng(0)
 
     # ---- roots ----
-    PGS_T2D = rng.standard_normal(n)
-    PGS_BMI = rng.standard_normal(n)
-    PGS_LDL = rng.standard_normal(n)
-    PGS_HbA1c = rng.standard_normal(n)
+    pgs_t2d = rng.standard_normal(n)
+    pgs_bmi = rng.standard_normal(n)
+    pgs_ldl = rng.standard_normal(n)
+    pgs_hba1c = rng.standard_normal(n)
     age = rng.uniform(40.0, 75.0, size=n)
     sex = rng.binomial(1, 0.5, size=n)  # 1 = male
-    ancestry_PC1 = rng.standard_normal(n)
+    ancestry_pc1 = rng.standard_normal(n)
 
     # family history: partly correlated with T2D PGS to mimic shared liab.
-    fh_logit = -0.8 + 0.6 * PGS_T2D + 0.2 * PGS_BMI
-    family_history_T2D = rng.binomial(1, _logistic(fh_logit))
+    fh_logit = -0.8 + 0.6 * pgs_t2d + 0.2 * pgs_bmi
+    family_history_t2d = rng.binomial(1, _logistic(fh_logit))
 
     # lifestyle
     years_smoking = np.maximum(
@@ -113,45 +113,45 @@ def simulate(
     physical_activity = rng.normal(loc=15.0 - 0.05 * (age - 50.0), scale=8.0, size=n)
     diet_quality = rng.normal(loc=0.0 + 0.05 * (age - 50.0) / 10.0, scale=1.0, size=n)
 
-    # BMI <- PGS_BMI + sex + physical_activity + diet_quality
-    BMI = (
+    # bmi <- pgs_bmi + sex + physical_activity + diet_quality
+    bmi = (
         27.0
-        + 1.8 * PGS_BMI
+        + 1.8 * pgs_bmi
         + 1.2 * sex
         - 0.15 * (physical_activity - 15.0)
         - 0.6 * diet_quality
         + rng.normal(0.0, 3.5, size=n)
     )
-    BMI = np.clip(BMI, 15.0, 55.0)
+    bmi = np.clip(bmi, 15.0, 55.0)
 
-    # LDL <- PGS_LDL + ancestry_PC1 + diet_quality
-    LDL = (
+    # ldl_cholesterol <- pgs_ldl + ancestry_pc1 + diet_quality
+    ldl_cholesterol = (
         3.0
-        + 0.45 * PGS_LDL
-        + 0.15 * ancestry_PC1
+        + 0.45 * pgs_ldl
+        + 0.15 * ancestry_pc1
         - 0.20 * diet_quality
         + rng.normal(0.0, 0.6, size=n)
     )
-    LDL = np.clip(LDL, 1.0, 9.0)
+    ldl_cholesterol = np.clip(ldl_cholesterol, 1.0, 9.0)
 
-    # HbA1c <- PGS_HbA1c + ancestry_PC1 + smooth(BMI)
-    HbA1c = (
+    # hba1c <- pgs_hba1c + ancestry_pc1 + smooth(bmi)
+    hba1c = (
         5.2
-        + 0.35 * PGS_HbA1c
-        + 0.05 * ancestry_PC1
-        + 0.25 * _smooth_bmi_effect(BMI)
+        + 0.35 * pgs_hba1c
+        + 0.05 * ancestry_pc1
+        + 0.25 * _smooth_bmi_effect(bmi)
         + rng.normal(0.0, 0.35, size=n)
     )
-    HbA1c = np.clip(HbA1c, 4.0, 14.0)
+    hba1c = np.clip(hba1c, 4.0, 14.0)
 
-    # hypertension <- age + BMI
+    # hypertension <- age + bmi
     htn_logit = (
-        -3.5 + 0.05 * (age - 50.0) + 0.18 * (BMI - 25.0) + rng.normal(0.0, 0.3, size=n)
+        -3.5 + 0.05 * (age - 50.0) + 0.18 * (bmi - 25.0) + rng.normal(0.0, 0.3, size=n)
     )
     hypertension = rng.binomial(1, _logistic(htn_logit))
 
-    # systolic BP <- age + sex + hypertension
-    systolic_BP = (
+    # systolic_bp <- age + sex + hypertension
+    systolic_bp = (
         115.0
         + 0.5 * (age - 50.0)
         + 3.0 * sex
@@ -159,13 +159,13 @@ def simulate(
         + rng.normal(0.0, 10.0, size=n)
     )
 
-    # CVD <- age + sex + years_smoking + systolic_BP + hypertension
+    # CVD <- age + sex + years_smoking + systolic_bp + hypertension
     cvd_logit = (
         -4.5
         + 0.06 * (age - 50.0)
         + 0.4 * sex
         + 0.04 * years_smoking
-        + 0.015 * (systolic_BP - 120.0)
+        + 0.015 * (systolic_bp - 120.0)
         + 0.6 * hypertension
     )
     cardiovascular_disease = rng.binomial(1, _logistic(cvd_logit))
@@ -174,10 +174,10 @@ def simulate(
     # Linear predictor for log-hazard scale (larger = earlier event).
     eta = (
         -2.4
-        + 0.55 * PGS_T2D
-        + 0.45 * family_history_T2D
-        + 0.9 * _smooth_bmi_effect(BMI)
-        + 0.60 * (HbA1c - 5.5)
+        + 0.55 * pgs_t2d
+        + 0.45 * family_history_t2d
+        + 0.9 * _smooth_bmi_effect(bmi)
+        + 0.60 * (hba1c - 5.5)
         + _smooth_age_effect(age) * 0.6
     )
     # Weibull AFT: T = exp(-eta / shape) * Exp(1)^(1/shape)
@@ -203,24 +203,24 @@ def simulate(
     # ---- assemble matrix in NODE_NAMES order ----
     X = np.empty((n, N_NODES), dtype=float)
     values = {
-        "PGS_T2D": PGS_T2D,
-        "PGS_BMI": PGS_BMI,
-        "PGS_LDL": PGS_LDL,
-        "PGS_HbA1c": PGS_HbA1c,
+        "pgs_t2d": pgs_t2d,
+        "pgs_bmi": pgs_bmi,
+        "pgs_ldl": pgs_ldl,
+        "pgs_hba1c": pgs_hba1c,
         "age": age,
         "sex": sex.astype(float),
-        "ancestry_PC1": ancestry_PC1,
-        "family_history_T2D": family_history_T2D.astype(float),
+        "ancestry_pc1": ancestry_pc1,
+        "family_history_t2d": family_history_t2d.astype(float),
         "years_smoking": years_smoking,
         "physical_activity": physical_activity,
         "diet_quality": diet_quality,
-        "BMI": BMI,
-        "LDL": LDL,
-        "HbA1c": HbA1c,
-        "systolic_BP": systolic_BP,
+        "bmi": bmi,
+        "ldl_cholesterol": ldl_cholesterol,
+        "hba1c": hba1c,
+        "systolic_bp": systolic_bp,
         "hypertension": hypertension.astype(float),
         "cardiovascular_disease": cardiovascular_disease.astype(float),
-        "T2D": event.astype(float),
+        "type2_diabetes": event.astype(float),
     }
     for i, name in enumerate(NODE_NAMES):
         X[:, i] = values[name]

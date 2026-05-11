@@ -45,9 +45,9 @@ def _make_tiny_prs_csv(path):
     pd.DataFrame(
         {
             "person_id": [str(1000 + i) for i in range(n)],
-            "PGS_T2D": rng.normal(size=n),
-            "PGS_BMI": rng.normal(size=n),
-            "PGS_LDL": rng.normal(size=n),
+            "pgs_t2d": rng.normal(size=n),
+            "pgs_bmi": rng.normal(size=n),
+            "pgs_ldl": rng.normal(size=n),
         }
     ).to_csv(path, index=False, compression="gzip")
 
@@ -395,19 +395,19 @@ def test_mrdag_cache_key_hashes_gwas_evidence_and_metadata():
 
     def make_gwas(beta: float, pval: float = 5e-8):
         return SimpleNamespace(
-            exposures=("BMI",),
-            outcomes=("T2D",),
+            exposures=("bmi",),
+            outcomes=("type2_diabetes",),
             betas=np.array([[beta]], dtype=float),
             ses=np.array([[0.1]], dtype=float),
             ivw_pvals=np.array([[0.01]], dtype=float),
             n_snps=np.array([12], dtype=int),
-            citations={("BMI", "T2D"): "test citation"},
+            citations={("bmi", "type2_diabetes"): "test citation"},
             circular_pairs=(),
             source_metadata={"params": {"pval": pval, "r2": 0.001, "kb": 10000}},
             per_pair=[
                 SimpleNamespace(
-                    exposure="BMI",
-                    outcome="T2D",
+                    exposure="bmi",
+                    outcome="type2_diabetes",
                     exposure_id="exp",
                     outcome_id="out",
                     beta=beta,
@@ -978,7 +978,7 @@ def test_ehr_panel_uses_visit_baseline_summary(tmp_path, monkeypatch):
     condition = pd.DataFrame(
         {
             "person_id": [int(pid) for pid in person_ids],
-            "phecode": ["T2D"] * len(person_ids),
+            "phecode": ["type2_diabetes"] * len(person_ids),
             "datetime": pd.to_datetime(["2024-06-01"] * len(person_ids)),
         }
     )

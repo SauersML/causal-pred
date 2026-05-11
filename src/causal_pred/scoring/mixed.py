@@ -150,22 +150,6 @@ def _score_cache_context_key(
     survival_time = hyper.get("survival_time")
     survival_event = hyper.get("survival_event")
 
-    identity = (
-        id(data),
-        data.shape,
-        str(data.dtype),
-        tuple(str(t) for t in node_types),
-        alpha_mu,
-        tau2,
-        horizon,
-        id(survival_time) if survival_time is not None else None,
-        id(survival_event) if survival_event is not None else None,
-    )
-    if cache is not None:
-        existing = cache.get("__score_cache_context__")
-        if existing is not None and existing.get("identity") == identity:
-            return str(existing["key"])
-
     payload = {
         "data_shape": tuple(int(x) for x in data.shape),
         "data_dtype": str(data.dtype),
@@ -192,7 +176,6 @@ def _score_cache_context_key(
                 "scoring hyperparameters"
             )
         cache["__score_cache_context__"] = {
-            "identity": identity,
             "payload": payload,
             "key": context_key,
         }

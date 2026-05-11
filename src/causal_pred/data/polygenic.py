@@ -82,10 +82,10 @@ class PolygenicRunError(RuntimeError):
 
 # Standard PGS column names understood by the synthetic dataset.
 _SYNTHETIC_PGS_COLUMNS: tuple[str, ...] = (
-    "PGS_T2D",
-    "PGS_BMI",
-    "PGS_LDL",
-    "PGS_HbA1c",
+    "pgs_t2d",
+    "pgs_bmi",
+    "pgs_ldl",
+    "pgs_hba1c",
 )
 
 
@@ -872,7 +872,7 @@ def augment_synthetic_with_real_pgs(
     pgs_df:   DataFrame whose rows correspond 1-to-1 (by position) to rows of
               ``dataset.X``.  It does not need to be indexed by sample ID —
               only its column-name mapping matters.
-    pgs_map:  mapping from synthetic column name (``PGS_T2D`` etc.) to a
+    pgs_map:  mapping from synthetic column name (``pgs_t2d`` etc.) to a
               column of ``pgs_df``.  Any synthetic column not mentioned in
               ``pgs_map`` is left untouched.
 

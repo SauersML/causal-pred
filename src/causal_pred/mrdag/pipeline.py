@@ -435,8 +435,26 @@ def run_mrdag(
     if rng is None:
         rng = np.random.default_rng(0)
 
+    if int(n_chains) < 1:
+        raise ValueError(f"n_chains must be >= 1, got {n_chains}")
+    if int(n_iter) < 1:
+        raise ValueError(f"n_iter must be >= 1, got {n_iter}")
+    if int(n_burn) < 0:
+        raise ValueError(f"n_burn must be >= 0, got {n_burn}")
+    if int(thin) < 1:
+        raise ValueError(f"thin must be >= 1, got {thin}")
+
     p = len(nodes)
     node_index = {name: i for i, name in enumerate(nodes)}
+
+    unknown = [
+        name for name in set(gwas.exposures) | set(gwas.outcomes) if name not in node_index
+    ]
+    if unknown:
+        raise ValueError(
+            "GWAS exposures/outcomes contain names not in `nodes`: "
+            + ", ".join(sorted(unknown))
+        )
 
     # ------------------------------------------------------------------
     # 1) MR trait set + candidate edge mask.

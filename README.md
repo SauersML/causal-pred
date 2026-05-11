@@ -12,57 +12,30 @@ parents (BMI, HbA1c, lifestyle, genetic risk), strong Mendelian-randomisation
 evidence (BMI -> T2D, LDL -> T2D null, etc.), and mature polygenic scores,
 which makes the validation framework meaningful even on synthetic data.
 
-## Documentation
-
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — module map, data flow, and
-  extension points (add a new disease, retarget at a different biobank).
-- [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — install, run, regenerate, troubleshoot.
-- [`docs/MATHEMATICAL_NOTES.md`](docs/MATHEMATICAL_NOTES.md) — equation-level
-  transcription of MrDAG and DAGSLAM with all approximations labelled.
-
 ## Pipeline
 
-```text
-  External GWAS            AoU cohort CSV + microarray genotypes
-  summary stats            + baseline-censored EHR stream
-        |                            |
-        v                            v
-      MrDAG  -- edge priors pi -->  gnomon-scored PRS nodes
-                     |              + TopK crosscoder features
-                     +----------+--------------+
-                                v
-                  DAGSLAM warm start -> Structure MCMC
-                                |
-                                v
-                    posterior parent sets + pathways
-                                |
-                                v
-                    gamfit survival GAM
-                                |
-                                v
-         per-person survival curves + causal pathway probabilities
-```
+External GWAS summary stats feed MrDAG, which produces an edge-inclusion
+prior. AoU cohort CSV plus microarray genotypes feed gnomon-scored PRS nodes
+and TopK crosscoder features. DAGSLAM uses the MrDAG prior and data score to
+warm-start a structure MCMC, whose posterior parent sets are then passed to
+the gamfit survival GAM. The output is per-person survival curves and causal
+pathway probabilities.
 
 ## Layout
 
-```text
-src/causal_pred/
-  data/        synthetic biobank-shape data, real GWAS table, gnomon wrapper
-  mrdag/       MrDAG: produces edge-inclusion-probability matrix pi
-  scoring/     mixed-type marginal-likelihood scores (BGe / Laplace)
-  dagslam/     DAGSLAM hill-climber for the warm-start DAG
-  mcmc/        structure MCMC with MrDAG prior
-  gam/         survival GAM (SauersML/gam backend)
-  validation/  known-edge checks, Nagelkerke R^2, calibration, time-dep AUC
-  plots.py     figure helpers (heatmaps, calibration, survival fans)
-  pipeline.py  end-to-end orchestration
-
-scripts/       runnable drivers (run_full_pipeline.py, generate_figures.py, benchmark.py)
-tests/         pytest tests for every component
-outputs/       JSON / PNG artefacts produced by the pipeline
-paper/         LaTeX paper and build script
-docs/          architecture, runbook, mathematical notes
-```
+- `src/causal_pred/data/` — synthetic biobank-shape data, real GWAS table, gnomon wrapper
+- `src/causal_pred/mrdag/` — MrDAG: produces edge-inclusion-probability matrix pi
+- `src/causal_pred/scoring/` — mixed-type marginal-likelihood scores (BGe / Laplace)
+- `src/causal_pred/dagslam/` — DAGSLAM hill-climber for the warm-start DAG
+- `src/causal_pred/mcmc/` — structure MCMC with MrDAG prior
+- `src/causal_pred/gam/` — survival GAM (SauersML/gam backend)
+- `src/causal_pred/validation/` — known-edge checks, Nagelkerke R^2, calibration, time-dep AUC
+- `src/causal_pred/plots.py` — figure helpers (heatmaps, calibration, survival fans)
+- `src/causal_pred/pipeline.py` — end-to-end orchestration
+- `scripts/` — runnable drivers (`run_full_pipeline.py`, `generate_figures.py`, `benchmark.py`)
+- `tests/` — pytest tests for every component
+- `outputs/` — JSON / PNG artefacts produced by the pipeline
+- `paper/` — LaTeX paper and build script
 
 ## Quickstart
 
@@ -76,5 +49,69 @@ The bootstrap verifies AoU workspace inputs, installs local tools, syncs locked
 dependencies, prepares or restores PRS/EHR intermediates, and runs the single
 causal pipeline.
 
-See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for full instructions and
-troubleshooting.
+## Install
+
+The project uses `uv` for environment management. Clone the repo, then:
+
+```sh
+uv sync --dev
+```
+
+This resolves all runtime and dev dependencies, including the Rust-backed
+`gam` library.
+
+## Run
+
+```sh
+uv run python scripts/run_full_pipeline.py
+```
+
+There are no command-line flags; edit the constants in
+`src/causal_pred/pipeline.py` when the production configuration changes.
+
+## MR prior source (OpenGWAS)
+
+The MrDAG prior is built from two-sample IVW estimates over a curated trait
+set, produced by `src/causal_pred/data/opengwas.py::load_live_gwas`. Set
+`OPENGWAS_JWT` (token from <https://opengwas.io/profile/>) to refresh from
+the OpenGWAS REST API. The on-disk cache under `data/mr_cache/` is keyed by
+`(exposure, outcome, p, r2, kb)` so repeat runs do not re-hit the API.
+
+## Tests
+
+```sh
+uv run pytest -q
+```
+
+Parallel:
+
+```sh
+uv run pytest -q -n auto
+```
+
+## Benchmarks
+
+```sh
+uv run python scripts/benchmark.py
+```
+
+Results are written to `outputs/benchmark.json`.
+
+## Figures
+
+```sh
+uv run python scripts/generate_figures.py
+```
+
+Renders standalone PNG/PDF figures from `outputs/summary.json` and the saved
+NumPy artefacts into `outputs/plots/`.
+
+## Paper rebuild
+
+```sh
+make -C paper paper
+```
+
+`build_paper.py` stamps numeric values from `outputs/summary.json` into
+`main.tex`. The Makefile no-ops gracefully if `latexmk` and `pdflatex` are
+both missing.

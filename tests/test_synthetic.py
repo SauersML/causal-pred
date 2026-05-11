@@ -41,7 +41,7 @@ def test_binary_columns_are_binary(small_data):
 
 def test_bmi_increases_t2d_risk(medium_data):
     """One-sided sanity: people with BMI > 30 should have higher event rate."""
-    bmi = medium_data.X[:, NODE_INDEX["BMI"]]
+    bmi = medium_data.X[:, NODE_INDEX["bmi"]]
     high = medium_data.event[bmi > 30]
     low = medium_data.event[bmi < 25]
     assert high.mean() > low.mean()

@@ -196,22 +196,45 @@ def edge_probability_heatmap(
 # ---------------------------------------------------------------------------
 
 
+def _tied_block_ends(sorted_scores: np.ndarray) -> np.ndarray:
+    """Boolean mask selecting the last index of each tied-score block.
+
+    ``sorted_scores`` is assumed to be sorted (descending in our use, but
+    any monotone order works). Adjacent equal entries form a block; we
+    keep only the final index of each block so downstream curve points
+    do not split equal-score samples by row order.
+    """
+    n = sorted_scores.size
+    keep = np.empty(n, dtype=bool)
+    if n == 0:
+        return keep
+    keep[:-1] = sorted_scores[:-1] != sorted_scores[1:]
+    keep[-1] = True
+    return keep
+
+
 def _roc_curve(
     scores: np.ndarray, y: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Return (fpr, tpr, auroc) curve points, sorted by descending score."""
+    """Return (fpr, tpr, auroc) curve points.
+
+    Tied scores are collapsed to a single curve vertex (the end of the
+    tied block) so the trapezoidal AUROC equals the Mann-Whitney AUC
+    with the standard half-credit for ties, independent of input order.
+    """
     y = y.astype(bool)
     n_pos = int(y.sum())
     n_neg = int(y.size - n_pos)
     if n_pos == 0 or n_neg == 0:
         return np.array([0.0, 1.0]), np.array([0.0, 1.0]), float("nan")
     order = np.argsort(-scores, kind="mergesort")
+    s_sorted = scores[order]
     y_sorted = y[order]
     tps = np.cumsum(y_sorted).astype(float)
     fps = np.cumsum(~y_sorted).astype(float)
-    tpr = np.concatenate([[0.0], tps / n_pos])
-    fpr = np.concatenate([[0.0], fps / n_neg])
-    # AUROC via trapezoidal rule over the curve.
+    keep = _tied_block_ends(s_sorted)
+    tpr = np.concatenate([[0.0], tps[keep] / n_pos])
+    fpr = np.concatenate([[0.0], fps[keep] / n_neg])
     auroc = (
         float(np.trapezoid(tpr, fpr))
         if hasattr(np, "trapezoid")
@@ -223,18 +246,27 @@ def _roc_curve(
 def _pr_curve(
     scores: np.ndarray, y: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Return (recall, precision, average-precision)."""
+    """Return (recall, precision, average-precision).
+
+    Tied scores are evaluated as one threshold block, matching the
+    average-precision definition used by scikit-learn and by
+    ``causal_pred.validation.known_edges._auprc``.
+    """
     y = y.astype(bool)
     n_pos = int(y.sum())
     if n_pos == 0:
         return np.array([0.0, 1.0]), np.array([1.0, 0.0]), float("nan")
     order = np.argsort(-scores, kind="mergesort")
+    s_sorted = scores[order]
     y_sorted = y[order]
     tps = np.cumsum(y_sorted).astype(float)
     fps = np.cumsum(~y_sorted).astype(float)
-    recall = tps / n_pos
-    precision = np.where((tps + fps) > 0, tps / np.maximum(tps + fps, 1), 1.0)
-    # Standard AP: sum over thresholds of (R_k - R_{k-1}) * P_k.
+    keep = _tied_block_ends(s_sorted)
+    tp_b = tps[keep]
+    fp_b = fps[keep]
+    recall = tp_b / n_pos
+    precision = np.where((tp_b + fp_b) > 0, tp_b / np.maximum(tp_b + fp_b, 1), 1.0)
+    # Standard AP over the (collapsed) threshold blocks.
     ap = float(np.sum(np.diff(np.concatenate([[0.0], recall])) * precision))
     return recall, precision, ap
 

@@ -197,7 +197,9 @@ def calibration_metrics(
             continue
         hl += (oj - ej) ** 2 / denom
     hl_df = max(eff_bins - 2, 1)
-    hl_pvalue = float(1.0 - stats.chi2.cdf(hl, df=hl_df))
+    # Survival function avoids catastrophic cancellation when hl is large
+    # enough that chi2.cdf(hl, df) rounds to exactly 1.0.
+    hl_pvalue = float(stats.chi2.sf(hl, df=hl_df))
 
     return {
         "brier": brier,

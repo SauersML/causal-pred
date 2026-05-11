@@ -12,14 +12,14 @@ def test_shapes(small_gwas):
 
 
 def test_bmi_has_effect_on_t2d(small_gwas):
-    i = small_gwas.exposure_index("BMI")
-    j = small_gwas.outcome_index("T2D")
+    i = small_gwas.exposure_index("bmi")
+    j = small_gwas.outcome_index("type2_diabetes")
     assert small_gwas.betas[i, j] > 0.3
     assert small_gwas.ivw_pvals[i, j] < 0.05
 
 
 def test_physical_activity_t2d_is_weak_in_open_gwas_cache(small_gwas):
     i = small_gwas.exposure_index("physical_activity")
-    j = small_gwas.outcome_index("T2D")
+    j = small_gwas.outcome_index("type2_diabetes")
     z = small_gwas.betas[i, j] / small_gwas.ses[i, j]
     assert abs(z) < 3.0

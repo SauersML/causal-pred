@@ -93,14 +93,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 OPENGWAS_STUDY_IDS: Dict[str, str] = {
-    "BMI": "ieu-b-40",
-    "LDL": "ieu-b-110",
-    "HbA1c": "ebi-a-GCST90002244",
-    "systolic_BP": "ieu-b-38",
+    "bmi": "ieu-b-40",
+    "ldl_cholesterol": "ieu-b-110",
+    "hba1c": "ebi-a-GCST90002244",
+    "systolic_bp": "ieu-b-38",
     "years_smoking": "ieu-b-25",
     "physical_activity": "ukb-b-4710",
     "hypertension": "ukb-b-12493",
-    "T2D": "ebi-a-GCST006867",
+    "type2_diabetes": "ebi-a-GCST006867",
     "cardiovascular_disease": "ebi-a-GCST005195",
     # diet_quality intentionally omitted -- no consensus single-score GWAS.
 }
@@ -365,18 +365,28 @@ def harmonise_pairs(
 
 
 def ivw(pairs: Sequence[Tuple[float, float, float, float, str]]) -> Tuple[float, float, int]:
-    """Inverse-variance-weighted estimator on harmonised SNPs."""
+    """Inverse-variance-weighted estimator on harmonised SNPs.
+
+    Uses the algebraically equivalent form
+        beta = sum(bx*by / sy^2) / sum(bx^2 / sy^2)
+    so SNPs with bx == 0 contribute exactly zero rather than 0 * inf == NaN.
+    """
     if not pairs:
         return float("nan"), float("nan"), 0
     bx = np.asarray([p[0] for p in pairs], dtype=float)
     by = np.asarray([p[2] for p in pairs], dtype=float)
     sy = np.asarray([p[3] for p in pairs], dtype=float)
-    w = (bx ** 2) / (sy ** 2)
-    ratio = by / bx
-    denom = float(np.sum(w))
+    valid = np.isfinite(bx) & np.isfinite(by) & np.isfinite(sy) & (sy > 0.0)
+    if not np.any(valid):
+        return float("nan"), float("nan"), len(pairs)
+    bx = bx[valid]
+    by = by[valid]
+    sy = sy[valid]
+    inv_var = 1.0 / (sy * sy)
+    denom = float(np.sum(bx * bx * inv_var))
     if denom <= 0.0:
         return float("nan"), float("nan"), len(pairs)
-    beta = float(np.sum(w * ratio) / denom)
+    beta = float(np.sum(bx * by * inv_var) / denom)
     se = float(1.0 / np.sqrt(denom))
     return beta, se, len(pairs)
 
@@ -695,7 +705,9 @@ def load_live_gwas(
 
     with np.errstate(invalid="ignore"):
         z = betas / ses
-        pvals = 2.0 * (1.0 - norm.cdf(np.abs(z)))
+        # Use the survival function for stable upper-tail probabilities; the
+        # naive 1 - cdf(|z|) form underflows to exactly 0 for |z| >~ 8.
+        pvals = 2.0 * norm.sf(np.abs(z))
 
     summary = GWASSummary(
         exposures=exposures,

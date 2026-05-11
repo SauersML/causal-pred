@@ -185,7 +185,21 @@ def _shape_prediction_inputs(
     p = len(fit.columns)
     X_new = np.asarray(X_new, dtype=float)
     if p > 0:
-        X_new = X_new.reshape(-1, p)
+        if X_new.ndim == 1:
+            if X_new.shape[0] != p:
+                raise ValueError(
+                    f"1D X_new must have length {p} (one sample); got shape {X_new.shape}"
+                )
+            X_new = X_new.reshape(1, p)
+        elif X_new.ndim == 2:
+            if X_new.shape[1] != p:
+                raise ValueError(
+                    f"X_new has {X_new.shape[1]} columns but model expects {p}"
+                )
+        else:
+            raise ValueError(
+                f"X_new must be 1D or 2D; got {X_new.ndim}D shape {X_new.shape}"
+            )
     elif X_new.ndim == 2:
         if X_new.shape[1] != 0:
             raise ValueError(
@@ -371,7 +385,22 @@ class SurvivalGAM:
         X_new = np.asarray(X_new, dtype=float)
         p = len(self.columns)
         if p > 0:
-            return X_new.reshape(-1, p)
+            if X_new.ndim == 1:
+                if X_new.shape[0] != p:
+                    raise ValueError(
+                        f"1D X_new must have length {p} (one sample); "
+                        f"got shape {X_new.shape}"
+                    )
+                return X_new.reshape(1, p)
+            if X_new.ndim == 2:
+                if X_new.shape[1] != p:
+                    raise ValueError(
+                        f"X_new has {X_new.shape[1]} columns but model expects {p}"
+                    )
+                return X_new
+            raise ValueError(
+                f"X_new must be 1D or 2D; got {X_new.ndim}D shape {X_new.shape}"
+            )
         if X_new.ndim == 2:
             if X_new.shape[1] != 0:
                 raise ValueError(

@@ -29,10 +29,10 @@ import numpy as np
 
 
 MR_EXPOSURES: Tuple[str, ...] = (
-    "BMI",
-    "LDL",
-    "HbA1c",
-    "systolic_BP",
+    "bmi",
+    "ldl_cholesterol",
+    "hba1c",
+    "systolic_bp",
     "years_smoking",
     "physical_activity",
     "diet_quality",
@@ -40,13 +40,13 @@ MR_EXPOSURES: Tuple[str, ...] = (
 )
 
 MR_OUTCOMES: Tuple[str, ...] = (
-    "BMI",
-    "LDL",
-    "HbA1c",
-    "systolic_BP",
+    "bmi",
+    "ldl_cholesterol",
+    "hba1c",
+    "systolic_bp",
     "hypertension",
     "cardiovascular_disease",
-    "T2D",
+    "type2_diabetes",
 )
 
 
@@ -54,15 +54,15 @@ MR_OUTCOMES: Tuple[str, ...] = (
 # MR prior because a "causal" interpretation is confounded with how the
 # outcome is defined.
 #
-#   HbA1c -> T2D                  : HbA1c >= 6.5% is part of the T2D
+#   hba1c -> type2_diabetes       : HbA1c >= 6.5% is part of the T2D
 #                                    case definition.
-#   systolic_BP <-> hypertension  : SBP is used to define HTN, and HTN is
+#   systolic_bp <-> hypertension  : SBP is used to define HTN, and HTN is
 #                                    an indicator of the same blood-pressure
 #                                    process rather than an ordinary cause.
 CIRCULAR_PAIRS: Tuple[Tuple[str, str], ...] = (
-    ("HbA1c", "T2D"),
-    ("systolic_BP", "hypertension"),
-    ("hypertension", "systolic_BP"),
+    ("hba1c", "type2_diabetes"),
+    ("systolic_bp", "hypertension"),
+    ("hypertension", "systolic_bp"),
 )
 
 

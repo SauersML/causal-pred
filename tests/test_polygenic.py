@@ -101,17 +101,17 @@ def test_tsv_parsing_sscore(tmp_path):
     _write_mock_sscore(
         sscore,
         iids=["S1", "S2", "S3"],
-        avg_cols=["T2D", "BMI"],
+        avg_cols=["type2_diabetes", "bmi"],
         values=[[0.12, -0.34], [0.56, 0.78], [-1.0, 2.5]],
     )
     df = pg.parse_sscore(sscore)
-    assert list(df.columns) == ["T2D", "BMI"]
+    assert list(df.columns) == ["type2_diabetes", "bmi"]
     assert df.index.name == "IID"
     assert df.shape == (3, 2)
-    assert df.loc["S1", "T2D"] == pytest.approx(0.12)
-    assert df.loc["S3", "BMI"] == pytest.approx(2.5)
+    assert df.loc["S1", "type2_diabetes"] == pytest.approx(0.12)
+    assert df.loc["S3", "bmi"] == pytest.approx(2.5)
     # dtypes
-    assert df["T2D"].dtype == np.float64
+    assert df["type2_diabetes"].dtype == np.float64
     assert str(df.index.dtype) in ("string", "object", "string[python]")
 
 
@@ -128,7 +128,7 @@ def test_tsv_parsing_sscore_with_region_header(tmp_path):
     sscore.write_text("\n".join(lines) + "\n")
     df = pg.parse_sscore(sscore)
     assert df.shape == (2, 1)
-    assert df.loc["S2", "T2D"] == pytest.approx(-0.5)
+    assert df.loc["S2", "type2_diabetes"] == pytest.approx(-0.5)
 
 
 def test_tsv_parsing_sscore_filters_iids_while_streaming(tmp_path):
@@ -137,7 +137,7 @@ def test_tsv_parsing_sscore_filters_iids_while_streaming(tmp_path):
     _write_mock_sscore(
         sscore,
         iids=["S1", "S2", "S3", "S4"],
-        avg_cols=["T2D", "BMI"],
+        avg_cols=["type2_diabetes", "bmi"],
         values=[[0.1, 1.1], [0.2, 1.2], [0.3, 1.3], [0.4, 1.4]],
         missing_pct=0.5,
     )
@@ -145,10 +145,10 @@ def test_tsv_parsing_sscore_filters_iids_while_streaming(tmp_path):
     df = pg.parse_sscore(sscore, keep_iids={"S2", "S4"}, chunksize=2)
 
     assert list(df.index.astype(str)) == ["S2", "S4"]
-    assert list(df.columns) == ["T2D", "BMI"]
+    assert list(df.columns) == ["type2_diabetes", "bmi"]
     assert df.shape == (2, 2)
-    assert df.loc["S2", "T2D"] == pytest.approx(0.2)
-    assert df.loc["S4", "BMI"] == pytest.approx(1.4)
+    assert df.loc["S2", "type2_diabetes"] == pytest.approx(0.2)
+    assert df.loc["S4", "bmi"] == pytest.approx(1.4)
 
 
 def test_score_panel_passes_matching_keep_iids_to_gnomon(monkeypatch, tmp_path):
@@ -187,7 +187,7 @@ def test_score_panel_passes_matching_keep_iids_to_gnomon(monkeypatch, tmp_path):
     assert "--keep" in captured["cmd"]
     assert captured["keep"] == ["S1"]
     assert list(df.index.astype(str)) == ["S1"]
-    assert df.loc["S1", "T2D"] == pytest.approx(0.25)
+    assert df.loc["S1", "type2_diabetes"] == pytest.approx(0.25)
 
 
 def test_tsv_parsing_sex(tmp_path):
@@ -291,7 +291,7 @@ def test_augment_synthetic_replaces_and_preserves():
     new_ds = pg.augment_synthetic_with_real_pgs(
         ds,
         pgs_df,
-        pgs_map={"PGS_T2D": "t2d_raw", "PGS_BMI": "bmi_raw"},
+        pgs_map={"pgs_t2d": "t2d_raw", "pgs_bmi": "bmi_raw"},
     )
 
     # shape / metadata preserved
@@ -303,20 +303,20 @@ def test_augment_synthetic_replaces_and_preserves():
     np.testing.assert_array_equal(new_ds.event, ds.event)
 
     # replaced columns are standardised
-    t2d_idx = ds.columns.index("PGS_T2D")
-    bmi_idx = ds.columns.index("PGS_BMI")
+    t2d_idx = ds.columns.index("pgs_t2d")
+    bmi_idx = ds.columns.index("pgs_bmi")
     assert abs(new_ds.X[:, t2d_idx].mean()) < 1e-10
     assert abs(new_ds.X[:, t2d_idx].std() - 1.0) < 1e-6
     assert abs(new_ds.X[:, bmi_idx].mean()) < 1e-10
 
     # unrelated PGS columns are untouched
-    ldl_idx = ds.columns.index("PGS_LDL")
-    hba_idx = ds.columns.index("PGS_HbA1c")
+    ldl_idx = ds.columns.index("pgs_ldl")
+    hba_idx = ds.columns.index("pgs_hba1c")
     np.testing.assert_array_equal(new_ds.X[:, ldl_idx], ds.X[:, ldl_idx])
     np.testing.assert_array_equal(new_ds.X[:, hba_idx], ds.X[:, hba_idx])
 
     # a non-PGS phenotype column is untouched
-    bmi_phe_idx = ds.columns.index("BMI")
+    bmi_phe_idx = ds.columns.index("bmi")
     np.testing.assert_array_equal(new_ds.X[:, bmi_phe_idx], ds.X[:, bmi_phe_idx])
 
     # input dataset was not mutated
@@ -331,11 +331,11 @@ def test_augment_synthetic_validates_arguments():
         pg.augment_synthetic_with_real_pgs(ds, df, {"not_a_col": "real"})
 
     with pytest.raises(KeyError):
-        pg.augment_synthetic_with_real_pgs(ds, df, {"PGS_T2D": "missing"})
+        pg.augment_synthetic_with_real_pgs(ds, df, {"pgs_t2d": "missing"})
 
     short = pd.DataFrame({"real": np.zeros(ds.n - 1)})
     with pytest.raises(ValueError):
-        pg.augment_synthetic_with_real_pgs(ds, short, {"PGS_T2D": "real"})
+        pg.augment_synthetic_with_real_pgs(ds, short, {"pgs_t2d": "real"})
 
 
 # ---------------------------------------------------------------------------

@@ -84,7 +84,7 @@ def test_fit_smoke(monkeypatch):
         time,
         event,
         X,
-        columns=("sex", "BMI"),
+        columns=("sex", "bmi"),
         n_uncertainty_slices=9,
         progress=progress_messages.append,
     )
@@ -92,10 +92,10 @@ def test_fit_smoke(monkeypatch):
     assert seen["survival_likelihood"] == "location-scale"
     assert seen["baseline_target"] == "linear"
     assert seen["config"] == {"noise_formula": "1"}
-    assert seen["df_columns"] == ("entry", "exit", "event", "sex", "BMI")
+    assert seen["df_columns"] == ("entry", "exit", "event", "sex", "bmi")
     assert seen["formula"] == "Surv(entry, exit, event) ~ sex + BMI"
-    np.testing.assert_allclose(seen["df"][["sex", "BMI"]].mean(axis=0), 0.0)
-    np.testing.assert_allclose(seen["df"][["sex", "BMI"]].std(axis=0, ddof=0), 1.0)
+    np.testing.assert_allclose(seen["df"][["sex", "bmi"]].mean(axis=0), 0.0)
+    np.testing.assert_allclose(seen["df"][["sex", "bmi"]].std(axis=0, ddof=0), 1.0)
 
     t_grid = np.array([0.5, 2.0, 5.0])
     S = gam_model.predict_survival(X[:2], t_grid)
@@ -134,11 +134,11 @@ def test_predict_shape():
 
     n_slices = 37
     gam_model = SurvivalGAM(
-        columns=("BMI", "age"),
+        columns=("bmi", "age"),
         diagnostics={},
         _fit=_SubmodelFit(
             model=_FakeModel(),
-            columns=("BMI", "age"),
+            columns=("bmi", "age"),
             n_train=10,
             n_events=4,
             formula="Surv(entry, exit, event) ~ BMI + age",
@@ -229,8 +229,8 @@ def test_bma_weights(small_data, monkeypatch):
     time = d.time[:n_keep]
     event = d.event[:n_keep]
 
-    set_A = (NODE_INDEX["BMI"], NODE_INDEX["HbA1c"])
-    set_B = (NODE_INDEX["ancestry_PC1"],)
+    set_A = (NODE_INDEX["bmi"], NODE_INDEX["hba1c"])
+    set_B = (NODE_INDEX["ancestry_pc1"],)
     parent_sets = [set_A, set_B]
     weights = np.array([0.9, 0.1])
     t_grid = np.array([2.0, 5.0, 10.0])
@@ -249,7 +249,7 @@ def test_bma_weights(small_data, monkeypatch):
             return np.zeros((X_new.shape[0], len(t_grid)), dtype=float)
 
     def _fixed_fit(_time, _event, _X, columns, **_kwargs):
-        offsets = {("BMI", "HbA1c"): 0.0, ("ancestry_PC1",): 0.2}
+        offsets = {("bmi", "hba1c"): 0.0, ("ancestry_pc1",): 0.2}
         return _FixedSurvivalFit(offsets[tuple(columns)])
 
     monkeypatch.setattr(survival_mod, "fit_survival_gam", _fixed_fit)

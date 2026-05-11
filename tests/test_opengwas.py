@@ -90,12 +90,12 @@ def test_load_live_gwas_real_cache_produces_ivw_cells():
     assert usable.any(), "expected at least one usable IVW cell"
     assert int(usable.sum()) >= 40
 
-    bmi_idx = summary.exposures.index("BMI")
-    ldl_idx = summary.outcomes.index("LDL")
+    bmi_idx = summary.exposures.index("bmi")
+    ldl_idx = summary.outcomes.index("ldl_cholesterol")
     assert np.isfinite(summary.betas[bmi_idx, ldl_idx])
     assert np.isfinite(summary.ses[bmi_idx, ldl_idx])
     assert summary.ses[bmi_idx, ldl_idx] > 0.0
-    assert ("BMI", "LDL") in summary.citations
+    assert ("bmi", "ldl_cholesterol") in summary.citations
 
     # diet_quality has no curated study id -> entire row should be NaN.
     diet_idx = summary.exposures.index("diet_quality")
@@ -118,14 +118,14 @@ def test_no_jwt_yields_all_nan_summary(tmp_path: Path):
 def test_curated_ids_match_documented_set():
     # Lock in the ID picks so accidental edits surface in code review.
     expected = {
-        "BMI": "ieu-b-40",
-        "LDL": "ieu-b-110",
-        "HbA1c": "ebi-a-GCST90002244",
-        "systolic_BP": "ieu-b-38",
+        "bmi": "ieu-b-40",
+        "ldl_cholesterol": "ieu-b-110",
+        "hba1c": "ebi-a-GCST90002244",
+        "systolic_bp": "ieu-b-38",
         "years_smoking": "ieu-b-25",
         "physical_activity": "ukb-b-4710",
         "hypertension": "ukb-b-12493",
-        "T2D": "ebi-a-GCST006867",
+        "type2_diabetes": "ebi-a-GCST006867",
         "cardiovascular_disease": "ebi-a-GCST005195",
     }
     assert opengwas.OPENGWAS_STUDY_IDS == expected

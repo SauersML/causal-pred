@@ -22,42 +22,49 @@ class Node:
     name: str
     kind: str  # "continuous" | "binary" | "survival"
     description: str
+    label: str  # pretty display name for plots / log strings
     exogenous: bool = False
 
 
 # Ordered so that any topological sort of the synthetic DAG will respect it.
 # Genetic/demographic roots first, then mediators, then the T2D outcome.
+#
+# ``name`` is the canonical lowercase snake_case identifier used for every
+# array column, dict key, and string comparison in the codebase.  ``label``
+# is the pretty display name used only by plots and log messages -- it is
+# data, not a code path.
 NODES: Tuple[Node, ...] = (
     # --- genetic roots (continuous, standardised polygenic scores) ---
-    Node("PGS_T2D", "continuous", "Polygenic score for T2D", exogenous=True),
-    Node("PGS_BMI", "continuous", "Polygenic score for body-mass index", exogenous=True),
-    Node("PGS_LDL", "continuous", "Polygenic score for LDL cholesterol", exogenous=True),
-    Node("PGS_HbA1c", "continuous", "Polygenic score for HbA1c", exogenous=True),
+    Node("pgs_t2d", "continuous", "Polygenic score for T2D", "PGS T2D", exogenous=True),
+    Node("pgs_bmi", "continuous", "Polygenic score for body-mass index", "PGS BMI", exogenous=True),
+    Node("pgs_ldl", "continuous", "Polygenic score for LDL cholesterol", "PGS LDL", exogenous=True),
+    Node("pgs_hba1c", "continuous", "Polygenic score for HbA1c", "PGS HbA1c", exogenous=True),
     # --- demographic roots ---
-    Node("age", "continuous", "Current age (years)", exogenous=True),
-    Node("sex", "binary", "1 = male, 0 = female", exogenous=True),
-    Node("ancestry_PC1", "continuous", "Genetic-ancestry PC1", exogenous=True),
+    Node("age", "continuous", "Current age (years)", "age", exogenous=True),
+    Node("sex", "binary", "1 = male, 0 = female", "sex", exogenous=True),
+    Node("ancestry_pc1", "continuous", "Genetic-ancestry PC1", "ancestry PC1", exogenous=True),
     # --- family history ---
     Node(
-        "family_history_T2D",
+        "family_history_t2d",
         "binary",
         "Any first-degree relative with T2D",
+        "family history T2D",
         exogenous=True,
     ),
     # --- lifestyle / environment ---
-    Node("years_smoking", "continuous", "Cumulative years of smoking"),
-    Node("physical_activity", "continuous", "Average MET-hours per week"),
-    Node("diet_quality", "continuous", "Healthy-Eating-Index z-score"),
+    Node("years_smoking", "continuous", "Cumulative years of smoking", "years smoking"),
+    Node("physical_activity", "continuous", "Average MET-hours per week", "physical activity"),
+    Node("diet_quality", "continuous", "Healthy-Eating-Index z-score", "diet quality"),
     # --- clinical mediators ---
-    Node("BMI", "continuous", "Body-mass index (kg/m^2)"),
-    Node("LDL", "continuous", "LDL cholesterol (mmol/L)"),
-    Node("HbA1c", "continuous", "Glycated haemoglobin (%)"),
-    Node("systolic_BP", "continuous", "Systolic blood pressure (mmHg)"),
+    Node("bmi", "continuous", "Body-mass index (kg/m^2)", "BMI"),
+    Node("ldl_cholesterol", "continuous", "LDL cholesterol (mmol/L)", "LDL cholesterol"),
+    Node("hba1c", "continuous", "Glycated haemoglobin (%)", "HbA1c"),
+    Node("systolic_bp", "continuous", "Systolic blood pressure (mmHg)", "systolic BP"),
     # --- related disease states ---
-    Node("hypertension", "binary", "Hypertension diagnosis"),
-    Node("cardiovascular_disease", "binary", "Prior CVD event"),
+    Node("hypertension", "binary", "Hypertension diagnosis", "hypertension"),
+    Node("cardiovascular_disease", "binary", "Prior CVD event", "cardiovascular disease"),
     # --- outcome ---
-    Node("T2D", "survival", "Time-to-T2D with right-censoring"),
+    Node("type2_diabetes", "survival", "Time-to-T2D with right-censoring", "T2D"),
 )
 
 NODE_NAMES: Tuple[str, ...] = tuple(n.name for n in NODES)
@@ -81,27 +88,27 @@ N_NODES: int = len(NODES)
 
 CANONICAL_EDGES: Tuple[Tuple[str, str], ...] = (
     # genetic -> phenotype
-    ("PGS_BMI", "BMI"),
-    ("PGS_LDL", "LDL"),
-    ("PGS_HbA1c", "HbA1c"),
-    ("PGS_T2D", "T2D"),
+    ("pgs_bmi", "bmi"),
+    ("pgs_ldl", "ldl_cholesterol"),
+    ("pgs_hba1c", "hba1c"),
+    ("pgs_t2d", "type2_diabetes"),
     # lifestyle -> phenotype  (well-established)
     ("years_smoking", "cardiovascular_disease"),
-    ("physical_activity", "BMI"),
-    ("diet_quality", "BMI"),
-    ("diet_quality", "LDL"),
+    ("physical_activity", "bmi"),
+    ("diet_quality", "bmi"),
+    ("diet_quality", "ldl_cholesterol"),
     # clinical mediators -> outcome
-    ("BMI", "T2D"),
-    ("BMI", "hypertension"),
-    ("BMI", "HbA1c"),
-    ("systolic_BP", "cardiovascular_disease"),
+    ("bmi", "type2_diabetes"),
+    ("bmi", "hypertension"),
+    ("bmi", "hba1c"),
+    ("systolic_bp", "cardiovascular_disease"),
     # age is a driver of almost everything
-    ("age", "T2D"),
+    ("age", "type2_diabetes"),
     ("age", "hypertension"),
     ("age", "cardiovascular_disease"),
-    ("age", "systolic_BP"),
+    ("age", "systolic_bp"),
     # family history captures unmeasured genetic+environmental shared liab.
-    ("family_history_T2D", "T2D"),
+    ("family_history_t2d", "type2_diabetes"),
     # hypertension -> CVD
     ("hypertension", "cardiovascular_disease"),
 )
@@ -109,15 +116,15 @@ CANONICAL_EDGES: Tuple[Tuple[str, str], ...] = (
 # Extra edges used only by the simulator (mild confounders / demographic
 # effects that are realistic but not "textbook causal").
 SYNTHETIC_ONLY_EDGES: Tuple[Tuple[str, str], ...] = (
-    ("sex", "BMI"),
-    ("sex", "systolic_BP"),
+    ("sex", "bmi"),
+    ("sex", "systolic_bp"),
     ("sex", "cardiovascular_disease"),
-    ("ancestry_PC1", "LDL"),
-    ("ancestry_PC1", "HbA1c"),
+    ("ancestry_pc1", "ldl_cholesterol"),
+    ("ancestry_pc1", "hba1c"),
     # Simulated risk-marker/diagnostic dependencies, excluded from the clean
     # literature gold-standard benchmark.
-    ("HbA1c", "T2D"),
-    ("hypertension", "systolic_BP"),
+    ("hba1c", "type2_diabetes"),
+    ("hypertension", "systolic_bp"),
 )
 
 ALL_GROUND_TRUTH_EDGES: Tuple[Tuple[str, str], ...] = (

@@ -183,8 +183,8 @@ def test_hl_chi2():
 
 def test_time_dependent_auc_sanity():
     d = simulate(n=2000, rng=np.random.default_rng(42))
-    bmi = d.X[:, NODE_INDEX["BMI"]]
-    pgs = d.X[:, NODE_INDEX["PGS_T2D"]]
+    bmi = d.X[:, NODE_INDEX["bmi"]]
+    pgs = d.X[:, NODE_INDEX["pgs_t2d"]]
     risk = (bmi - bmi.mean()) / bmi.std() + (pgs - pgs.mean()) / pgs.std()
     eval_times = np.array([5.0, 10.0, 15.0])
     out = time_dependent_auc(d.time, d.event, risk, eval_times)

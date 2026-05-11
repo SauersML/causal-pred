@@ -605,6 +605,72 @@ def _ehr_recon_metrics(
     return out
 
 
+def _ehr_recon_per_column(
+    b_z: np.ndarray,
+    b_raw: np.ndarray,
+    b_hat: np.ndarray,
+    *,
+    gaussian: np.ndarray,
+    binary: np.ndarray,
+    count: np.ndarray,
+    mean_E: np.ndarray,
+) -> np.ndarray:
+    """Per-column reconstruction quality in each column's native space.
+
+    Returns an ``(m_E,)`` array of pseudo-R^2 scores on a comparable
+    scale: ``1.0`` is perfect, ``0.0`` matches the prior/constant
+    baseline, negative is worse than the prior. The per-kind definitions
+    mirror :func:`_ehr_recon_metrics`:
+
+    * Gaussian: ``1 - SS_res/SS_tot`` on z-scored values.
+    * Binary: ``1 - Brier(model) / Brier(prior)`` against the raw
+      ``{0,1}`` target, with model probabilities
+      ``sigmoid(b_hat + prior_logit)``. ``Brier(prior) = p(1-p)`` is the
+      classical R^2-style denominator for a Bernoulli target.
+    * Count: ``1 - SS_res/SS_tot`` in ``log1p`` space against
+      ``log1p(softplus(b_hat))``, matching the training loss.
+
+    Columns whose SS_tot / Brier(prior) is degenerate (all-constant
+    target) are returned as NaN.
+    """
+    m_E = int(b_hat.shape[1])
+    out = np.full(m_E, np.nan, dtype=np.float64)
+    eps = 1e-12
+
+    if gaussian.any():
+        idx = np.flatnonzero(gaussian)
+        t = b_z[:, idx]
+        p = b_hat[:, idx]
+        ss_res = np.sum((t - p) ** 2, axis=0)
+        ss_tot = np.sum((t - t.mean(axis=0, keepdims=True)) ** 2, axis=0)
+        denom = np.where(ss_tot > eps, ss_tot, np.nan)
+        out[idx] = 1.0 - ss_res / denom
+
+    if binary.any():
+        idx = np.flatnonzero(binary)
+        prevalence = np.clip(mean_E[idx], 1e-4, 1.0 - 1e-4)
+        prior_logit = np.log(prevalence / (1.0 - prevalence))
+        prob = 1.0 / (1.0 + np.exp(-(b_hat[:, idx] + prior_logit[None, :])))
+        target = b_raw[:, idx]
+        brier_model = np.mean((prob - target) ** 2, axis=0)
+        brier_prior = np.mean((prevalence[None, :] - target) ** 2, axis=0)
+        denom = np.where(brier_prior > eps, brier_prior, np.nan)
+        out[idx] = 1.0 - brier_model / denom
+
+    if count.any():
+        idx = np.flatnonzero(count)
+        target = np.log1p(np.clip(b_raw[:, idx], 0.0, None))
+        pred = np.log1p(
+            np.clip(np.expm1(np.logaddexp(0.0, b_hat[:, idx])), 0.0, None)
+        )
+        ss_res = np.sum((target - pred) ** 2, axis=0)
+        ss_tot = np.sum((target - target.mean(axis=0, keepdims=True)) ** 2, axis=0)
+        denom = np.where(ss_tot > eps, ss_tot, np.nan)
+        out[idx] = 1.0 - ss_res / denom
+
+    return out
+
+
 def train_crosscoder(
     A: np.ndarray,
     B: np.ndarray,
@@ -860,10 +926,6 @@ def train_crosscoder(
             return torch.zeros((), dtype=torch_dtype, device=torch_device)
         return sum(w * p for w, p in zip(weights, pieces))
 
-    def _standard_aux_loss(a_hat: torch.Tensor, b_hat: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        x_hat = torch.cat([a_hat, b_hat], dim=1)
-        return 0.5 * torch.mean((x_hat - target) ** 2)
-
     @torch.no_grad()
     def _project_params() -> None:
         params["W_e"].mul_(encoder_mask)
@@ -1062,8 +1124,26 @@ def train_crosscoder(
                 allowed=dead_allowed,
             )
             a_aux, b_aux = _decode(z_aux)
-            residual = x - torch.cat([a_hat.detach(), b_hat.detach()], dim=1)
-            loss_aux = _standard_aux_loss(a_aux, b_aux, residual)
+            # `x` is in standardised raw-input space. `a_hat` matches that space
+            # for the genome block, and `b_hat` matches only on Gaussian EHR
+            # columns -- for binary/count columns `b_hat` lives in logit/log1p
+            # space and is not comparable to `x`. Restrict the auxiliary
+            # reconstruction loss to the coordinate-consistent columns so dead
+            # units are not driven toward residuals in mixed coordinate systems.
+            recon = torch.cat([a_hat.detach(), b_hat.detach()], dim=1)
+            aux_pred = torch.cat([a_aux, b_aux], dim=1)
+            if bool(gaussian_e.all()):
+                residual = x - recon
+                loss_aux = 0.5 * torch.mean((aux_pred - residual) ** 2)
+            else:
+                ehr_consistent = gaussian_e
+                residual_a = x[:, :m_G] - recon[:, :m_G]
+                residual_b = (x[:, m_G:] - recon[:, m_G:])[:, ehr_consistent]
+                pred_a = aux_pred[:, :m_G]
+                pred_b = aux_pred[:, m_G:][:, ehr_consistent]
+                residual = torch.cat([residual_a, residual_b], dim=1)
+                aux_pred = torch.cat([pred_a, pred_b], dim=1)
+                loss_aux = 0.5 * torch.mean((aux_pred - residual) ** 2)
 
         loss = (
             loss_main

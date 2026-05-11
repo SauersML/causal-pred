@@ -49,6 +49,8 @@ from .crosscoder import (
     BANK_GENOME_PRIVATE,
     BANK_SHARED,
     TopKCrosscoder,
+    _ehr_kind_masks,
+    _ehr_recon_per_column,
     encode,
     feature_stream_share,
 )
@@ -1019,16 +1021,28 @@ def reconstruction_quality(
     a_z = (panels.A - model.mean_G) / model.std_G
     b_z = (panels.B - model.mean_E) / model.std_E
 
-    def _r2_per_col(target: np.ndarray, recon: np.ndarray) -> np.ndarray:
-        ss_res = np.sum((target - recon) ** 2, axis=0)
-        ss_tot = np.sum(target ** 2, axis=0)  # mean ~0 because z-scored
-        ss_tot = np.where(ss_tot > 1e-12, ss_tot, 1.0)
-        return 1.0 - ss_res / ss_tot
+    # Genome side is always Gaussian (PRS values), so plain z-space R^2 is
+    # the right metric.
+    ss_res_g = np.sum((a_z - a_hat) ** 2, axis=0)
+    ss_tot_g = np.sum((a_z - a_z.mean(axis=0, keepdims=True)) ** 2, axis=0)
+    ss_tot_g = np.where(ss_tot_g > 1e-12, ss_tot_g, np.nan)
+    r2_g = 1.0 - ss_res_g / ss_tot_g
 
-    r2_g = _r2_per_col(a_z, a_hat)
-    r2_e = _r2_per_col(b_z, b_hat)
-    mean_g = float(np.mean(r2_g)) if r2_g.size else float("nan")
-    mean_e = float(np.mean(r2_e)) if r2_e.size else float("nan")
+    # EHR side is mixed-likelihood: ``b_hat`` is a z-score / logit /
+    # log-rate depending on the column's kind. Comparing it against the
+    # z-scored target with a single R^2 is meaningless (see the docstring
+    # of ``_ehr_recon_metrics``), so evaluate each kind in its native
+    # space and return a comparable pseudo-R^2 per column.
+    gaussian_e, binary_e, count_e = _ehr_kind_masks(
+        model.ehr_feature_kinds, model.m_E
+    )
+    r2_e = _ehr_recon_per_column(
+        b_z, panels.B, b_hat,
+        gaussian=gaussian_e, binary=binary_e, count=count_e,
+        mean_E=model.mean_E,
+    )
+    mean_g = float(np.nanmean(r2_g)) if r2_g.size else float("nan")
+    mean_e = float(np.nanmean(r2_e)) if r2_e.size else float("nan")
 
     fig = plt.figure(figsize=(11.0, 7.5), dpi=_DPI, constrained_layout=True)
     gs = fig.add_gridspec(2, 1, height_ratios=[1.0, 1.0], hspace=0.25)
@@ -1060,6 +1074,7 @@ def reconstruction_quality(
     _faint_grid(ax_g, axis="x")
 
     # ---- EHR side: by kind, distribution; or best/worst N ----------------
+    quality_label = "reconstruction quality (R² / Brier lift)"
     if ehr_kinds is not None and len(ehr_kinds) == r2_e.size:
         kinds = np.asarray(ehr_kinds)
         kind_order = sorted(np.unique(kinds).tolist())
@@ -1068,7 +1083,8 @@ def reconstruction_quality(
         bp_data: list[np.ndarray] = []
         for i, kind in enumerate(kind_order):
             sel = kinds == kind
-            bp_data.append(r2_e[sel])
+            vals = r2_e[sel]
+            bp_data.append(vals[np.isfinite(vals)])
             positions.append(float(i))
             labels.append(f"{kind}\n(n={int(sel.sum())})")
         bp = ax_e.boxplot(
@@ -1104,20 +1120,24 @@ def reconstruction_quality(
                      linestyle="--", alpha=0.85)
         ax_e.text(
             ax_e.get_xlim()[1] * 0.99, mean_e,
-            f"  mean R² = {mean_e:.3f}",
+            f"  mean = {mean_e:.3f}",
             ha="right", va="bottom", fontsize=8.5, color=PROMOTED_COLOR,
         )
-        ax_e.set_ylabel("R²")
+        ax_e.set_ylabel(quality_label)
         ax_e.set_title("EHR side: per-column reconstruction by kind",
                        loc="left", fontsize=11, fontweight="bold")
         _faint_grid(ax_e, axis="y")
     else:
-        order = np.argsort(r2_e)
-        n = r2_e.size
+        finite = np.isfinite(r2_e)
+        idx_all = np.flatnonzero(finite)
+        order_finite = idx_all[np.argsort(r2_e[idx_all])]
+        n = order_finite.size
         if n <= 2 * max_ehr_rows:
-            keep = order
+            keep = order_finite
         else:
-            keep = np.concatenate([order[:max_ehr_rows], order[-max_ehr_rows:]])
+            keep = np.concatenate(
+                [order_finite[:max_ehr_rows], order_finite[-max_ehr_rows:]]
+            )
         r2_show = r2_e[keep]
         ax_e.barh(
             np.arange(r2_show.size),
@@ -1133,10 +1153,10 @@ def reconstruction_quality(
                      linestyle="--", alpha=0.85)
         ax_e.text(
             mean_e, r2_show.size - 0.5,
-            f"  mean R² = {mean_e:.3f}",
+            f"  mean = {mean_e:.3f}",
             ha="left", va="top", fontsize=8.5, color=PROMOTED_COLOR,
         )
-        ax_e.set_xlabel("R²")
+        ax_e.set_xlabel(quality_label)
         ax_e.set_title(
             "EHR side: per-column reconstruction "
             f"(top + bottom {max_ehr_rows})",
@@ -1535,13 +1555,22 @@ def overview(
         a_z = (panels.A - model.mean_G) / model.std_G
         b_z = (panels.B - model.mean_E) / model.std_E
         ss_res_a = np.sum((a_z - a_hat) ** 2, axis=0)
-        ss_tot_a = np.maximum(np.sum(a_z ** 2, axis=0), 1e-12)
+        ss_tot_a = np.sum((a_z - a_z.mean(axis=0, keepdims=True)) ** 2, axis=0)
+        ss_tot_a = np.where(ss_tot_a > 1e-12, ss_tot_a, np.nan)
         r2_g_arr = 1.0 - ss_res_a / ss_tot_a
-        ss_res_b = np.sum((b_z - b_hat) ** 2, axis=0)
-        ss_tot_b = np.maximum(np.sum(b_z ** 2, axis=0), 1e-12)
-        r2_e_arr = 1.0 - ss_res_b / ss_tot_b
+        # EHR side: mixed-likelihood, so compute per-kind reconstruction
+        # quality (R^2 for gaussian/count, Brier-lift for binary) rather
+        # than comparing z-scored targets to logits/log-rates.
+        gaussian_e, binary_e, count_e = _ehr_kind_masks(
+            model.ehr_feature_kinds, model.m_E
+        )
+        r2_e_arr = _ehr_recon_per_column(
+            b_z, panels.B, b_hat,
+            gaussian=gaussian_e, binary=binary_e, count=count_e,
+            mean_E=model.mean_E,
+        )
         bp = ax_d.boxplot(
-            [r2_g_arr, r2_e_arr],
+            [r2_g_arr[np.isfinite(r2_g_arr)], r2_e_arr[np.isfinite(r2_e_arr)]],
             positions=[0, 1], widths=0.55,
             patch_artist=True, showfliers=False,
         )
@@ -1560,8 +1589,9 @@ def overview(
             median.set_linewidth(1.6)
         rng = np.random.default_rng(1)
         for i, vals in enumerate([r2_g_arr, r2_e_arr]):
-            j = rng.uniform(-0.18, 0.18, size=vals.size)
-            ax_d.scatter(np.full(vals.size, i) + j, vals, s=8,
+            finite = vals[np.isfinite(vals)]
+            j = rng.uniform(-0.18, 0.18, size=finite.size)
+            ax_d.scatter(np.full(finite.size, i) + j, finite, s=8,
                          color=_darken([GENOME_COLOR, EHR_COLOR][i], 0.25),
                          alpha=0.55, edgecolors="none")
         ax_d.set_xticks([0, 1])
@@ -1569,7 +1599,7 @@ def overview(
             [f"genome\nm={r2_g_arr.size}", f"EHR\nm={r2_e_arr.size}"],
             fontsize=9.5,
         )
-        ax_d.set_ylabel("R² per column")
+        ax_d.set_ylabel("reconstruction quality (R² / Brier lift)")
         ax_d.set_title("D. Reconstruction quality",
                        loc="left", fontsize=11, fontweight="bold")
         _faint_grid(ax_d, axis="y")

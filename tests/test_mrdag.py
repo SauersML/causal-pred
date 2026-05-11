@@ -111,14 +111,14 @@ def test_entries_outside_mr_set_are_nan(mrdag_result):
 
 def test_bmi_to_t2d_high(mrdag_result):
     pi = mrdag_result.pi
-    val = pi[NODE_INDEX["BMI"], NODE_INDEX["T2D"]]
+    val = pi[NODE_INDEX["bmi"], NODE_INDEX["type2_diabetes"]]
     assert np.isfinite(val)
     assert val > 0.7, f"Expected BMI->T2D > 0.7, got {val:.3f}"
 
 
 def test_physical_activity_to_t2d_direct_low(mrdag_result):
     pi = mrdag_result.pi
-    val = pi[NODE_INDEX["physical_activity"], NODE_INDEX["T2D"]]
+    val = pi[NODE_INDEX["physical_activity"], NODE_INDEX["type2_diabetes"]]
     assert np.isfinite(val)
     assert val < 0.3, f"Expected physical_activity->T2D < 0.3, got {val:.3f}"
 
@@ -179,20 +179,20 @@ def test_diagnostics_present(mrdag_result):
 def test_opengwas_cached_summary_loads():
     g = _load_cached_gwas()
     assert g.betas.shape == g.ses.shape
-    i_bmi = g.exposure_index("BMI")
-    j_t2d = g.outcome_index("T2D")
+    i_bmi = g.exposure_index("bmi")
+    j_t2d = g.outcome_index("type2_diabetes")
     assert np.isfinite(g.betas[i_bmi, j_t2d])
     assert g.betas[i_bmi, j_t2d] > 0.4, (
         f"BMI->T2D IVW beta should be > 0.4, got {g.betas[i_bmi, j_t2d]}"
     )
     # Circular pairs are dropped.
-    i_hba = g.exposure_index("HbA1c")
+    i_hba = g.exposure_index("hba1c")
     assert np.isnan(g.betas[i_hba, j_t2d])
-    i_sbp = g.exposure_index("systolic_BP")
+    i_sbp = g.exposure_index("systolic_bp")
     j_htn = g.outcome_index("hypertension")
     assert np.isnan(g.betas[i_sbp, j_htn])
     i_htn = g.exposure_index("hypertension")
-    j_sbp = g.outcome_index("systolic_BP")
+    j_sbp = g.outcome_index("systolic_bp")
     assert np.isnan(g.betas[i_htn, j_sbp])
 
 
@@ -208,10 +208,10 @@ def test_run_mrdag_on_cached_opengwas_summary():
         thin=5,
     )
     assert res.pi.shape == (N_NODES, N_NODES)
-    bmi_t2d = res.pi[NODE_INDEX["BMI"], NODE_INDEX["T2D"]]
+    bmi_t2d = res.pi[NODE_INDEX["bmi"], NODE_INDEX["type2_diabetes"]]
     assert np.isfinite(bmi_t2d)
     assert bmi_t2d > 0.7, f"opengwas BMI->T2D = {bmi_t2d:.3f}"
-    pa_t2d = res.pi[NODE_INDEX["physical_activity"], NODE_INDEX["T2D"]]
+    pa_t2d = res.pi[NODE_INDEX["physical_activity"], NODE_INDEX["type2_diabetes"]]
     assert np.isfinite(pa_t2d)
     assert pa_t2d < 0.3, f"opengwas physical_activity->T2D = {pa_t2d:.3f}"
 
