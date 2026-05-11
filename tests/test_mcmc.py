@@ -19,9 +19,9 @@ import numpy as np
 import pytest
 
 from causal_pred.data.nodes import CANONICAL_EDGES, NODE_INDEX, N_NODES
+from causal_pred.graph import is_dag as _is_dag
 from causal_pred.mcmc.structure_mcmc import (
     MCMCResult,
-    _is_dag,
     _rhat_edgewise,
     run_structure_mcmc,
 )
@@ -103,7 +103,6 @@ def test_allowed_edges_are_structural():
         hybrid_prob=0.4,
         edge_resample_prob=0.4,
         max_parents=2,
-        exact_parent_resample=True,
         allowed_edges=allowed,
     )
 
@@ -449,7 +448,6 @@ def test_rhat_diagnostic_is_bounded(medium_data):
         thin=2,
         n_chains=3,
         hybrid_prob=0.1,
-        resample_flip=0.01,
         rng=np.random.default_rng(11),
         **_survival_hyper(medium_data),
     )
@@ -509,7 +507,6 @@ def test_hybrid_move_accepts(medium_data):
         thin=1,
         n_chains=1,
         hybrid_prob=1.0,
-        resample_flip=0.05,
         rng=np.random.default_rng(3),
         **_survival_hyper(medium_data),
     )
@@ -551,7 +548,6 @@ def test_accept_rate_improves(medium_data):
         start,
         _empty_prior(p),
         hybrid_prob=0.5,
-        resample_flip=0.05,
         rng=np.random.default_rng(0),
         **_survival_hyper(medium_data),
         **common,

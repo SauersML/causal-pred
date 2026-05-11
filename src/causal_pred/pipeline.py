@@ -107,11 +107,8 @@ MCMC_SAMPLES = 500
 MCMC_BURN_IN = 250
 MCMC_THIN = 2
 MCMC_CHAINS = 2
-MCMC_BLOCK_RESAMPLE_PROB = 0.0
 MCMC_EDGE_RESAMPLE_PROB = 0.9
 MCMC_PARENT_RESAMPLE_PROB = 0.05
-MCMC_BLOCK_SIZE = 3
-MCMC_EXACT_PARENT_RESAMPLE = True
 MCMC_PROGRESS_INTERVAL = 100
 THRESHOLD_DEFAULT = 0.5
 
@@ -1085,11 +1082,8 @@ def _pipeline_config() -> dict[str, Any]:
             "burn_in": MCMC_BURN_IN,
             "thin": MCMC_THIN,
             "chains": MCMC_CHAINS,
-            "block_resample_prob": MCMC_BLOCK_RESAMPLE_PROB,
-            "block_size": MCMC_BLOCK_SIZE,
             "edge_resample_prob": MCMC_EDGE_RESAMPLE_PROB,
             "parent_resample_prob": MCMC_PARENT_RESAMPLE_PROB,
-            "exact_parent_resample": MCMC_EXACT_PARENT_RESAMPLE,
             "progress_interval": MCMC_PROGRESS_INTERVAL,
             "max_parents": DAGSLAM_MAX_PARENTS,
         },
@@ -3247,8 +3241,7 @@ def _load_or_run_mcmc(
         "[mcmc] running posterior structure sampler n=%d p=%d "
         "start_edges=%d allowed_edges=%d samples_per_chain=%d burn_in=%d "
         "thin=%d chains=%d total_iters=%d move_probs(edge_gibbs=%.2f "
-        "parent=%.2f block=%.2f single_edge=%.2f) exact_parent=%s "
-        "max_parents=%d progress_interval=%d",
+        "parent=%.2f single_edge=%.2f) max_parents=%d progress_interval=%d",
         data.n,
         data.p,
         int(np.asarray(start_adj, dtype=int).sum()),
@@ -3260,14 +3253,7 @@ def _load_or_run_mcmc(
         total_iters_per_chain * MCMC_CHAINS,
         float(MCMC_EDGE_RESAMPLE_PROB),
         float(MCMC_PARENT_RESAMPLE_PROB),
-        float(MCMC_BLOCK_RESAMPLE_PROB),
-        float(
-            1.0
-            - MCMC_BLOCK_RESAMPLE_PROB
-            - MCMC_EDGE_RESAMPLE_PROB
-            - MCMC_PARENT_RESAMPLE_PROB
-        ),
-        bool(MCMC_EXACT_PARENT_RESAMPLE),
+        float(1.0 - MCMC_EDGE_RESAMPLE_PROB - MCMC_PARENT_RESAMPLE_PROB),
         int(DAGSLAM_MAX_PARENTS),
         int(MCMC_PROGRESS_INTERVAL),
     )
@@ -3277,6 +3263,7 @@ def _load_or_run_mcmc(
         node_types=data.node_types,
         start_adj=start_adj,
         pi_prior=pi_prior,
+        max_parents=DAGSLAM_MAX_PARENTS,
         n_samples=MCMC_SAMPLES,
         burn_in=MCMC_BURN_IN,
         thin=MCMC_THIN,
@@ -3284,12 +3271,8 @@ def _load_or_run_mcmc(
         rng=np.random.default_rng(PIPELINE_SEED + 3),
         progress=lambda payload: _log_mcmc_progress_event(logger, payload),
         progress_interval=MCMC_PROGRESS_INTERVAL,
-        block_resample_prob=MCMC_BLOCK_RESAMPLE_PROB,
-        block_size=MCMC_BLOCK_SIZE,
         edge_resample_prob=MCMC_EDGE_RESAMPLE_PROB,
         hybrid_prob=MCMC_PARENT_RESAMPLE_PROB,
-        exact_parent_resample=MCMC_EXACT_PARENT_RESAMPLE,
-        max_parents=DAGSLAM_MAX_PARENTS,
         allowed_edges=allowed_edges,
         survival_time=data.time,
         survival_event=data.event,

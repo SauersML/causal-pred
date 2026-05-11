@@ -20,12 +20,14 @@ import pytest
 
 from causal_pred.data.nodes import NODE_INDEX, NODE_NAMES, N_NODES
 from causal_pred.data.gwas import MR_EXPOSURES, MR_OUTCOMES
+from causal_pred.graph import (
+    is_reachable as _is_reachable,
+    would_create_cycle as _creates_cycle_if_add,
+)
 from causal_pred.mrdag.pipeline import (
     run_mrdag,
     MrDAGResult,
     _compute_T,
-    _creates_cycle_if_add,
-    _is_reachable,
     _rhat_per_edge,
 )
 

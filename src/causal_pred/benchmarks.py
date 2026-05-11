@@ -641,8 +641,6 @@ def run_causal_pred(
         perturb_flips=2,
         hybrid_prob=0.1,
         edge_resample_prob=0.2,
-        block_resample_prob=0.0,
-        exact_parent_resample=False,
         max_parents=3,
         allowed_edges=allowed_edges,
         survival_time=data.time[train_idx],

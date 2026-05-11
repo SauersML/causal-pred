@@ -27,9 +27,9 @@ from causal_pred.data.nodes import (
 )
 from causal_pred.dagslam.search import (
     DAGSLAMResult,
-    _is_dag,
     run_dagslam,
 )
+from causal_pred.graph import is_dag as _is_dag
 from causal_pred.scoring.mixed import score_dag
 
 
