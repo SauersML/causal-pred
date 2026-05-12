@@ -98,8 +98,16 @@ MRDAG_N_ITER = 6000
 MRDAG_N_CHAINS = 4
 MRDAG_N_BURN = 1000
 MRDAG_THIN = 5
+# MrDAG per-edge Bernoulli prior: probability that any candidate edge is
+# present a priori, before MR evidence updates it. 0.05 (the old default)
+# encoded a sparse-DAG belief that fights against weak MR signal; 0.5 is
+# non-informative and lets the data alone drive the per-edge posterior.
+# Combined with the bumped DAGSLAM_MAX_PARENTS=5, this gives structure
+# MCMC room to consider richer parent sets where the data leaves
+# legitimate uncertainty.
+MRDAG_PRIOR_INCL = 0.5
 
-DAGSLAM_MAX_PARENTS = 3
+DAGSLAM_MAX_PARENTS = 5
 DAGSLAM_MAX_ITER = 500
 DAGSLAM_RESTARTS = 3
 
@@ -136,7 +144,7 @@ MCMC_PERTURB_FLIPS = 15
 #
 # This is the production cohort size; the full-cohort run is not a config
 # option. If you want to validate against the full cohort, fork a branch.
-SUBSAMPLE_N = 10000
+SUBSAMPLE_N = 3000
 SUBSAMPLE_SEED_OFFSET = 99
 
 THRESHOLD_DEFAULT = 0.5
@@ -1084,6 +1092,7 @@ def _pipeline_config() -> dict[str, Any]:
             "n_chains": MRDAG_N_CHAINS,
             "n_burn": MRDAG_N_BURN,
             "thin": MRDAG_THIN,
+            "prior_incl": MRDAG_PRIOR_INCL,
         },
         "dagslam": {
             "max_parents": DAGSLAM_MAX_PARENTS,
@@ -3104,6 +3113,7 @@ def _load_or_run_mrdag(
         n_chains=MRDAG_N_CHAINS,
         n_burn=MRDAG_N_BURN,
         thin=MRDAG_THIN,
+        prior_incl=MRDAG_PRIOR_INCL,
     )
     diagnostics = dict(result.diagnostics)
     diagnostics["runtime_s"] = time.time() - t0
