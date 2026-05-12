@@ -1328,9 +1328,14 @@ def resolve_aou_genotypes(
 
 
 def _has_genotype_triple(d: Path) -> bool:
-    return all(
-        (d / f).is_file() and (d / f).stat().st_size > 0 for f in AOU_GENOTYPE_FILES
-    )
+    for f in AOU_GENOTYPE_FILES:
+        p = d / f
+        if p.is_file() and p.stat().st_size > 0:
+            continue
+        if p.with_suffix(p.suffix + ".sha256").is_file():
+            continue
+        return False
+    return True
 
 
 def discover_genotype_dir(extra: Sequence[str | os.PathLike] = ()) -> Optional[Path]:
