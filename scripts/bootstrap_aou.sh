@@ -133,15 +133,22 @@ if ps -ef | grep -E "run_full_pipeline|joblib.externals.loky" | grep -v grep >/d
 fi
 
 # 7. pipeline ----------------------------------------------------------------
-# Log what code we are about to run so any "did my pull take effect" question
-# can be answered from this terminal alone, no follow-up commands needed.
+# Always mirror stdout+stderr to bootstrap.log so the status-check cell can
+# read the Rust optimizer trace, BFGS convergence lines and panic messages
+# *without* relying on the operator remembering to `tee` the invocation.
+# Forgetting the tee made every silent worker death unrecoverable post-hoc;
+# baking it into the script is the only way to make that impossible.
+BOOTSTRAP_LOG="$REPO_DIR/bootstrap.log"
 log "git head before launch: $(git -C "$REPO_DIR" log --oneline -1)"
 log "gam/survival.py k=5 grep matches: $(grep -c 'k=5' "$REPO_DIR/src/causal_pred/gam/survival.py")"
-log "running real AoU causal pipeline"
+log "running real AoU causal pipeline (mirroring to $BOOTSTRAP_LOG)"
 # -u forces unbuffered stdout/stderr. PYTHONUNBUFFERED is also set inside the
 # pipeline entrypoint as a belt-and-suspenders so progress logs from
 # DAGSLAM / MCMC / BMA appear in real time on this non-TTY harness instead
-# of sitting in the OS pipe buffer for minutes.
-PYTHONUNBUFFERED=1 uv run python -u scripts/run_full_pipeline.py
+# of sitting in the OS pipe buffer for minutes. `stdbuf -oL -eL` line-buffers
+# the `tee` side so partial Rust log lines don't sit in the pipe for hours.
+PYTHONUNBUFFERED=1 stdbuf -oL -eL uv run python -u scripts/run_full_pipeline.py 2>&1 \
+    | stdbuf -oL -eL tee "$BOOTSTRAP_LOG"
+# `pipefail` is on (`set -euo pipefail`), so a nonzero pipeline exit propagates.
 
 log "done. artefacts in $REPO_DIR/outputs"
