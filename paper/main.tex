@@ -408,40 +408,6 @@ Thus, the \texttt{gamfit} stage serves as the final prediction layer of the agen
 
 \begin{table}[H]
 \centering
-\begin{tabular}{lr}
-\toprule
-Metric & Value \\
-\midrule
-Samples $n$                & \nSamples{} \\
-Nodes $p$                  & \nNodes{} \\
-Event rate                 & \eventRate{} \\
-AUROC                      & \auroc{} \\
-Time-dep.\ AUC @ 5y        & \aurocFive{} \\
-Time-dep.\ AUC @ 10y       & \aurocTen{} \\
-Time-dep.\ AUC @ 15y       & \aurocFifteen{} \\
-Brier                      & \brier{} \\
-Integrated Brier           & \ibs{} \\
-Nagelkerke $R^2$           & \nagelkerke{} \\
-Expected calibration error & \ece{} \\
-Edge recall                & \edgeRecall{} \\
-Edge AUROC                 & \edgeAuroc{} \\
-MCMC samples/chain         & \mcmcIter{} \\
-MCMC chains                & \mcmcChains{} \\
-$\hat{R}_{\max}$           & \mcmcRhat{} \\
-Mean acceptance            & \mcmcAccept{} \\
-Runtime (s)                & \runtimeSeconds{} \\
-\bottomrule
-\end{tabular}
-\caption{Headline metrics, stamped from \texttt{outputs/summary.json} at
-build time.}
-\end{table}
-
-\subsection{Benchmark comparison}
-
-Table~\ref{tab:benchmarks} compares Causal-Pred to four standard baselines on the same synthetic cohort: Kaplan--Meier with no covariates, Cox proportional hazards over all covariates, a naive logistic regression trained on the ten-year event indicator, and a naive Bonferroni-thresholded MR--IVW edge classifier \citep{DaveySmith2014}. Kaplan--Meier is reported for completeness -- every individual shares the marginal survival curve, so its discrimination metrics are degenerate by construction. MR--IVW does not produce a survival curve and is included only on the edge-recovery column. Causal-Pred is the only entry that produces both individual-level survival and a structural-edge posterior.
-
-\begin{table}[H]
-\centering
 \begin{tabular}{lrrrr}
 \toprule
 Model & Nagelkerke $R^2$ @ 10y & td-AUC @ 10y & IBS & Edge AUPRC \\
@@ -467,13 +433,6 @@ MR--IVW (Bonferroni)     & ---                       & ---                  & --
 \paragraph{Benchmark comparison.}
 We compared the full pipeline against Kaplan--Meier and Cox proportional hazards baselines on various metrics, using two GAM backends. On the gamfit backend, Causal-Pred attains the best Nagelkerke $R^2$ at 10 years (0.245 vs.\ 0.186 logistic, 0.167 Cox), the best ten-year time-dependent AUC (0.828 vs.\ 0.745, 0.741), and the lowest integrated Brier score among survival models (0.127 vs.\ 0.132, 0.141), with an edge AUPRC of 0.546 against 0.530 for MR--IVW. On the R mgcv/gamlss backend, which does not include posterior sampling, performance is lower: Cox PH is the best (Nagelkerke 0.312, td-AUC 0.807, IBS 0.121), and Causal-Pred edge recovery is AUPRC 0.586 and AUROC 0.809. This may indicate that better uncertainty allows also for increased discrimination due to the maximum a posteriori estimates becoming more accurate.
 
-\section{Discussion (finish once we have full results)}
-
-\paragraph{Limitations}
-All of Us individual-level data are accessible inside the Researcher Workbench \citep{AllofUs2024}. The above section is on a synthetic biobank-shape cohort with a known ground-truth DAG, which is useful since the causal structure in the real world is not known. On real data, HbA1c was discovered as a strong risk factor. This is also used to diagnose type 2 diabetes, which complicates the interpretation.
-
-\paragraph{Prior work on causal priors}
-Our edge-inclusion prior is informed by published Mendelian-randomization evidence (e.g.\ \citealt{Fall2015, Xue2018, Ference2017}). Where no published IVW estimate is available, the prior is left non-informative and not imputed, so the structural posterior is never biased by unattributed prior claims \citep{DaveySmith2014}.
 
 \section{Reproducibility}
 
