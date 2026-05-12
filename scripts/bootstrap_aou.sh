@@ -165,16 +165,4 @@ log "regenerating standalone figures"
 PYTHONUNBUFFERED=1 stdbuf -oL -eL uv run python -u scripts/generate_figures.py 2>&1 \
     | stdbuf -oL -eL tee -a "$BOOTSTRAP_LOG"
 
-# 10. paper: copy figures into paper/figures/, stamp summary+benchmark
-#     macros into main.tex, build the PDF if latexmk/pdflatex is present.
-#     We invoke `figures` + `quick` directly (not `paper`) because `paper`
-#     re-runs the pipeline, which we have just finished.
-log "building paper (figures + quick)"
-if command -v make >/dev/null 2>&1; then
-    make -C paper figures 2>&1 | stdbuf -oL -eL tee -a "$BOOTSTRAP_LOG"
-    make -C paper quick   2>&1 | stdbuf -oL -eL tee -a "$BOOTSTRAP_LOG"
-else
-    log "WARNING: make not on PATH; skipping paper build"
-fi
-
-log "done. artefacts in $REPO_DIR/outputs and $REPO_DIR/paper"
+log "done. artefacts in $REPO_DIR/outputs"
