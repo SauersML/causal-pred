@@ -2846,10 +2846,11 @@ def _load_or_run_genscore_features(
     brier_lift = float(recon_metrics["brier_lift_vs_prior"])
     r2_e_count = float(recon_metrics["r2_ehr_count_logspace"])
 
-    rg_q = np.quantile(r_G, [0.0, 0.25, 0.5, 0.75, 1.0])
+    quartiles = [0.0, 0.25, 0.5, 0.75, 1.0]
+    rg_q = np.quantile(r_G, quartiles)
     rate_alive = activation_rate_all[~dead_mask_all]
     if rate_alive.size > 0:
-        rate_q = np.quantile(rate_alive, [0.0, 0.25, 0.5, 0.75, 1.0])
+        rate_q = np.quantile(rate_alive, quartiles)
     else:
         rate_q = np.zeros(5)
 
@@ -3878,8 +3879,8 @@ def _median_probability_parent_set(
     samples: np.ndarray,
     target_idx: int,
 ) -> tuple[int, ...]:
-    max_parents = int(globals().get("SURVIVAL_GAM_MAX_PARENTS", 6))
-    min_edge_prob = float(globals().get("SURVIVAL_GAM_MIN_EDGE_PROB", 0.5))
+    max_parents = SURVIVAL_GAM_MAX_PARENTS
+    min_edge_prob = SURVIVAL_GAM_MIN_EDGE_PROB
     edge_probs = samples.astype(float).mean(axis=0)
     probs = edge_probs[:, target_idx].copy()
     probs[target_idx] = 0.0

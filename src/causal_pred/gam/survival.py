@@ -23,11 +23,6 @@ logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[str], None]
 
 _SURVIVAL_ENTRY_ORIGIN = 1.0
-_SURVIVAL_LIKELIHOOD = "location-scale"
-_SURVIVAL_BASELINE_TARGET = "gompertz-makeham"
-_SURVIVAL_MODEL_FAMILY = "gamlss-location-scale"
-_UNCERTAINTY_MODE = "gamfit_gamlss_delta_method_response_se"
-_UNCERTAINTY_SOURCE = "gamfit.SurvivalPrediction.survival_se_at"
 
 
 def _progress_callback(progress: bool | ProgressCallback) -> Optional[ProgressCallback]:
@@ -133,15 +128,15 @@ def _fit_gam(
         emit(
             "fit start "
             f"n={time.shape[0]} events={int(np.sum(event > 0.0))} "
-            f"p={len(columns)} likelihood={_SURVIVAL_LIKELIHOOD} "
-            f"baseline={_SURVIVAL_BASELINE_TARGET} formula={formula} "
+            f"p={len(columns)} likelihood=location-scale "
+            f"baseline=gompertz-makeham formula={formula} "
             f"noise_formula={sigma_rhs}"
         )
     model = gam.fit(
         df,
         formula,
-        survival_likelihood=_SURVIVAL_LIKELIHOOD,
-        baseline_target=_SURVIVAL_BASELINE_TARGET,
+        survival_likelihood="location-scale",
+        baseline_target="gompertz-makeham",
         config={"noise_formula": sigma_rhs},
     )
     train_summary: Dict[str, Any] = dict(model.summary().to_dict())
@@ -169,8 +164,8 @@ def _fit_gam(
         formula=formula,
         location_formula=location_rhs,
         train_summary=train_summary,
-        survival_likelihood=_SURVIVAL_LIKELIHOOD,
-        baseline_target=_SURVIVAL_BASELINE_TARGET,
+        survival_likelihood="location-scale",
+        baseline_target="gompertz-makeham",
         noise_formula=sigma_rhs,
         x_center=x_center.astype(float, copy=True),
         x_scale=x_scale.astype(float, copy=True),
@@ -517,8 +512,8 @@ class SurvivalGAM:
     def uncertainty_summary(self) -> dict:
         d = dict(self.diagnostics)
         d["n_uncertainty_slices"] = int(self._n_uncertainty_slices)
-        d["uncertainty_mode"] = _UNCERTAINTY_MODE
-        d["uncertainty_source"] = _UNCERTAINTY_SOURCE
+        d["uncertainty_mode"] = "gamfit_gamlss_delta_method_response_se"
+        d["uncertainty_source"] = "gamfit.SurvivalPrediction.survival_se_at"
         if self._fit is not None:
             d["survival_likelihood"] = self._fit.survival_likelihood
             d["baseline_target"] = self._fit.baseline_target
@@ -595,7 +590,7 @@ def fit_survival_gam(
 
     diagnostics = {
         "backend": "gamfit",
-        "model_family": _SURVIVAL_MODEL_FAMILY,
+        "model_family": "gamlss-location-scale",
         "library_version": gam.build_info().get("version"),
         "formula": fit.formula,
         "location_formula": fit.location_formula,
@@ -614,8 +609,8 @@ def fit_survival_gam(
         "survival_likelihood": fit.survival_likelihood,
         "baseline_target": fit.baseline_target,
         "n_uncertainty_slices": int(n_uncertainty_slices),
-        "uncertainty_mode": _UNCERTAINTY_MODE,
-        "uncertainty_source": _UNCERTAINTY_SOURCE,
+        "uncertainty_mode": "gamfit_gamlss_delta_method_response_se",
+        "uncertainty_source": "gamfit.SurvivalPrediction.survival_se_at",
     }
 
     return SurvivalGAM(

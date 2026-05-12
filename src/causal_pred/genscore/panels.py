@@ -169,11 +169,9 @@ def download_panel(
     gzip_suffix = f"{text_suffix}.gz"
     total = len(ids)
 
-    def _emit(msg: str) -> None:
-        if progress is not None:
-            progress(msg)
+    emit: Callable[[str], None] = progress if progress is not None else (lambda _msg: None)
 
-    _emit(
+    emit(
         f"download_panel: {total} PGS scoring files into {out} "
         f"(workers={n_workers}, timeout={timeout}s, build={build})"
     )
@@ -208,7 +206,7 @@ def download_panel(
                 _InvalidScoreFile,
             ) as exc:
                 errors.append(exc)
-                _emit(
+                emit(
                     f"[{completed}/{total}] FAILED {pgs_id}: {exc!r}"
                 )
                 continue
@@ -218,13 +216,13 @@ def download_panel(
             else:
                 downloaded_n += 1
                 bytes_downloaded += nbytes
-            _emit(
+            emit(
                 f"[{completed}/{total}] {status} {pid} "
                 f"({nbytes / (1 << 20):.2f} MiB in {elapsed:.1f}s) "
                 f"[cached={cached_n} downloaded={downloaded_n} failed={len(errors)}]"
             )
 
-    _emit(
+    emit(
         f"download_panel: done {len(paths)}/{total} files "
         f"(cached={cached_n} downloaded={downloaded_n} failed={len(errors)} "
         f"bytes_downloaded={bytes_downloaded / (1 << 20):.1f} MiB "

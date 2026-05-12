@@ -109,13 +109,6 @@ def _bin_edges(p: np.ndarray, n_bins: int, strategy: str) -> np.ndarray:
     raise ValueError(f"unknown strategy {strategy!r}")
 
 
-def _bin_assign(p: np.ndarray, edges: np.ndarray) -> np.ndarray:
-    # Assign into [edges[i], edges[i+1]); last bin closed on the right.
-    k = np.searchsorted(edges, p, side="right") - 1
-    k = np.clip(k, 0, edges.size - 2)
-    return k
-
-
 def calibration_metrics(
     y_true, p_pred, n_bins: int = 10, strategy: str = "quantile"
 ) -> dict:
@@ -146,7 +139,8 @@ def calibration_metrics(
 
     # Murphy (1973) decomposition using the binning induced by ``strategy``.
     edges = _bin_edges(p_clip, n_bins, strategy)
-    k = _bin_assign(p_clip, edges)
+    # Assign into [edges[i], edges[i+1]); last bin closed on the right.
+    k = np.clip(np.searchsorted(edges, p_clip, side="right") - 1, 0, edges.size - 2)
 
     bin_n = np.zeros(n_bins, dtype=float)
     bin_sum_p = np.zeros(n_bins, dtype=float)
