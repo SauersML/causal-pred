@@ -18,16 +18,17 @@ PDFLATEX := $(shell command -v pdflatex 2>/dev/null)
 REPO_ROOT := $(realpath ..)
 PLOT_SRC  := $(REPO_ROOT)/outputs/plots
 FIG_DST   := figures
-SUMMARY   := $(REPO_ROOT)/outputs/summary.json
+SUMMARY    := $(REPO_ROOT)/outputs/summary.json
+BENCHMARKS := $(REPO_ROOT)/outputs/benchmarks.json
 
 paper:
 	uv run python $(REPO_ROOT)/scripts/run_full_pipeline.py
-	uv run python build_paper.py --summary $(SUMMARY) --tex main.tex --out main.tex
+	uv run python build_paper.py --summary $(SUMMARY) --summary $(BENCHMARKS) --tex main.tex --out main.tex
 	$(MAKE) figures
 	$(MAKE) quick
 
 quick:
-	uv run python build_paper.py --summary $(SUMMARY) --tex main.tex --out main.tex
+	uv run python build_paper.py --summary $(SUMMARY) --summary $(BENCHMARKS) --tex main.tex --out main.tex
 ifneq ($(LATEXMK),)
 	$(LATEXMK) -pdf -interaction=nonstopmode -halt-on-error main.tex
 else

@@ -207,36 +207,37 @@ def _normalise_pipeline_summary(summary: dict) -> None:
     data = summary.get("data_summary")
     if isinstance(data, Mapping):
         dataset = summary.setdefault("dataset", {})
-        dataset.setdefault("n", data.get("n"))
-        dataset.setdefault("p", data.get("p"))
-        dataset.setdefault("event_rate", data.get("event_rate"))
+        if data.get("n") is not None:
+            dataset["n"] = data.get("n")
+        if data.get("p") is not None:
+            dataset["p"] = data.get("p")
+        if data.get("event_rate") is not None:
+            dataset["event_rate"] = data.get("event_rate")
 
     validation = summary.get("validation")
     if isinstance(validation, Mapping):
-        survival = validation.get("survival") or {}
         edge = validation.get("known_edge_recovery") or {}
         metrics = summary.setdefault("metrics", {})
-        if isinstance(survival, Mapping):
-            metrics.setdefault("nagelkerke_r2", survival.get("nagelkerke_r2_at_10y"))
-            cal = survival.get("calibration_at_10y") or {}
-            if isinstance(cal, Mapping):
-                metrics.setdefault("brier", cal.get("brier"))
-                metrics.setdefault("ece", cal.get("ece"))
-            br = survival.get("brier") or {}
-            if isinstance(br, Mapping):
-                metrics.setdefault("ibs", br.get("ibs"))
-            td = survival.get("time_dependent_auc") or {}
-            if isinstance(td, Mapping):
-                times = td.get("times") or []
-                aucs = td.get("auc") or []
-                by_time = {}
-                for t, a in zip(times, aucs):
-                    try:
-                        by_time[str(int(round(float(t))))] = a
-                    except (TypeError, ValueError):
-                        continue
-                metrics.setdefault("time_dep_auc", by_time)
-                metrics.setdefault("auroc", td.get("integrated_auc"))
+        metrics.setdefault("nagelkerke_r2", validation.get("nagelkerke_r2_at_10y"))
+        cal = validation.get("calibration_at_10y") or {}
+        if isinstance(cal, Mapping):
+            metrics.setdefault("brier", cal.get("brier"))
+            metrics.setdefault("ece", cal.get("ece"))
+        br = validation.get("brier") or {}
+        if isinstance(br, Mapping):
+            metrics.setdefault("ibs", br.get("ibs"))
+        td = validation.get("time_dependent_auc") or {}
+        if isinstance(td, Mapping):
+            times = td.get("times") or []
+            aucs = td.get("auc") or []
+            by_time = {}
+            for t, a in zip(times, aucs):
+                try:
+                    by_time[str(int(round(float(t))))] = a
+                except (TypeError, ValueError):
+                    continue
+            metrics.setdefault("time_dep_auc", by_time)
+            metrics.setdefault("auroc", td.get("integrated_auc"))
         if isinstance(edge, Mapping):
             metrics.setdefault("edge_auroc", edge.get("auroc"))
             metrics.setdefault("edge_auprc", edge.get("auprc"))
