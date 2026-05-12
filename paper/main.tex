@@ -344,7 +344,6 @@ The \texttt{gamfit} Python library was created to implement this survival model 
 \[
 \texttt{Surv(entry, exit, event)} \sim s(x_1) + s(x_2) + \cdots + s(x_m).
 \]
-If no parents are selected, the model reduces to an intercept-only survival model.
 
 The data are represented using start-stop survival notation. Each subject has an entry time, an exit time, and an event indicator. The implementation uses a fixed artificial entry origin and sets
 \[
