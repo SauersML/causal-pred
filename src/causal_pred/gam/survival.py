@@ -41,13 +41,13 @@ def _progress_callback(progress: bool | ProgressCallback) -> Optional[ProgressCa
 def _build_survival_formula(columns: Sequence[str]) -> str:
     if not columns:
         raise ValueError("survival GAM requires at least one parent column")
-    return " + ".join(f"s({c})" for c in columns)
+    return " + ".join(f"s({c}, k=5)" for c in columns)
 
 
 def _build_noise_formula(columns: Sequence[str]) -> str:
     if not columns:
         raise ValueError("survival GAM noise predictor requires at least one parent column")
-    return " + ".join(f"s({c})" for c in columns)
+    return " + ".join(f"s({c}, k=5)" for c in columns)
 
 
 @dataclass
