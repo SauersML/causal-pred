@@ -126,16 +126,6 @@ MCMC_PROGRESS_INTERVAL = 100
 # moves. ~15 flips is ~20% of an ~80-edge DAG -- aggressive enough to
 # test mixing without launching from absurdly-low-likelihood starts.
 MCMC_PERTURB_FLIPS = 15
-# Top-K predecessors per node retained for exact parent-set Gibbs.
-# With DAGSLAM_MAX_PARENTS=5 and ~30 candidates per node, enumeration is
-# sum_k C(30, k) for k in 0..5 ~= 175k parent sets -- 30x the cost of
-# cap=3 unpruned. Pruning each node's candidate pool to its top-K
-# predecessors by MrDAG prior log-odds collapses this to ~sum_k C(K, k):
-# at K=12 the enumeration shrinks to ~1.6k sets, far below cap=3's 6k.
-# The MH single-edge moves keep pruned candidates reachable, so the
-# chain remains ergodic over the full DAG space; only the Gibbs
-# conditional is restricted. Set to None to disable pruning.
-MCMC_MAX_CANDIDATES_PER_NODE = 12
 
 # Cohort subsample for causal structure learning.
 # At biobank scale the per-edge log Bayes factor between competing parent
@@ -1118,7 +1108,6 @@ def _pipeline_config() -> dict[str, Any]:
             "parent_resample_prob": MCMC_PARENT_RESAMPLE_PROB,
             "progress_interval": MCMC_PROGRESS_INTERVAL,
             "perturb_flips": MCMC_PERTURB_FLIPS,
-            "max_candidates_per_node": MCMC_MAX_CANDIDATES_PER_NODE,
             "max_parents": DAGSLAM_MAX_PARENTS,
         },
         "structural_constraints": {
@@ -1127,11 +1116,10 @@ def _pipeline_config() -> dict[str, Any]:
             "promoted_crosscoder_features": "non_root_with_forbidden_target_to_feature_and_feature_to_pgs",
         },
         "subsample": {
-            # None when the full cohort is used. SUBSAMPLE_N is also folded
-            # implicitly into every downstream cache key via the data hash
-            # (data.X / data.time / data.event differ after subsampling), but
-            # we surface it here so an explicit config bump (e.g. seed change)
-            # forces a fresh causal-learning pass.
+            # SUBSAMPLE_N is folded implicitly into every downstream cache
+            # key via the data hash (data.X / data.time / data.event differ
+            # after subsampling); surfaced here so an explicit seed bump
+            # also forces a fresh causal-learning pass.
             "n": SUBSAMPLE_N,
             "seed_offset": SUBSAMPLE_SEED_OFFSET,
         },
@@ -3762,7 +3750,6 @@ def _load_or_run_mcmc(
         thin=MCMC_THIN,
         n_chains=MCMC_CHAINS,
         perturb_flips=MCMC_PERTURB_FLIPS,
-        max_candidates_per_node=MCMC_MAX_CANDIDATES_PER_NODE,
         rng=np.random.default_rng(PIPELINE_SEED + 3),
         progress=lambda payload: _log_mcmc_progress_event(logger, payload),
         progress_interval=MCMC_PROGRESS_INTERVAL,
