@@ -3278,7 +3278,7 @@ def _stratified_subsample(
     n_target: int,
     rng: np.random.Generator,
     logger: logging.Logger,
-) -> SyntheticDataset:
+) -> tuple[SyntheticDataset, np.ndarray]:
     """Stratified-on-event random subsample of the cohort.
 
     At biobank scale the structure-MCMC posterior over DAGs collapses to a
@@ -3306,7 +3306,7 @@ def _stratified_subsample(
             int(n_target),
             n_full,
         )
-        return data
+        return data, np.arange(n_full, dtype=np.int64)
     if int(n_target) < 100:
         raise ValueError(
             f"SUBSAMPLE_N={n_target} too small; need >=100 for stable "
@@ -3362,7 +3362,7 @@ def _stratified_subsample(
         event_rate,
         realized_rate,
     )
-    return sub
+    return sub, combined.astype(np.int64, copy=False)
 
 
 def _cached_allowed_edges_match(
@@ -5180,12 +5180,13 @@ def run_pipeline() -> PipelineResult:
     # hit. Only DAGSLAM / MCMC / survival-BMA see the smaller cohort. The
     # cohort hash (data.X / data.time / data.event SHA-256) changes, which
     # auto-invalidates dagslam / mcmc / survival-gam caches.
-    data = _stratified_subsample(
+    data, _sub_indices = _stratified_subsample(
         data,
         n_target=SUBSAMPLE_N,
         rng=np.random.default_rng(PIPELINE_SEED + SUBSAMPLE_SEED_OFFSET),
         logger=logger,
     )
+    kept_person_ids = np.asarray(kept_person_ids)[_sub_indices]
 
     key, dagslam = _run_dagslam_stage(
         cache, data, mrdag_prior, allowed_edges, timings, logger
