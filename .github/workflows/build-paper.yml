@@ -1,0 +1,68 @@
+name: build-paper
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'paper/**'
+      - '.github/workflows/build-paper.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-paper-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 1
+
+      - name: Cache Tectonic resources
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/Tectonic
+          key: tectonic-${{ runner.os }}-${{ hashFiles('paper/main.tex', 'paper/bib.bib') }}
+          restore-keys: |
+            tectonic-${{ runner.os }}-
+
+      - name: Setup Tectonic
+        uses: wtfjoke/setup-tectonic@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compile paper/main.tex
+        working-directory: paper
+        run: |
+          tectonic -X compile \
+            --keep-intermediates \
+            --keep-logs \
+            --synctex \
+            main.tex
+
+      - name: Commit and push PDF
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f paper/main.pdf
+          if git diff --cached --quiet; then
+            echo "No PDF changes to commit."
+            exit 0
+          fi
+          git commit -m "Build paper PDF [skip ci]"
+          # Retry-push in case main moved while we built.
+          for i in 1 2 3; do
+            git pull --rebase --autostash origin main && git push origin HEAD:main && exit 0
+            sleep 2
+          done
+          echo "Failed to push after retries" >&2
+          exit 1
