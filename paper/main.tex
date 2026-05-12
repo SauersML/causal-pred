@@ -361,7 +361,7 @@ S(t \mid x) = P(T > t \mid x)
 \]
 on a requested time grid. The implementation queries \texttt{gamfit} for survival probabilities at these horizons and clips the resulting values to the valid range $[0,1]$. It also enforces monotonicity of the survival curve over time, since survival probabilities should not increase as the time horizon grows.
 
-The wrapper also obtains response-scale standard errors for the predicted survival probabilities using \texttt{gamfit}'s survival uncertainty interface. These standard errors represent uncertainty within a fitted survival model. The implementation can convert the mean survival surface and its standard error into multiple uncertainty slices by adding normal quantiles to the response-scale survival estimates and then clipping and monotonizing the resulting curves. This gives a practical way to visualize or summarize uncertainty in predicted survival probabilities at each time horizon.
+We obtain response-scale standard errors for the predicted survival probabilities using \texttt{gamfit}'s survival uncertainty interface. These standard errors represent uncertainty within a fitted survival model. The implementation can convert the mean survival surface and its standard error into multiple uncertainty slices by adding normal quantiles to the response-scale survival estimates and then clipping and monotonizing the resulting curves. This gives a practical way to visualize or summarize uncertainty in predicted survival probabilities at each time horizon.
 
 Finally, we combine the survival model with graph uncertainty through Bayesian model averaging over posterior parent sets. Suppose the MCMC sampler produces candidate parent sets
 \[
