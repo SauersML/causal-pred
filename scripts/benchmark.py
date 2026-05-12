@@ -76,8 +76,23 @@ def _git_sha(repo_root: str) -> str:
         return "unknown"
 
 
+_BENCHMARK_DISPLAY = {
+    "kaplan_meier":   ("KM",          "#bdbdbd"),
+    "naive_logistic": ("Logistic",    "#9aa0a6"),
+    "cox_ph":         ("Cox PH",      "#1a73e8"),
+    "mr_ivw":         ("MR-IVW",      "#9aa0a6"),
+    "causal_pred":    ("causal-pred", "#d93025"),
+}
+_SURV_ORDER = ("kaplan_meier", "naive_logistic", "cox_ph", "causal_pred")
+_EDGE_ORDER = ("mr_ivw", "causal_pred")
+
+
 def _bar_chart(baselines: Dict[str, dict], out_path: str) -> None:
-    """Emit a bar chart comparing the numeric metrics across baselines."""
+    """Emit a 2x2 figure of interesting metrics across baselines:
+    integrated time-dependent AUC, Nagelkerke R^2 at 10y, scaled
+    integrated Brier (IBS / IBS_KM, lower = better), and causal-edge
+    AUROC.  Methods are colored consistently across panels.
+    """
     try:
         import matplotlib
 
@@ -87,76 +102,133 @@ def _bar_chart(baselines: Dict[str, dict], out_path: str) -> None:
         print(f"[bench] skipping plot: matplotlib unavailable ({exc})")
         return
 
-    surv_rows = []
-    edge_rows = []
-    for name, m in baselines.items():
-        if m.get("status") in ("skipped", "failed"):
-            continue
-        r2 = m.get("nagelkerke_at_10y")
-        td = m.get("time_dep_auc", {}) or {}
-        ia = td.get("integrated_auc")
-        ibs = m.get("ibs")
-        if any(v is not None and np.isfinite(v) for v in (r2, ia, ibs)):
-            surv_rows.append(
-                (
-                    name,
-                    float(r2) if r2 is not None else float("nan"),
-                    float(ia) if ia is not None else float("nan"),
-                    float(ibs) if ibs is not None else float("nan"),
-                )
-            )
-        auroc = m.get("edge_auroc")
-        auprc = m.get("edge_auprc")
-        if auroc is not None or auprc is not None:
-            edge_rows.append(
-                (
-                    name,
-                    float(auroc) if auroc is not None else float("nan"),
-                    float(auprc) if auprc is not None else float("nan"),
-                )
-            )
+    def _ok(m):
+        return m is not None and m.get("status") not in ("skipped", "failed")
+
+    def _get(name, *keys, default=float("nan")):
+        cur = baselines.get(name)
+        if not _ok(cur):
+            return default
+        for k in keys:
+            if not isinstance(cur, dict) or k not in cur:
+                return default
+            cur = cur[k]
+        return float(cur) if cur is not None else default
+
+    ibs_km = _get("kaplan_meier", "ibs")
+
+    def _row(order):
+        rows = []
+        for key in order:
+            disp, color = _BENCHMARK_DISPLAY.get(key, (key, "#4C72B0"))
+            rows.append((key, disp, color))
+        return rows
+
+    surv_rows = [r for r in _row(_SURV_ORDER) if _ok(baselines.get(r[0]))]
+    edge_rows = [r for r in _row(_EDGE_ORDER) if _ok(baselines.get(r[0]))]
 
     if not surv_rows and not edge_rows:
         print("[bench] no rows to plot")
         return
 
-    n_surv = 3 if surv_rows else 0
-    n_edge = 2 if edge_rows else 0
-    n_panels = n_surv + n_edge
-    fig, axes = plt.subplots(
-        1, n_panels, figsize=(4 * n_panels, 4.2), constrained_layout=True
+    def _annotate(ax, bars, vals, fmt="{:.3f}"):
+        ymin, ymax = ax.get_ylim()
+        pad = (ymax - ymin) * 0.015
+        for bar, v in zip(bars, vals):
+            if v != v:  # NaN
+                continue
+            y = v + pad if v >= 0 else v - pad
+            ax.text(
+                bar.get_x() + bar.get_width() / 2, y,
+                fmt.format(v),
+                ha="center", va="bottom" if v >= 0 else "top",
+                fontsize=11, fontweight="bold",
+            )
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 8), constrained_layout=True)
+
+    # Panel 1: integrated AUC
+    ax = axes[0, 0]
+    vals = [_get(k, "time_dep_auc", "integrated_auc") for k, _, _ in surv_rows]
+    bars = ax.bar(
+        [d for _, d, _ in surv_rows], vals,
+        color=[c for _, _, c in surv_rows],
+        edgecolor="black", linewidth=0.7, width=0.65,
     )
-    if n_panels == 1:
-        axes = [axes]
-    panel_idx = 0
+    ax.axhline(0.5, color="black", linestyle=":", linewidth=0.8, alpha=0.5)
+    ax.set_ylim(0.45, 0.92)
+    ax.set_ylabel("Integrated AUC")
+    ax.set_title("Discrimination  (higher = better)",
+                 fontsize=12, fontweight="bold", loc="left")
+    _annotate(ax, bars, vals)
+    ax.grid(axis="y", alpha=0.25)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
 
-    if surv_rows:
-        s_names = [r[0] for r in surv_rows]
-        s_data = np.array([[r[1], r[2], r[3]] for r in surv_rows], dtype=float)
-        s_titles = ["Nagelkerke $R^2$ @ 10y", "Integrated td-AUC", "IBS (lower = better)"]
-        for k in range(3):
-            ax = axes[panel_idx + k]
-            ax.bar(range(len(s_names)), s_data[:, k], color="#4C72B0")
-            ax.set_xticks(range(len(s_names)))
-            ax.set_xticklabels(s_names, rotation=30, ha="right")
-            ax.set_title(s_titles[k])
-            ax.grid(True, axis="y", alpha=0.3)
-        panel_idx += 3
+    # Panel 2: Nagelkerke R^2
+    ax = axes[0, 1]
+    vals = [_get(k, "nagelkerke_at_10y") for k, _, _ in surv_rows]
+    bars = ax.bar(
+        [d for _, d, _ in surv_rows], vals,
+        color=[c for _, _, c in surv_rows],
+        edgecolor="black", linewidth=0.7, width=0.65,
+    )
+    ax.axhline(0.0, color="black", linewidth=0.8)
+    vmax = max((v for v in vals if v == v), default=0.3)
+    vmin = min((v for v in vals if v == v), default=0.0)
+    ax.set_ylim(min(vmin - 0.03, -0.05), max(vmax + 0.05, 0.30))
+    ax.set_ylabel("Nagelkerke $R^2$ at 10 y")
+    ax.set_title("Explained variation  (higher = better)",
+                 fontsize=12, fontweight="bold", loc="left")
+    _annotate(ax, bars, vals)
+    ax.grid(axis="y", alpha=0.25)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
 
+    # Panel 3: scaled Brier (lower better)
+    ax = axes[1, 0]
+    scaled = [
+        (_get(k, "ibs") / ibs_km) if (ibs_km and ibs_km == ibs_km) else float("nan")
+        for k, _, _ in surv_rows
+    ]
+    bars = ax.bar(
+        [d for _, d, _ in surv_rows], scaled,
+        color=[c for _, _, c in surv_rows],
+        edgecolor="black", linewidth=0.7, width=0.65,
+    )
+    ax.axhline(1.0, color="black", linestyle=":", linewidth=0.8, alpha=0.5)
+    finite = [v for v in scaled if v == v]
+    if finite:
+        ax.set_ylim(max(0.0, min(finite) - 0.05), max(1.05, max(finite) + 0.05))
+    ax.set_ylabel("Scaled Brier (IBS / IBS$_{\\mathrm{KM}}$)")
+    ax.set_title("Calibration  (lower = better)",
+                 fontsize=12, fontweight="bold", loc="left")
+    _annotate(ax, bars, scaled)
+    ax.grid(axis="y", alpha=0.25)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+
+    # Panel 4: causal-edge AUROC
+    ax = axes[1, 1]
     if edge_rows:
-        e_names = [r[0] for r in edge_rows]
-        e_data = np.array([[r[1], r[2]] for r in edge_rows], dtype=float)
-        e_titles = ["Edge AUROC", "Edge AUPRC"]
-        for k in range(2):
-            ax = axes[panel_idx + k]
-            ax.bar(range(len(e_names)), e_data[:, k], color="#55A868")
-            ax.set_xticks(range(len(e_names)))
-            ax.set_xticklabels(e_names, rotation=30, ha="right")
-            ax.set_ylim(0.0, 1.0)
-            ax.set_title(e_titles[k])
-            ax.grid(True, axis="y", alpha=0.3)
+        vals = [_get(k, "edge_auroc") for k, _, _ in edge_rows]
+        bars = ax.bar(
+            [d for _, d, _ in edge_rows], vals,
+            color=[c for _, _, c in edge_rows],
+            edgecolor="black", linewidth=0.7, width=0.5,
+        )
+        ax.set_ylim(0.0, 1.0)
+        ax.set_ylabel("Edge AUROC")
+        ax.set_title("Causal-edge discovery  (higher = better)",
+                     fontsize=12, fontweight="bold", loc="left")
+        _annotate(ax, bars, vals)
+        ax.grid(axis="y", alpha=0.25)
+    else:
+        ax.axis("off")
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
 
-    fig.savefig(out_path, dpi=140)
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
 
 
