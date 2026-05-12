@@ -402,7 +402,7 @@ The first term represents parametric uncertainty within each fitted survival mod
 Thus, the \texttt{gamfit} stage serves as the final prediction layer of the agent. The graph-learning stages identify plausible parent sets for the T2D outcome, and the survival GAM converts those parent sets into individual-level survival curves with uncertainty from both fitted model parameters and graph structure.
 
 
-\section{Results (finish once we have full results)}
+\section{Results}
 
 \begin{table}[h]
 \centering
@@ -465,14 +465,14 @@ MR--IVW (Bonferroni)     & ---                       & ---                  & --
 \section{Discussion (finish once we have full results)}
 
 \paragraph{Limitations}
-All of Us individual-level data are only accessible inside the Researcher Workbench \citep{AllofUs2024}; the reported numbers are therefore on a synthetic biobank-shape cohort with a known ground-truth DAG. On real data, HbA1c is used both as a risk factor and, implicitly, in the adjudication of type 2 diabetes, which gives rise to a mild circularity; we flag this as a caveat and recommend using a pre-adjudication baseline HbA1c window in any real-data deployment.
+All of Us individual-level data are accessible inside the Researcher Workbench \citep{AllofUs2024}. The above section is on a synthetic biobank-shape cohort with a known ground-truth DAG, which is useful since the causal structure in the real world is not known. On real data, HbA1c was discovered as a strong risk factor. This is also used to diagnose type 2 diabetes, which complicates the interpretation.
 
 \paragraph{Prior work on causal priors}
-Our edge-inclusion prior is informed by published Mendelian-randomisation evidence (e.g.\ \citealt{Fall2015, Xue2018, Ference2017}). Where no published IVW estimate is available, the prior is left non-informative rather than imputed, so the structural posterior is never biased by unattributed prior claims \citep{DaveySmith2014}.
+Our edge-inclusion prior is informed by published Mendelian-randomisation evidence (e.g.\ \citealt{Fall2015, Xue2018, Ference2017}). Where no published IVW estimate is available, the prior is left non-informative and not imputed, so the structural posterior is never biased by unattributed prior claims \citep{DaveySmith2014}.
 
 \section{Reproducibility}
 
-All code is pinned via \texttt{uv.lock}. The GAM backend is the Rust-based \texttt{SauersML/gam} package built through \texttt{rustup}. Polygenic scoring, HWE-PCA projection, and sample-term inference shell out to the \texttt{gnomon} CLI. Every stage accepts an explicit RNG and derives child seeds deterministically. A full run is reproduced by \texttt{uv run python scripts/run\_full\_pipeline.py} followed by \texttt{make -C paper quick}.
+All code is pinned via \texttt{uv.lock}. The GAM backend is the Rust-based \texttt{SauersML/gam} package built through \texttt{rustup}. Polygenic scoring uses the \texttt{gnomon} CLI. RNGs are used. A full run is reproduced by \texttt{uv run python scripts/run\_full\_pipeline.py}.
 
 \bibliographystyle{plainnat}
 \bibliography{bib}
