@@ -57,7 +57,7 @@
 \newcommand{\DAG}{\mathcal{G}}
 \newcommand{\pa}{\mathrm{Pa}}
 
-\title{Causal Disease Modelling with Structural and Parametric Uncertainty; Type-2 Diabetes}
+\title{Causal Disease Modeling with Structural and Parametric Uncertainty; Type-2 Diabetes}
 
 \author{
 Will Beaumaster, Rabeh Masoud, Scott Sauers, Joseph Schaak, Patricia Setiani, Liwen Tang\\
@@ -96,7 +96,7 @@ The All of Us biobank is an appropriate data environment for this problem becaus
 
 \section{Background}
 
-Mendelian randomisation (MR) uses germline genotypes -- randomised at meiosis -- as instrumental variables to estimate causal effects between measured exposures \citep{DaveySmith2014, Corbin2016}. For metabolic-disease outcomes, well-replicated examples include BMI $\to$ type 2 diabetes \citep{Fall2015, Xue2018}, LDL $\to$ coronary disease \citep{Ference2017, Emdin2017}, blood pressure $\to$ cardiovascular outcomes \citep{Nazarzadeh2022}, and null/negative findings for alcohol intake \citep{Holmes2014}. Summary-data inverse-variance weighted (IVW) estimates are straightforward to aggregate across thousands of variants and form the raw input to our structural prior.
+Mendelian randomization (MR) uses germline genotypes -- randomized at meiosis -- as instrumental variables to estimate causal effects between measured exposures \citep{DaveySmith2014, Corbin2016}. For metabolic-disease outcomes, well-replicated examples include BMI $\to$ type 2 diabetes \citep{Fall2015, Xue2018}, LDL $\to$ coronary disease \citep{Ference2017, Emdin2017}, blood pressure $\to$ cardiovascular outcomes \citep{Nazarzadeh2022}, and null/negative findings for alcohol intake \citep{Holmes2014}. Summary-data inverse-variance weighted (IVW) estimates are straightforward to aggregate across thousands of variants and form the raw input to our structural prior.
 
 Because alleles are assigned approximately at random at conception, a variant is akin to a randomized treatment: any association between the variant and the outcome, via the exposure, is not due to reverse causation or by confounding of the exposure-outcome relationship \citep{DaveySmith2014}.
 
@@ -114,11 +114,11 @@ Because alleles are assigned approximately at random at conception, a variant is
   \draw[->, thick, dashed, gray] (G) to[bend right=40] node[below, font=\footnotesize, text=black]{ruled out: pleiotropy} (O);
   \draw[->, thick, dashed, gray] (C) to[bend right=20] node[above, font=\footnotesize, text=black]{ruled out: shared cause} (G);
 \end{tikzpicture}
-\caption{MR assumptions: the variant affects the outcome through the exposure, and that nothing causes both the variant and the outcome (dashed grey arrows ruled out). When these assumptions are met, the outcome association represents a causal effect of the exposure on the outcome.}
+\caption{MR assumptions: the variant affects the outcome through the exposure, and that nothing causes both the variant and the outcome (dashed gray arrows ruled out). When these assumptions are met, the outcome association represents a causal effect of the exposure on the outcome.}
 \label{fig:mr-dag}
 \end{figure}
 
-Bayesian structure learning over DAGs scores each candidate graph by a marginal likelihood with a conjugate structure prior \citep{Geiger2002, Kuipers2014} and explores the space via Markov chain Monte Carlo with neighbourhood-balanced proposals \citep{GiudiciCastelo2003, MadiganYork1995}. Bayesian model averaging over the posterior propagates structural uncertainty into downstream predictions \citep{Draper1995}.
+Bayesian structure learning over DAGs scores each candidate graph by a marginal likelihood with a conjugate structure prior \citep{Geiger2002, Kuipers2014} and explores the space via Markov chain Monte Carlo with neighborhood-balanced proposals \citep{GiudiciCastelo2003, MadiganYork1995}. Bayesian model averaging over the posterior propagates structural uncertainty into downstream predictions \citep{Draper1995}.
 
 \section{Methods and Algorithms}
 This project uses a modular causal-prediction pipeline. The overall goal is to move from participant-level biomedical measurements to individualized type 2 diabetes risk predictions while preserving uncertainty about the underlying causal structure. The pipeline has five main components: data construction, Mendelian-randomization-informed edge priors, a DAGSLAM warm-start graph, structure MCMC over directed acyclic graphs, and a survival generalized additive model for individual-level risk prediction.
@@ -469,7 +469,7 @@ MR--IVW (Bonferroni)     & ---                       & ---                  & --
 All of Us individual-level data are accessible inside the Researcher Workbench \citep{AllofUs2024}. The above section is on a synthetic biobank-shape cohort with a known ground-truth DAG, which is useful since the causal structure in the real world is not known. On real data, HbA1c was discovered as a strong risk factor. This is also used to diagnose type 2 diabetes, which complicates the interpretation.
 
 \paragraph{Prior work on causal priors}
-Our edge-inclusion prior is informed by published Mendelian-randomisation evidence (e.g.\ \citealt{Fall2015, Xue2018, Ference2017}). Where no published IVW estimate is available, the prior is left non-informative and not imputed, so the structural posterior is never biased by unattributed prior claims \citep{DaveySmith2014}.
+Our edge-inclusion prior is informed by published Mendelian-randomization evidence (e.g.\ \citealt{Fall2015, Xue2018, Ference2017}). Where no published IVW estimate is available, the prior is left non-informative and not imputed, so the structural posterior is never biased by unattributed prior claims \citep{DaveySmith2014}.
 
 \section{Reproducibility}
 
