@@ -6,7 +6,6 @@
 \usepackage{graphicx}
 \usepackage{booktabs}
 \usepackage{tikz}
-\usetikzlibrary{shapes.geometric}
 \usepackage{natbib}
 \usepackage{hyperref}
 \usepackage{indentfirst}
@@ -340,8 +339,9 @@ where $G^{(m)}$ is a sampled DAG. These posterior edge probabilities are used to
 
 
 \subsection{Gamfit Survival GAM (Have Scott take a look)}
-After graph learning, we use the posterior parent sets for the T2D node as inputs to a survival generalized additive model. This stage is used for individual-level time-to-event prediction, not for the local graph score used during DAGSLAM or MCMC. During graph search, the survival node is scored as a fixed-horizon IPCW-weighted binary endpoint; after graph learning, \texttt{gamfit} fits a richer right-censored survival model to estimate individual survival curves.
-The survival model is implemented as a thin wrapper around the \texttt{gamfit} Python library, which provides PyO3 bindings to a Rust GAM engine. The fitted model is a right-censored location-scale GAMLSS survival model. In a location-scale survival model, covariates can affect the location component of the survival distribution, while the scale or noise component is modeled separately. In our implementation, the default location formula uses the selected parent variables as predictors, while the default noise formula is intercept-only:
+After graph learning, we use the posterior parent sets for the T2D node as inputs to a survival generalized additive model (GAM). This stage is used for individual-level time-to-event prediction, not for the local graph score used during DAGSLAM or MCMC. During graph search, the survival node is scored as a fixed-horizon IPCW-weighted binary endpoint; after graph learning, \texttt{gamfit} fits a richer right-censored survival model to estimate individual survival curves.
+
+The \texttt{gamfit} Python library was created to implement this survival model in Python, as existing Python GAM libraries do not have support for survival modeling or serious uncertainty quantification. The fitted model is a right-censored location-scale GAMLSS survival model. In a location-scale survival model, covariates can affect the location component of the survival distribution, while the scale or noise component is modeled separately. In our implementation, the default location formula uses the selected parent variables as predictors, while the default noise formula is intercept-only:
 \[
 \texttt{Surv(entry, exit, event)} \sim x_1 + x_2 + \cdots + x_m.
 \]
