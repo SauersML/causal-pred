@@ -132,32 +132,34 @@ if ps -ef | grep -E "run_full_pipeline|joblib.externals.loky" | grep -v grep >/d
     die "refusing to start a new pipeline alongside stale workers"
 fi
 
-# 7. pipeline ----------------------------------------------------------------
+# 7. synthetic-data baselines first ------------------------------------------
+# Kaplan-Meier, Cox, naive logistic, MR-IVW, plus the causal-pred stack on
+# simulated data. Writes outputs/benchmarks.json and benchmarks.png, both
+# consumed by the paper. Running this BEFORE the real pipeline means a
+# broken simulation path fails fast (minutes) instead of hiding behind the
+# many-hour real-data run.
+BOOTSTRAP_LOG="$REPO_DIR/bootstrap.log"
+log "git head before launch: $(git -C "$REPO_DIR" log --oneline -1)"
+log "gam/survival.py k=5 grep matches: $(grep -c 'k=5' "$REPO_DIR/src/causal_pred/gam/survival.py")"
+log "running synthetic-data benchmarks (mirroring to $BOOTSTRAP_LOG)"
+PYTHONUNBUFFERED=1 stdbuf -oL -eL uv run python -u scripts/benchmark.py 2>&1 \
+    | stdbuf -oL -eL tee "$BOOTSTRAP_LOG"
+
+# 8. real AoU pipeline -------------------------------------------------------
 # Always mirror stdout+stderr to bootstrap.log so the status-check cell can
 # read the Rust optimizer trace, BFGS convergence lines and panic messages
 # *without* relying on the operator remembering to `tee` the invocation.
 # Forgetting the tee made every silent worker death unrecoverable post-hoc;
 # baking it into the script is the only way to make that impossible.
-BOOTSTRAP_LOG="$REPO_DIR/bootstrap.log"
-log "git head before launch: $(git -C "$REPO_DIR" log --oneline -1)"
-log "gam/survival.py k=5 grep matches: $(grep -c 'k=5' "$REPO_DIR/src/causal_pred/gam/survival.py")"
-log "running real AoU causal pipeline (mirroring to $BOOTSTRAP_LOG)"
+log "running real AoU causal pipeline"
 # -u forces unbuffered stdout/stderr. PYTHONUNBUFFERED is also set inside the
 # pipeline entrypoint as a belt-and-suspenders so progress logs from
 # DAGSLAM / MCMC / BMA appear in real time on this non-TTY harness instead
 # of sitting in the OS pipe buffer for minutes. `stdbuf -oL -eL` line-buffers
 # the `tee` side so partial Rust log lines don't sit in the pipe for hours.
 PYTHONUNBUFFERED=1 stdbuf -oL -eL uv run python -u scripts/run_full_pipeline.py 2>&1 \
-    | stdbuf -oL -eL tee "$BOOTSTRAP_LOG"
-# `pipefail` is on (`set -euo pipefail`), so a nonzero pipeline exit propagates.
-
-# 8. synthetic-data baselines (Kaplan-Meier, Cox, naive logistic, MR-IVW,
-#    causal-pred stack). Writes outputs/benchmarks.json and benchmarks.png,
-#    both consumed by the paper. The pipeline does NOT cover this; if we
-#    skip it the paper's baselines table and figure go stale.
-log "running synthetic-data benchmarks"
-PYTHONUNBUFFERED=1 stdbuf -oL -eL uv run python -u scripts/benchmark.py 2>&1 \
     | stdbuf -oL -eL tee -a "$BOOTSTRAP_LOG"
+# `pipefail` is on (`set -euo pipefail`), so a nonzero pipeline exit propagates.
 
 # 9. standalone figures from saved arrays (survival fans, calibration,
 #    edge heatmap, etc). Writes outputs/plots/*.{png,pdf}.
