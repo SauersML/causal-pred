@@ -268,7 +268,7 @@ The algorithm first finds the posterior mode, or MAP estimate, using Newton-IRLS
 \]
 where $H$ is the negative Hessian of the log posterior at the MAP estimate. This allows the graph search to compare different parent sets for binary variables while still using an approximate Bayesian marginal likelihood rather than only a fitted likelihood. If the number of rows is too small relative to the number of coefficients, the implementation falls back to a BIC score for numerical stability.
 
-Survival nodes are not scored directly using the final survival GAM. Instead, during graph search, the survival outcome is converted into a fixed-horizon binary endpoint. Cases are subjects who experience the event before the chosen survival horizon, controls are subjects known to be event-free beyond the horizon, and subjects censored before the horizon are not incorrectly treated as controls. To account for censoring, the implementation uses inverse probability of censoring weights (IPCW). The resulting weighted binary endpoint is then scored with the same Laplace logistic marginal likelihood used for ordinary binary nodes.
+Survival nodes are not scored directly using the final survival generalized additive model (GAM). Instead, during graph search, the survival outcome is converted into a fixed-horizon binary endpoint. Cases are subjects who experience the event before the chosen survival horizon, controls are subjects known to be event-free beyond the horizon, and subjects censored before the horizon are not incorrectly treated as controls. To account for censoring, the implementation uses inverse probability of censoring weights (IPCW). The resulting weighted binary endpoint is then scored with the same Laplace logistic marginal likelihood used for ordinary binary nodes.
 
 This scoring design separates graph learning from the final prediction model. DAGSLAM and MCMC use mixed-type local marginal likelihoods to evaluate graph structures efficiently, while the later \texttt{gamfit} stage uses the posterior parent sets to fit smooth time-to-event prediction models.
 
@@ -337,7 +337,7 @@ The posterior graph samples are summarized by edge-inclusion probabilities,
 where $G^{(m)}$ is a sampled DAG. These posterior edge probabilities are used to quantify structural uncertainty and to identify high-probability causal dependencies. The sampler also records the log posterior values of kept samples and reports diagnostics including per-move-type acceptance rates, mean log posterior per chain, Gelman--Rubin $\hat{R}$ for directed edge indicators, $\hat{R}$ for the undirected skeleton, and effective sample size per edge using Geyer's initial-positive-sequence estimator \citep{Geyer1992}. Directed-edge $\hat{R}$ is treated as the primary diagnostic because the project reports directed causal edge and path probabilities.
 
 
-\subsection{Gamfit Survival GAM (Have Scott take a look)}
+\subsection{Survival GAM}
 After graph learning, we use the posterior parent sets for the T2D node as inputs to a survival generalized additive model (GAM). This stage is used for individual-level time-to-event prediction, not for the local graph score used during DAGSLAM or MCMC. During graph search, the survival node is scored as a fixed-horizon IPCW-weighted binary endpoint; after graph learning, \texttt{gamfit} fits a richer right-censored survival model to estimate individual survival curves.
 
 The \texttt{gamfit} Python library was created to implement this survival model in Python, as existing Python GAM libraries do not have support for survival modeling or serious uncertainty quantification. The fitted model is a right-censored parametric survival GAMLSS: the baseline cumulative hazard is Gompertz--Makeham,
@@ -368,9 +368,9 @@ For a fitted parent set, the model predicts an individual survival curve
 \[
 S(t \mid x) = P(T > t \mid x)
 \]
-on a requested time grid. The implementation queries \texttt{gamfit} for survival probabilities at these horizons and clips the resulting values to the valid range $[0,1]$. It also enforces monotonicity of the survival curve over time, since survival probabilities should not increase as the time horizon grows.
+on a requested time grid. \texttt{gamfit} is queried for survival probabilities at these horizons. The GAM structurally enforces monotonicity of the survival curve over time, since survival probabilities should not increase as the time horizon grows.
 
-We obtain response-scale standard errors for the predicted survival probabilities using \texttt{gamfit}'s survival uncertainty interface. These standard errors represent uncertainty within a fitted survival model.
+We obtain response-scale standard errors for the predicted survival probabilities using \texttt{gamfit}'s survival uncertainty interface. These standard errors represent uncertainty within a single fitted survival model. This uncertainty term includes the uncertainty of the spline coefficients themselves in addition to sampling error.
 
 Finally, we combine the survival model with graph uncertainty through Bayesian model averaging over posterior parent sets. Suppose the MCMC sampler produces candidate parent sets
 \[
