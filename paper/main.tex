@@ -432,11 +432,10 @@ Model & Nagelkerke $R^2$ @ 10y & td-AUC @ 10y & IBS & Edge AUPRC \\
 Kaplan--Meier            & \benchKMNagelkerke        & \benchKMTdAuc        & \benchKMIbs        & --- \\
 Cox PH                   & \benchCoxNagelkerke       & \benchCoxTdAuc       & \benchCoxIbs       & --- \\
 Naive logistic @ 10y     & \benchLogisticNagelkerke  & \benchLogisticTdAuc  & \benchLogisticIbs  & --- \\
-MR--IVW (Bonferroni)     & ---                       & ---                  & ---                & \benchMRAuprc \\
 \textbf{Causal-Pred}     & \textbf{\benchCausalPredNagelkerke} & \textbf{\benchCausalPredTdAuc} & \textbf{\benchCausalPredIbs} & \textbf{\benchCausalPredEdgeAuprc} \\
 \bottomrule
 \end{tabular}
-\caption{End-to-end benchmark table. Values are stamped at build time from \texttt{outputs/benchmarks.json}. Higher is better for Nagelkerke $R^2$, time-dependent AUC, and edge AUPRC; lower is better for the integrated Brier score (IBS).}
+\caption{End-to-end benchmark table. Higher is better for Nagelkerke $R^2$, time-dependent AUC, and edge AUPRC; lower is better for the integrated Brier score (IBS).}
 \label{tab:benchmarks}
 \end{table}
 
