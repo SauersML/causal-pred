@@ -416,7 +416,7 @@ Nagelkerke $R^2$           & \nagelkerke{} \\
 Expected calibration error & \ece{} \\
 Edge recall                & \edgeRecall{} \\
 Edge AUROC                 & \edgeAuroc{} \\
-MCMC iterations/chain      & \mcmcIter{} \\
+MCMC samples/chain         & \mcmcIter{} \\
 MCMC chains                & \mcmcChains{} \\
 $\hat{R}_{\max}$           & \mcmcRhat{} \\
 Mean acceptance            & \mcmcAccept{} \\
@@ -465,7 +465,7 @@ Our edge-inclusion prior is informed by published Mendelian-randomisation eviden
 
 \section{Reproducibility (check if needs changes later)}
 
-All code is pinned via \texttt{uv.lock}. The GAM backend is the Rust-based \texttt{SauersML/gam} package built through \texttt{rustup}. Polygenic scoring, HWE-PCA projection, and sample-term inference shell out to the \texttt{gnomon} CLI. Every stage accepts an explicit RNG and derives child seeds deterministically. A full run is reproduced by \texttt{uv run python scripts/run\_full\_pipeline.py} followed by \texttt{make -C paper paper}.
+All code is pinned via \texttt{uv.lock}. The GAM backend is the Rust-based \texttt{SauersML/gam} package built through \texttt{rustup}. Polygenic scoring, HWE-PCA projection, and sample-term inference shell out to the \texttt{gnomon} CLI. Every stage accepts an explicit RNG and derives child seeds deterministically. A full run is reproduced by \texttt{uv run python scripts/run\_full\_pipeline.py} followed by \texttt{make -C paper quick}.
 
 \bibliographystyle{plainnat}
 \bibliography{bib}
