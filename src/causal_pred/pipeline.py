@@ -1191,6 +1191,8 @@ def _pipeline_config() -> dict[str, Any]:
             "target_column": SURVIVAL_TARGET_COLUMN,
             "max_parents": SURVIVAL_GAM_MAX_PARENTS,
             "min_edge_prob": SURVIVAL_GAM_MIN_EDGE_PROB,
+            "baseline_target": "gompertz-makeham",
+            "k_knots": 8,
         },
         "causal_paths": {
             "target": CAUSAL_PATH_TARGET,

@@ -36,7 +36,7 @@ def _progress_callback(progress: bool | ProgressCallback) -> Optional[ProgressCa
 def _build_survival_formula(columns: Sequence[str]) -> str:
     if not columns:
         raise ValueError("survival GAM requires at least one parent column")
-    return " + ".join(f"s({c}, k=5)" for c in columns)
+    return " + ".join(f"s({c}, k=8)" for c in columns)
 
 
 def _build_noise_formula(columns: Sequence[str]) -> str:
@@ -141,7 +141,7 @@ def _fit_gam(
         df,
         formula,
         survival_likelihood="location-scale",
-        baseline_target="linear",
+        baseline_target="gompertz-makeham",
         config={"noise_formula": sigma_rhs},
     )
     train_summary: Dict[str, Any] = dict(model.summary().to_dict())
@@ -170,7 +170,7 @@ def _fit_gam(
         location_formula=location_rhs,
         train_summary=train_summary,
         survival_likelihood="location-scale",
-        baseline_target="linear",
+        baseline_target="gompertz-makeham",
         noise_formula=sigma_rhs,
         x_center=x_center.astype(float, copy=True),
         x_scale=x_scale.astype(float, copy=True),
