@@ -343,7 +343,7 @@ After graph learning, we use the posterior parent sets for the T2D node as input
 
 The \texttt{gamfit} Python library was created to implement this survival model in Python, as existing Python GAM libraries do not have support for survival modeling or serious uncertainty quantification. The fitted model is a right-censored location-scale GAMLSS survival model. In a location-scale survival model, covariates can affect the location component of the survival distribution, while the scale or noise component is modeled separately. In our implementation, the default location formula uses the selected parent variables as predictors, while the default noise formula is intercept-only:
 \[
-\texttt{Surv(entry, exit, event)} \sim x_1 + x_2 + \cdots + x_m.
+\texttt{Surv(entry, exit, event)} \sim s(x_1) + s(x_2) + \cdots + s(x_m).
 \]
 If no parents are selected, the model reduces to an intercept-only survival model.
 
