@@ -92,7 +92,7 @@ In this project, we combine these ideas into a causal prediction pipeline for T2
 The All of Us biobank is an appropriate data environment for this problem because it contains both the scale and variable diversity needed for causal risk modeling. The agent interacts with the environment by reading participant-level measurements, learning candidate dependencies among variables, sampling plausible causal graphs, and producing individualized T2D risk predictions. In a complete deployment, such an agent would not replace clinical judgment, but could support decision-making by identifying high-risk individuals and discover new possibly causal pathways that contribute most to the prediction. Thus, the project studies the smaller technical subproblem of causal structure learning and uncertainty-aware prediction within the broader goal of interpretable and reliable disease-risk assessment. The methods here are applied on T2D as an example, but are broadly applicable to any common disease.
 
 
-\section{Background (finish/edit/delete this later)}
+\section{Background}
 
 Mendelian randomisation (MR) uses germline genotypes -- randomised at meiosis -- as instrumental variables to estimate causal effects between measured exposures \citep{DaveySmith2014, Corbin2016}. For metabolic-disease outcomes, well-replicated examples include BMI $\to$ type 2 diabetes \citep{Fall2015, Xue2018}, LDL $\to$ coronary disease \citep{Ference2017, Emdin2017}, blood pressure $\to$ cardiovascular outcomes \citep{Nazarzadeh2022}, and null/negative findings for alcohol intake \citep{Holmes2014}. Summary-data inverse-variance weighted (IVW) estimates are straightforward to aggregate across thousands of variants and form the raw input to our structural prior.
 
@@ -401,10 +401,6 @@ The first term represents parametric uncertainty within each fitted survival mod
 Thus, the \texttt{gamfit} stage serves as the final prediction layer of the agent. The graph-learning stages identify plausible parent sets for the T2D outcome, and the survival GAM converts those parent sets into individual-level survival curves with uncertainty from both fitted model parameters and graph structure.
 
 
-\subsection{Validation}
-
-Write after code is complete.
-
 \section{Results (finish once we have full results)}
 
 \begin{table}[h]
@@ -473,7 +469,7 @@ All of Us individual-level data are only accessible inside the Researcher Workbe
 \paragraph{Prior work on causal priors}
 Our edge-inclusion prior is informed by published Mendelian-randomisation evidence (e.g.\ \citealt{Fall2015, Xue2018, Ference2017}). Where no published IVW estimate is available, the prior is left non-informative rather than imputed, so the structural posterior is never biased by unattributed prior claims \citep{DaveySmith2014}.
 
-\section{Reproducibility (check if needs changes later)}
+\section{Reproducibility}
 
 All code is pinned via \texttt{uv.lock}. The GAM backend is the Rust-based \texttt{SauersML/gam} package built through \texttt{rustup}. Polygenic scoring, HWE-PCA projection, and sample-term inference shell out to the \texttt{gnomon} CLI. Every stage accepts an explicit RNG and derives child seeds deterministically. A full run is reproduced by \texttt{uv run python scripts/run\_full\_pipeline.py} followed by \texttt{make -C paper quick}.
 
