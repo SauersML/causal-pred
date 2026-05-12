@@ -18,13 +18,9 @@
 # Steps:
 #   1. assert AoU workspace variables exist
 #   2. install `uv` if missing
-#   3. install a stable Rust toolchain (required to build gamfit from source)
+#   3. install a minimal stable Rust toolchain if a compatible `gamfit` wheel is unavailable
 #   4. locate this checkout, or clone it into $HOME/causal-pred on a fresh workbench
-#   5. `uv sync --dev` into the repo-local .venv (skips gamfit)
-#   5b. clone/update SauersML/gam in $HOME/gam and build gamfit from source
-#       with RUSTFLAGS=-C target-cpu=native + --profile release (max-speed
-#       Rust profile: lto=thin, codegen-units=1). Faster than the PyPI
-#       wheel and picks up unreleased fixes from gam main HEAD.
+#   5. `uv sync --locked --dev` into the repo-local .venv
 #   6. install `gnomon` if missing
 #   7. run the single real pipeline; it prepares/loads cached PRS, builds
 #      EHR crosscoder features, runs MrDAG -> DAGSLAM -> MCMC -> GAM, and
@@ -103,38 +99,12 @@ log "git pull --ff-only"
 git pull --ff-only
 
 # 5. python deps -------------------------------------------------------------
-# Lock everything to the committed pins EXCEPT gamfit, which we skip here
-# and build from source against the SauersML/gam main HEAD in step 5b.
-# The PyPI wheel is always behind main and is compiled for the manylinux
-# baseline (no AVX2/AVX-512, codegen-units=16); a local build with
-# target-cpu=native + the repo's --profile release (lto=thin,
-# codegen-units=1) is meaningfully faster on biobank-scale inner loops
-# and lets us pick up unreleased gamfit fixes without waiting on PyPI.
-log "uv sync --dev (gamfit skipped; built from source in step 5b)"
-uv sync --no-install-package gamfit --dev
-
-# 5b. gamfit from source -----------------------------------------------------
-# Clone (or fast-forward) SauersML/gam and build the gamfit wheel inside
-# the project venv with native CPU tuning. Rust toolchain installed in
-# step 2 is required. Build is ~5-10 min cold; subsequent bootstraps
-# reuse $GAM_DIR/target so incremental rebuilds are near-instant.
-GAM_DIR="$HOME/gam"
-if [[ ! -d "$GAM_DIR/.git" ]]; then
-    [[ ! -e "$GAM_DIR" ]] || die "$GAM_DIR exists but is not a git checkout"
-    log "cloning SauersML/gam into $GAM_DIR"
-    git clone https://github.com/SauersML/gam.git "$GAM_DIR"
-else
-    log "git pull --ff-only in $GAM_DIR"
-    git -C "$GAM_DIR" pull --ff-only
-fi
-log "gam HEAD: $(git -C "$GAM_DIR" log --oneline -1)"
-
-log "building gamfit from source (--profile release, target-cpu=native)"
-RUSTFLAGS="-C target-cpu=native" \
-MATURIN_PEP517_ARGS="--profile release" \
-    uv pip install --reinstall "$GAM_DIR"
-
-log "installed gamfit version: $(uv run python -c 'import gamfit, sys; print(getattr(gamfit, "__version__", "?"))')"
+# Lock everything else to the committed pins, but always pull the newest
+# gamfit available on PyPI. The Rust survival GAM is the most actively
+# evolving dependency in the stack, and we never want a stale wheel
+# silently masking fixes that have been published since the last `uv lock`.
+log "uv sync --upgrade-package gamfit --dev (gamfit pinned to latest)"
+uv sync --upgrade-package gamfit --dev
 
 # 5. gnomon ------------------------------------------------------------------
 log "installing gnomon via install.sh"
