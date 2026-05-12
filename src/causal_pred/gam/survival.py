@@ -42,7 +42,12 @@ def _build_survival_formula(columns: Sequence[str]) -> str:
 def _build_noise_formula(columns: Sequence[str]) -> str:
     if not columns:
         raise ValueError("survival GAM noise predictor requires at least one parent column")
-    return " + ".join(f"s({c}, k=5)" for c in columns)
+    # Linear-in-covariates log-sigma. Smooth noise blew up the outer REML
+    # hyperparameter dim (k ~ 17 for cap-3 parents vs k ~ 11 here), and the
+    # Hessian-of-REML cost is O(k^2 * p), so dropping the noise smooths cuts
+    # per-eval wallclock by ~5x. Heteroscedasticity in log time-to-event is
+    # typically mild and linear-in-x captures the dominant trend.
+    return " + ".join(columns)
 
 
 @dataclass
