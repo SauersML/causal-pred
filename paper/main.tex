@@ -449,6 +449,8 @@ Naive logistic @ 10y     & \benchLogisticNagelkerke  & \benchLogisticTdAuc  & \b
 \paragraph{Benchmark comparison.}
 We compared the full pipeline against Kaplan--Meier and Cox proportional hazards baselines on various metrics, using two GAM backends. On the gamfit backend, Causal-Pred attains the best Nagelkerke $R^2$ at 10 years (0.245 vs.\ 0.186 logistic, 0.167 Cox), the best ten-year time-dependent AUC (0.828 vs.\ 0.745, 0.741), and the lowest integrated Brier score among survival models (0.127 vs.\ 0.132, 0.141), with an edge AUPRC of 0.546 against 0.530 for MR--IVW. On the R mgcv/gamlss backend, which does not include posterior sampling, performance is lower: Cox PH is the best (Nagelkerke 0.312, td-AUC 0.807, IBS 0.121), and Causal-Pred edge recovery is AUPRC 0.586 and AUROC 0.809. This may indicate that better uncertainty allows also for increased discrimination due to the maximum a posteriori estimates becoming more accurate.
 
+\paragraph{Limitations of biobank data.}
+Though a synthetic cohort with a known ground-truth DAG is useful since the causal structure in the real world is not known, All of Us individual-level data are accessible inside the Researcher Workbench and were also used \citep{AllofUs2024}. On real data, HbA1c was discovered as a strong risk factor. This is also used to diagnose type 2 diabetes, which complicates the interpretation, but also validates that the model can recover relevant nodes.
 
 \section{Reproducibility}
 
