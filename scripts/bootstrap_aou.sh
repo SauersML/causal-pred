@@ -111,7 +111,32 @@ log "installing gnomon via install.sh"
 curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
 export PATH="$HOME/.local/bin:$PATH"
 
-# 6. pipeline ----------------------------------------------------------------
+# 6. kill any stale pipeline before launching a new one ---------------------
+# Python's module system is interpreter-local: once causal_pred.gam.survival
+# (or any other module) is imported into a long-lived process, a later
+# `git pull` does NOT cause the running process to pick up the new code,
+# and loky workers it forks inherit the same stale in-memory modules. The
+# symptom is "I pulled and re-ran bootstrap but the fits still take the
+# old amount of time" -- this happens whenever a previous bootstrap left a
+# pipeline + loky zombies running. We hard-kill those here so the next
+# `uv run python` invocation is a brand-new interpreter with the freshly
+# pulled source on disk.
+log "killing any stale pipeline + loky workers from previous invocations"
+pkill -9 -f "scripts/run_full_pipeline" 2>/dev/null || true
+pkill -9 -f "joblib.externals.loky" 2>/dev/null || true
+# Give the OS a moment to reap; then verify nothing is left.
+sleep 2
+if ps -ef | grep -E "run_full_pipeline|joblib.externals.loky" | grep -v grep >/dev/null; then
+    log "WARNING: stale pipeline processes survived pkill -9; listing"
+    ps -ef | grep -E "run_full_pipeline|joblib.externals.loky" | grep -v grep
+    die "refusing to start a new pipeline alongside stale workers"
+fi
+
+# 7. pipeline ----------------------------------------------------------------
+# Log what code we are about to run so any "did my pull take effect" question
+# can be answered from this terminal alone, no follow-up commands needed.
+log "git head before launch: $(git -C "$REPO_DIR" log --oneline -1)"
+log "gam/survival.py k=5 grep matches: $(grep -c 'k=5' "$REPO_DIR/src/causal_pred/gam/survival.py")"
 log "running real AoU causal pipeline"
 # -u forces unbuffered stdout/stderr. PYTHONUNBUFFERED is also set inside the
 # pipeline entrypoint as a belt-and-suspenders so progress logs from
