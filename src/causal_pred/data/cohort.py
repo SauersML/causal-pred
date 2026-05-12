@@ -1249,48 +1249,66 @@ def resolve_aou_genotypes(
 ) -> Path:
     """Return local AoU v8 microarray PLINK ``arrays.bed``.
 
-    Each member of ``arrays.{bed,bim,fam}`` is downloaded from the requester
-    pays AoU controlled bucket when absent or size-mismatched. Downloads go
-    to ``*.part`` and are atomically moved into place after the copied file
-    matches the remote byte count, so interrupted downloads are never treated
-    as usable genotype inputs.
+    Any local member of ``arrays.{bed,bim,fam}`` that exists with non-zero
+    size is trusted as a complete cache: no remote size check, no
+    re-download. Only files that are missing (or zero-byte) are fetched
+    from the requester-pays AoU controlled bucket via ``*.part``, atomically
+    moved into place once the copied size matches the remote byte count.
+
+    Set ``CAUSAL_PRED_NO_GENOTYPE_DOWNLOAD=1`` to forbid downloads entirely:
+    if the cache is incomplete the call raises ``FileNotFoundError`` rather
+    than contacting the bucket. To force a fresh download, delete the
+    relevant ``arrays.*`` file from ``cache_dir`` before invoking.
     """
-    project = billing_project or os.environ.get("GOOGLE_PROJECT")
-    if not project:
-        raise RuntimeError("GOOGLE_PROJECT must be set to download AoU microarray data")
-
-    gc = _gcloud()
-    if gc is None:
-        raise RuntimeError("gcloud is not on PATH; cannot fetch AoU microarray data")
-
     cache = Path(cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
     bucket = bucket.rstrip("/")
 
+    missing: list[str] = []
     for fname in AOU_GENOTYPE_FILES:
-        src = f"{bucket}/{fname}"
         dst = cache / fname
         sidecar = dst.with_suffix(dst.suffix + ".sha256")
+        if dst.is_file() and dst.stat().st_size > 0:
+            continue
         if not dst.is_file() and sidecar.is_file():
             continue
-        expected_size = _remote_gcloud_size(src, project)
-        if dst.is_file() and dst.stat().st_size == expected_size:
-            continue
+        missing.append(fname)
 
-        part = dst.with_suffix(dst.suffix + ".part")
-        if part.exists():
-            part.unlink()
-        subprocess.run(
-            [gc, "storage", "cp", src, str(part), f"--billing-project={project}"],
-            check=True,
+    if missing and os.environ.get("CAUSAL_PRED_NO_GENOTYPE_DOWNLOAD"):
+        raise FileNotFoundError(
+            "CAUSAL_PRED_NO_GENOTYPE_DOWNLOAD is set but AoU microarray "
+            f"cache at {cache} is missing: {missing}"
         )
-        got_size = part.stat().st_size
-        if got_size != expected_size:
-            part.unlink(missing_ok=True)
+
+    if missing:
+        project = billing_project or os.environ.get("GOOGLE_PROJECT")
+        if not project:
             raise RuntimeError(
-                f"downloaded {src} has {got_size} bytes; expected {expected_size}"
+                "GOOGLE_PROJECT must be set to download AoU microarray data"
             )
-        os.replace(part, dst)
+        gc = _gcloud()
+        if gc is None:
+            raise RuntimeError(
+                "gcloud is not on PATH; cannot fetch AoU microarray data"
+            )
+        for fname in missing:
+            src = f"{bucket}/{fname}"
+            dst = cache / fname
+            expected_size = _remote_gcloud_size(src, project)
+            part = dst.with_suffix(dst.suffix + ".part")
+            if part.exists():
+                part.unlink()
+            subprocess.run(
+                [gc, "storage", "cp", src, str(part), f"--billing-project={project}"],
+                check=True,
+            )
+            got_size = part.stat().st_size
+            if got_size != expected_size:
+                part.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"downloaded {src} has {got_size} bytes; expected {expected_size}"
+                )
+            os.replace(part, dst)
 
     bed = cache / "arrays.bed"
     bim = cache / "arrays.bim"
