@@ -572,6 +572,7 @@ def _gibbs_resample_parents(
     hyper: dict,
     allowed_edges: Optional[np.ndarray] = None,
     progress: Optional[ProgressCallback] = None,
+    max_candidates_per_node: Optional[int] = None,
 ) -> Tuple[bool, float, float]:
     """Exact conditional parent-set update for one node.
 
@@ -598,6 +599,21 @@ def _gibbs_resample_parents(
     candidates = [
         int(i) for i in range(p) if allowed_col[i] and i != j and not bool(reach[j, i])
     ]
+    # Candidate restriction: at cap=5 with ~30 candidates the enumeration
+    # is sum_k C(30, k) for k in 0..5 ~= 175k parent sets, each requiring
+    # a Laplace logistic score. Pruning each node's candidate pool to its
+    # top-K predecessors by MrDAG prior log-odds collapses this to
+    # ~sum_k C(K, k) while preserving the conjunctions that matter (the
+    # 4th/5th parents that are biologically plausible). Pruned candidates
+    # can still enter the chain via single-edge MH proposals so the chain
+    # remains ergodic over the full DAG space; only the *Gibbs conditional*
+    # is restricted, not the marginal posterior the chain targets.
+    if max_candidates_per_node is not None and len(candidates) > max_candidates_per_node:
+        # Rank by edge prior log-odds: log_pi[i, j] - log_1m[i, j]. Higher
+        # = stronger MrDAG / sparse-prior support for i -> j.
+        cand_scores = [(float(log_pi[i, j] - log_1m[i, j]), int(i)) for i in candidates]
+        cand_scores.sort(reverse=True)
+        candidates = [i for _, i in cand_scores[: int(max_candidates_per_node)]]
     cap = min(cap, len(candidates))
     n_parent_sets = int(sum(comb(len(candidates), size) for size in range(cap + 1)))
     emit_parent_progress = progress is not None and n_parent_sets >= 500
@@ -820,6 +836,7 @@ def _run_chain(
     hybrid_prob: float = 0.1,
     edge_resample_prob: float = 0.0,
     allowed_edges: Optional[np.ndarray] = None,
+    max_candidates_per_node: Optional[int] = None,
 ) -> dict:
     """Run one MCMC chain.  Returns a dict of per-chain outputs."""
     adj = start_adj.astype(np.int64, copy=True)
@@ -1001,6 +1018,7 @@ def _run_chain(
                 progress=(
                     _parent_progress if progress_callback is not None else None
                 ),
+                max_candidates_per_node=max_candidates_per_node,
             )
             if accepted:
                 cur_score += d_score
@@ -1152,6 +1170,7 @@ def run_structure_mcmc(
     hybrid_prob: float = 0.1,
     edge_resample_prob: float = 0.0,
     allowed_edges: Optional[np.ndarray] = None,
+    max_candidates_per_node: Optional[int] = None,
     **hyper,
 ) -> MCMCResult:
     """Structure MCMC over DAGs with an MrDAG edge-inclusion prior.
@@ -1337,6 +1356,7 @@ def run_structure_mcmc(
             hybrid_prob=hybrid_prob,
             edge_resample_prob=edge_resample_prob,
             allowed_edges=allowed,
+            max_candidates_per_node=max_candidates_per_node,
         )
         # Stack this chain's samples into a (S, p, p) array.
         if chain_out["samples"]:

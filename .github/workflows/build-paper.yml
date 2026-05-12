@@ -30,23 +30,20 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/Tectonic
-          key: tectonic-${{ runner.os }}-${{ hashFiles('paper/main.tex', 'paper/bib.bib') }}
-          restore-keys: |
-            tectonic-${{ runner.os }}-
+          key: tectonic-${{ runner.os }}-v1
+          enableCrossOsArchive: false
 
-      - name: Setup Tectonic
-        uses: wtfjoke/setup-tectonic@v3
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Tectonic
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 \
+            https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%400.15.0/tectonic-0.15.0-x86_64-unknown-linux-musl.tar.gz \
+            | sudo tar -xz -C /usr/local/bin tectonic
+          tectonic --version
 
       - name: Compile paper/main.tex
         working-directory: paper
-        run: |
-          tectonic -X compile \
-            --keep-intermediates \
-            --keep-logs \
-            --synctex \
-            main.tex
+        run: tectonic --chatter minimal --keep-logs main.tex
 
       - name: Commit and push PDF
         run: |
@@ -54,15 +51,12 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -f paper/main.pdf
-          if git diff --cached --quiet; then
-            echo "No PDF changes to commit."
-            exit 0
-          fi
+          git diff --cached --quiet && { echo "No PDF changes."; exit 0; }
           git commit -m "Build paper PDF [skip ci]"
-          # Retry-push in case main moved while we built.
+          # Fast path: push directly. Only rebase if main moved.
+          git push origin HEAD:main && exit 0
           for i in 1 2 3; do
             git pull --rebase --autostash origin main && git push origin HEAD:main && exit 0
-            sleep 2
           done
           echo "Failed to push after retries" >&2
           exit 1
