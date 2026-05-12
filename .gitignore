@@ -32,7 +32,8 @@ paper/*.bbl
 paper/*.blg
 paper/*.pdf
 paper/*.synctex.gz
-paper/figures/
+paper/figures/*
+!paper/figures/crosscoder_10_participant_umap.png
 
 # Editor / OS
 .DS_Store

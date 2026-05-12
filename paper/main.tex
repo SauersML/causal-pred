@@ -125,6 +125,23 @@ Bayesian structure learning over DAGs scores each candidate graph by a marginal 
 This project uses a modular causal-prediction pipeline. The overall goal is to move from participant-level biomedical measurements to individualized type 2 diabetes risk predictions while preserving uncertainty about the underlying causal structure. The pipeline has five main components: data construction, Mendelian-randomization-informed edge priors, a DAGSLAM warm-start graph, structure MCMC over directed acyclic graphs, and a survival generalized additive model for individual-level risk prediction.
 
 
+\subsection{Data exploration on All of Us}
+\label{sec:data-exploration}
+
+To explore the All of Us biobank data, we assessed $102{,}052$ participants with genome and electronic health records. $2{,}423$ had type~2 diabetes. For each participant, we created $117$ polygenic-score features from the PGS Catalog, and $941$ EHR-derived features across $72$ condition codes, $834$ drug-exposure codes, and $35$ lab results. We then trained a TopK cross-modal sparse autoencoder over the PRS+EHR input space ($d=2048$ latent dimension size, $k=32$ active per row) to understand the data organization and determine if T2D is trivially clustered with some combination of input features.
+
+Figure~\ref{fig:participant-umap} shows the resulting participant latent space projected to two dimensions via UMAP. Type~2 diabetes are not uniform across embedding, indicating that the variation captured by the principal PRS and EHR axes is not completely captured by any feature group. We also recover multiple biological axes: a metabolic-syndrome axis (top loadings on BMI and metabolic-syndrome PGSs together with HbA1c and triglyceride lab summaries), a hypertension and cardiovascular axis (hypertrophic-cardiomyopathy and venous-thrombosis PGSs with anti-hypertensive drug exposures), and a lipid axis (LDL- and HDL-cholesterol PGSs with statin and lipid-modifying drug exposures). This indicates that DAG construction is feasible, and motivates the node set used in the rest of the paper.
+
+
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.7\linewidth]{figures/crosscoder_10_participant_umap.png}
+\caption{Participant latent space on All of Us (UMAP projection of TopK cross-modal sparse-autoencoder activations, $n=12{,}000$ subsampled from $102{,}052$). Light grey points are non-T2D participants ($n=9{,}577$ in the subsample); dark points are T2D cases ($n=2{,}423$). (Section~\ref{sec:data-exploration}).}
+\label{fig:participant-umap}
+\end{figure}
+
+
 \subsection{Data}
 
 The target disease is type 2 diabetes. The synthetic data generator produces a cohort of $n = \nSamples{}$ subjects measured on $p = \nNodes{}$ nodes with node-level event rate \eventRate{}. The column convention is designed to resemble large biomedical cohort resources such as All of Us \citep{AllofUs2024} and UK Biobank \citep{Bycroft2018}. Each row represents one subject, and each column represents a clinical, behavioral, genetic, or outcome variable.
