@@ -90,7 +90,7 @@ def test_fit_smoke(monkeypatch):
     )
 
     assert seen["survival_likelihood"] == "location-scale"
-    assert seen["baseline_target"] == "gompertz-makeham"
+    assert seen["baseline_target"] == "linear"
     assert seen["config"] == {"noise_formula": "s(sex) + s(bmi)"}
     assert seen["df_columns"] == ("entry", "exit", "event", "sex", "bmi")
     assert seen["formula"] == "Surv(entry, exit, event) ~ s(sex) + s(bmi)"
@@ -145,7 +145,7 @@ def test_predict_shape():
             train_summary={},
             location_formula="s(bmi) + s(age)",
             survival_likelihood="location-scale",
-            baseline_target="gompertz-makeham",
+            baseline_target="linear",
             noise_formula="s(bmi) + s(age)",
             x_center=np.zeros(2),
             x_scale=np.ones(2),
@@ -212,7 +212,7 @@ def test_predict_survival_mean_uses_gamfit_surface():
         train_summary={},
         location_formula="s(x)",
         survival_likelihood="location-scale",
-        baseline_target="gompertz-makeham",
+        baseline_target="linear",
         noise_formula="s(x)",
         x_center=np.zeros(1),
         x_scale=np.ones(1),
@@ -346,7 +346,7 @@ def test_survival_se_requires_gamfit_uncertainty():
             train_summary={},
             location_formula="s(x)",
             survival_likelihood="location-scale",
-            baseline_target="gompertz-makeham",
+            baseline_target="linear",
             noise_formula="s(x)",
             x_center=np.zeros(1),
             x_scale=np.ones(1),

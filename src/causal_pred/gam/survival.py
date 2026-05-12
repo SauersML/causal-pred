@@ -134,14 +134,14 @@ def _fit_gam(
             "fit start "
             f"n={time.shape[0]} events={int(np.sum(event > 0.0))} "
             f"p={len(columns)} likelihood=location-scale "
-            f"baseline=gompertz-makeham formula={formula} "
+            f"baseline=linear formula={formula} "
             f"noise_formula={sigma_rhs}"
         )
     model = gam.fit(
         df,
         formula,
         survival_likelihood="location-scale",
-        baseline_target="gompertz-makeham",
+        baseline_target="linear",
         config={"noise_formula": sigma_rhs},
     )
     train_summary: Dict[str, Any] = dict(model.summary().to_dict())
@@ -170,7 +170,7 @@ def _fit_gam(
         location_formula=location_rhs,
         train_summary=train_summary,
         survival_likelihood="location-scale",
-        baseline_target="gompertz-makeham",
+        baseline_target="linear",
         noise_formula=sigma_rhs,
         x_center=x_center.astype(float, copy=True),
         x_scale=x_scale.astype(float, copy=True),
