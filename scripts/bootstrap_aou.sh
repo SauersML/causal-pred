@@ -151,4 +151,30 @@ PYTHONUNBUFFERED=1 stdbuf -oL -eL uv run python -u scripts/run_full_pipeline.py 
     | stdbuf -oL -eL tee "$BOOTSTRAP_LOG"
 # `pipefail` is on (`set -euo pipefail`), so a nonzero pipeline exit propagates.
 
-log "done. artefacts in $REPO_DIR/outputs"
+# 8. synthetic-data baselines (Kaplan-Meier, Cox, naive logistic, MR-IVW,
+#    causal-pred stack). Writes outputs/benchmarks.json and benchmarks.png,
+#    both consumed by the paper. The pipeline does NOT cover this; if we
+#    skip it the paper's baselines table and figure go stale.
+log "running synthetic-data benchmarks"
+PYTHONUNBUFFERED=1 stdbuf -oL -eL uv run python -u scripts/benchmark.py 2>&1 \
+    | stdbuf -oL -eL tee -a "$BOOTSTRAP_LOG"
+
+# 9. standalone figures from saved arrays (survival fans, calibration,
+#    edge heatmap, etc). Writes outputs/plots/*.{png,pdf}.
+log "regenerating standalone figures"
+PYTHONUNBUFFERED=1 stdbuf -oL -eL uv run python -u scripts/generate_figures.py 2>&1 \
+    | stdbuf -oL -eL tee -a "$BOOTSTRAP_LOG"
+
+# 10. paper: copy figures into paper/figures/, stamp summary+benchmark
+#     macros into main.tex, build the PDF if latexmk/pdflatex is present.
+#     We invoke `figures` + `quick` directly (not `paper`) because `paper`
+#     re-runs the pipeline, which we have just finished.
+log "building paper (figures + quick)"
+if command -v make >/dev/null 2>&1; then
+    make -C paper figures 2>&1 | stdbuf -oL -eL tee -a "$BOOTSTRAP_LOG"
+    make -C paper quick   2>&1 | stdbuf -oL -eL tee -a "$BOOTSTRAP_LOG"
+else
+    log "WARNING: make not on PATH; skipping paper build"
+fi
+
+log "done. artefacts in $REPO_DIR/outputs and $REPO_DIR/paper"
