@@ -789,7 +789,31 @@ def _file_sha256(
     logger: Optional[logging.Logger] = None,
     label: Optional[str] = None,
 ) -> str:
-    st = path.stat()
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        sidecar = _sha256_sidecar_path(path)
+        try:
+            record = json.loads(sidecar.read_text())
+        except Exception:
+            raise FileNotFoundError(
+                f"{path} is missing and no sidecar at {sidecar}; cannot compute digest"
+            )
+        if (
+            isinstance(record, dict)
+            and str(record.get("tag", "")) == _DIGEST_TAG
+            and isinstance(record.get("sha256"), str)
+            and len(record["sha256"]) == 64
+        ):
+            if logger is not None:
+                logger.info(
+                    "[prs]   digest %s reused from sidecar-only (file absent on disk)",
+                    label or path.name,
+                )
+            return record["sha256"]
+        raise FileNotFoundError(
+            f"{path} is missing and sidecar at {sidecar} is invalid"
+        )
     size = int(st.st_size)
     mtime_ns = int(st.st_mtime_ns)
     cached = _read_sha256_sidecar(path, size, mtime_ns)

@@ -1270,6 +1270,9 @@ def resolve_aou_genotypes(
     for fname in AOU_GENOTYPE_FILES:
         src = f"{bucket}/{fname}"
         dst = cache / fname
+        sidecar = dst.with_suffix(dst.suffix + ".sha256")
+        if not dst.is_file() and sidecar.is_file():
+            continue
         expected_size = _remote_gcloud_size(src, project)
         if dst.is_file() and dst.stat().st_size == expected_size:
             continue
@@ -1292,7 +1295,11 @@ def resolve_aou_genotypes(
     bed = cache / "arrays.bed"
     bim = cache / "arrays.bim"
     fam = cache / "arrays.fam"
-    if not (bed.is_file() and bim.is_file() and fam.is_file()):
+    for p in (bed, bim, fam):
+        if p.is_file():
+            continue
+        if p.with_suffix(p.suffix + ".sha256").is_file():
+            continue
         raise FileNotFoundError(f"incomplete AoU microarray PLINK triple in {cache}")
     return bed
 
