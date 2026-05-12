@@ -94,7 +94,27 @@ The All of Us biobank is an appropriate data environment for this problem becaus
 
 \section{Background (finish/edit/delete this later)}
 
-Mendelian randomisation uses germline genotypes -- randomised at meiosis -- as instrumental variables to estimate causal effects between measured exposures \citep{DaveySmith2014, Corbin2016}. For metabolic-disease outcomes, well-replicated examples include BMI $\to$ type 2 diabetes \citep{Fall2015, Xue2018}, LDL $\to$ coronary disease \citep{Ference2017, Emdin2017}, blood pressure $\to$ cardiovascular outcomes \citep{Nazarzadeh2022}, and null/negative findings for alcohol intake \citep{Holmes2014}. Summary-data IVW estimates are straightforward to aggregate across thousands of variants and form the raw input to our structural prior.
+Mendelian randomisation (MR) uses germline genotypes -- randomised at meiosis -- as instrumental variables to estimate causal effects between measured exposures \citep{DaveySmith2014, Corbin2016}. For metabolic-disease outcomes, well-replicated examples include BMI $\to$ type 2 diabetes \citep{Fall2015, Xue2018}, LDL $\to$ coronary disease \citep{Ference2017, Emdin2017}, blood pressure $\to$ cardiovascular outcomes \citep{Nazarzadeh2022}, and null/negative findings for alcohol intake \citep{Holmes2014}. Summary-data inverse-variance weighted (IVW) estimates are straightforward to aggregate across thousands of variants and form the raw input to our structural prior.
+
+Because alleles are assigned approximately at random at conception, a variant is akin to a randomized treatment: any association between the variant and the outcome, via the exposure, is not due to reverse causation or by confounding of the exposure-outcome relationship \citep{DaveySmith2014}.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[every node/.style={font=\small}, var/.style={ellipse, draw, thick, inner sep=3pt, minimum height=0.8cm}, conf/.style={ellipse, draw, thick, dashed, inner sep=3pt, minimum height=0.8cm}]
+  \node[var]  (G) at (0,0)    {genetic variant};
+  \node[var]  (E) at (3.5,0)  {exposure};
+  \node[var]  (O) at (7,0)    {outcome};
+  \node[conf] (C) at (5.25,2) {confounders};
+  \draw[->, thick] (G) -- node[above, font=\footnotesize]{relevance} (E);
+  \draw[->, thick] (E) -- node[above, font=\footnotesize]{causal effect} (O);
+  \draw[->, thick] (C) -- (E);
+  \draw[->, thick] (C) -- (O);
+  \draw[->, thick, dashed, gray] (G) to[bend right=40] node[below, font=\footnotesize, text=black]{ruled out: pleiotropy} (O);
+  \draw[->, thick, dashed, gray] (C) to[bend right=20] node[above, font=\footnotesize, text=black]{ruled out: shared cause} (G);
+\end{tikzpicture}
+\caption{MR assumptions: the variant affects the outcome through the exposure, and that nothing causes both the variant and the outcome (dashed grey arrows ruled out). When these assumptions are met, the outcome association represents a causal effect of the exposure on the outcome.}
+\label{fig:mr-dag}
+\end{figure}
 
 Bayesian structure learning over DAGs scores each candidate graph by a marginal likelihood with a conjugate structure prior \citep{Geiger2002, Kuipers2014} and explores the space via Markov chain Monte Carlo with neighbourhood-balanced proposals \citep{GiudiciCastelo2003, MadiganYork1995}. Bayesian model averaging over the posterior propagates structural uncertainty into downstream predictions \citep{Draper1995}.
 
@@ -108,7 +128,7 @@ The target disease is type 2 diabetes. The synthetic data generator produces a c
 
 The node set is mixed-type. Continuous covariates include measurements such as body mass index, LDL cholesterol, HbA1c, and systolic blood pressure. Binary variables represent lifestyle or disease indicators, such as smoking status or type 2 diabetes status. The outcome is represented as a survival variable, allowing the model to estimate not only whether a subject develops T2D, but also how risk changes over time. This mixed-type setting motivates the use of algorithms that can score continuous, binary, and survival nodes within the same directed acyclic graph.
 
-Each subject also carries a polygenic score computed externally using the \texttt{gnomon} command-line interface. A polygenic score summarizes many genetic variants into a single risk score by weighting alleles according to their estimated associations with a trait \citep{Khera2018}. In this project, the polygenic score is treated as an observed subject-level covariate rather than learned directly by the graphical model. This allows genetic risk to contribute to individual prediction while keeping the structure-learning problem focused on the observed clinical and behavioral variables.
+We computed over 100 polygenic scores per person using \texttt{gnomon}. A polygenic score summarizes many genetic variants into a single risk score by weighting alleles according to their estimated associations with a trait \citep{Khera2018}. In this project, the polygenic score is treated as an observed subject-level covariate rather than learned directly by the graphical model. This allows genetic risk to contribute to individual prediction while keeping the structure-learning problem focused on the observed clinical and behavioral variables.
 
 \subsection{MrDAG: MR-Informed Edge-Inclusion Prior}
 
