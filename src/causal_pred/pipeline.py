@@ -876,7 +876,39 @@ def _file_stat_fingerprint(
     logger: Optional[logging.Logger] = None,
     label: Optional[str] = None,
 ) -> dict[str, Any]:
-    st = path.stat()
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        # Cache-only path: trust the .sha256 sidecar (size + digest) so
+        # downstream cache lookups can proceed without re-downloading the
+        # underlying file (e.g. the multi-GB AoU arrays.bed).
+        sidecar = _sha256_sidecar_path(path)
+        try:
+            record = json.loads(sidecar.read_text())
+        except OSError as exc:
+            raise FileNotFoundError(
+                f"{path} is missing and no sidecar at {sidecar}; cannot fingerprint"
+            ) from exc
+        if (
+            not isinstance(record, dict)
+            or str(record.get("tag", "")) != _DIGEST_TAG
+            or not isinstance(record.get("sha256"), str)
+            or len(record["sha256"]) != 64
+            or int(record.get("size", -1)) < 0
+        ):
+            raise FileNotFoundError(
+                f"{path} is missing and sidecar at {sidecar} is invalid"
+            )
+        if logger is not None:
+            logger.info(
+                "[prs]   stat %s reused from sidecar-only (file absent on disk)",
+                label or path.name,
+            )
+        return {
+            "name": path.name,
+            "size": int(record["size"]),
+            "sha256": str(record["sha256"]),
+        }
     return {
         "name": path.name,
         "size": int(st.st_size),
@@ -894,11 +926,15 @@ def _plink_stat_fingerprint(
     for suffix in (".bed", ".bim", ".fam"):
         p = prefix.with_suffix(suffix)
         if logger is not None:
-            logger.info(
-                "[prs]  fingerprinting %s (%.1f MiB)",
-                p,
-                p.stat().st_size / (1 << 20),
-            )
+            try:
+                size_bytes = p.stat().st_size
+                logger.info(
+                    "[prs]  fingerprinting %s (%.1f MiB, on disk)",
+                    p,
+                    size_bytes / (1 << 20),
+                )
+            except FileNotFoundError:
+                logger.info("[prs]  fingerprinting %s (from sidecar)", p)
         t0 = time.time()
         files.append(_file_stat_fingerprint(p, logger=logger, label=p.name))
         if logger is not None:
@@ -1285,10 +1321,98 @@ def _cohort_person_ids(cohort_csv: Path) -> pd.Series:
 
 
 def _resolve_microarray_bed() -> Path:
+    """Return an `arrays.bed` path without ever downloading.
+
+    The pipeline does not need the multi-GB AoU PLINK triple on disk when
+    PRS scoring outputs are already cached. As long as either the file
+    itself or its `.sha256` sidecar is present locally, fingerprinting and
+    cache lookups can run without the bed. If neither is available the
+    caller must fix the cache (or call `resolve_aou_genotypes` directly to
+    materialise the triple)."""
     hit = discover_genotype_dir([Path.home(), REPO_ROOT / "genomes"])
     if hit is not None:
         return hit / "arrays.bed"
-    return resolve_aou_genotypes(cache_dir=GENOTYPE_CACHE_DIR)
+    cache = Path(GENOTYPE_CACHE_DIR)
+    missing: list[str] = []
+    for fname in ("arrays.bed", "arrays.bim", "arrays.fam"):
+        f = cache / fname
+        sidecar = f.with_suffix(f.suffix + ".sha256")
+        if (f.is_file() and f.stat().st_size > 0) or sidecar.is_file():
+            continue
+        missing.append(fname)
+    if missing:
+        raise FileNotFoundError(
+            "AoU microarray cache is incomplete and the pipeline never "
+            "auto-downloads the bed. Missing both file and .sha256 "
+            f"sidecar for: {missing} in {cache}. Either let the workspace "
+            "bucket populate the sidecars (a prior successful run does "
+            "this automatically) or call resolve_aou_genotypes(cache_dir="
+            f"{str(cache)!r}) manually to materialise the triple."
+        )
+    return cache / "arrays.bed"
+
+
+# Workspace-cache namespace for the three tiny .sha256 sidecars that let us
+# fingerprint the AoU microarray triple without keeping the multi-GB
+# arrays.bed locally between runs.
+_GENOTYPE_SIDECAR_PREFIX = "genotype_sidecars"
+
+
+def _genotype_sidecar_remote(fname: str) -> str:
+    return f"{_GENOTYPE_SIDECAR_PREFIX}/{fname}.sha256"
+
+
+def _genotype_sidecar_local(fname: str) -> Path:
+    return Path(GENOTYPE_CACHE_DIR) / (fname + ".sha256")
+
+
+def _sync_genotype_sidecars_from_workspace(
+    cache: Optional[WorkspaceCache],
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Pull tiny `.sha256` sidecars for arrays.{bed,bim,fam} from the
+    workspace bucket into the local genotype cache so subsequent fingerprint
+    computations can succeed without the underlying multi-GB files."""
+    if cache is None:
+        return
+    Path(GENOTYPE_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+    for fname in ("arrays.bed", "arrays.bim", "arrays.fam"):
+        local = _genotype_sidecar_local(fname)
+        if local.is_file() and local.stat().st_size > 0:
+            continue
+        remote = _genotype_sidecar_remote(fname)
+        try:
+            cache.fetch(remote, local)
+        except Exception as exc:
+            if logger is not None:
+                logger.info(
+                    "[prs] genotype sidecar fetch skipped %s (%s)", remote, exc
+                )
+            continue
+        if logger is not None and local.is_file() and local.stat().st_size > 0:
+            logger.info("[prs] pulled genotype sidecar %s", local)
+
+
+def _push_genotype_sidecars_to_workspace(
+    cache: Optional[WorkspaceCache],
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Upload local `.sha256` sidecars for arrays.{bed,bim,fam} so future
+    VMs can skip the bed download entirely on cache hits."""
+    if cache is None:
+        return
+    for fname in ("arrays.bed", "arrays.bim", "arrays.fam"):
+        local = _genotype_sidecar_local(fname)
+        if not local.is_file() or local.stat().st_size == 0:
+            continue
+        remote = _genotype_sidecar_remote(fname)
+        try:
+            cache.store(local, remote)
+        except Exception as exc:
+            if logger is not None:
+                logger.info(
+                    "[prs] genotype sidecar push skipped %s (%s)", remote, exc
+                )
 
 
 def _cohort_scores_from_gnomon_scores(
@@ -1602,6 +1726,22 @@ def _build_prs_panel(
         cache, out_dir, fingerprint, person_ids, logger
     )
     if scores is None:
+        prefix = bed.with_suffix("")
+        missing_files = [
+            str(prefix.with_suffix(suffix))
+            for suffix in (".bed", ".bim", ".fam")
+            if not prefix.with_suffix(suffix).is_file()
+            or prefix.with_suffix(suffix).stat().st_size == 0
+        ]
+        if missing_files:
+            raise FileNotFoundError(
+                "PRS scoring cache miss and the AoU microarray PLINK triple "
+                f"is not present on disk: {missing_files}. The pipeline "
+                "does not auto-download the bed; either populate the "
+                "workspace-bucket PRS cache (so the cache lookup hits) or "
+                "call resolve_aou_genotypes() manually to materialise the "
+                "triple."
+            )
         logger.info(
             "[prs] scoring AoU microarray genotypes bed=%s cohort_ids=%d score_files=%d",
             bed,
@@ -1672,6 +1812,11 @@ def _load_or_build_prs_panel(
     person_ids: Sequence[str],
     logger: logging.Logger,
 ) -> tuple[pd.DataFrame, str]:
+    # Pull tiny .sha256 sidecars for arrays.{bed,bim,fam} so we can
+    # fingerprint the AoU PLINK triple without keeping the multi-GB bed on
+    # disk: if the PRS panel is already cached in the workspace bucket the
+    # cache lookup below succeeds and the bed is never touched.
+    _sync_genotype_sidecars_from_workspace(cache, logger)
     bed = _resolve_microarray_bed()
     panel_dir = Path(DEFAULT_CACHE_DIR) / PGS_PANEL_DIRNAME
     panel_dir.mkdir(parents=True, exist_ok=True)
@@ -1700,6 +1845,10 @@ def _load_or_build_prs_panel(
     fingerprint = _prs_panel_fingerprint(
         bed, score_files, person_ids, logger=logger
     )
+    # Mirror the freshly-computed .sha256 sidecars to the workspace bucket so
+    # future VMs (without arrays.bed on disk) can replay the fingerprint and
+    # hit this very cache entry without re-downloading the bed.
+    _push_genotype_sidecars_to_workspace(cache, logger)
     filename = "aou-prs-panel-" + _short_hash(fingerprint) + ".csv.gz"
     path = Path(DEFAULT_CACHE_DIR) / PRS_PANEL_CACHE_DIRNAME / filename
     remote_name = f"{PRS_PANEL_CACHE_DIRNAME}/{filename}"
