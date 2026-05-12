@@ -340,10 +340,21 @@ where $G^{(m)}$ is a sampled DAG. These posterior edge probabilities are used to
 \subsection{Gamfit Survival GAM (Have Scott take a look)}
 After graph learning, we use the posterior parent sets for the T2D node as inputs to a survival generalized additive model (GAM). This stage is used for individual-level time-to-event prediction, not for the local graph score used during DAGSLAM or MCMC. During graph search, the survival node is scored as a fixed-horizon IPCW-weighted binary endpoint; after graph learning, \texttt{gamfit} fits a richer right-censored survival model to estimate individual survival curves.
 
-The \texttt{gamfit} Python library was created to implement this survival model in Python, as existing Python GAM libraries do not have support for survival modeling or serious uncertainty quantification. The fitted model is a right-censored location-scale GAMLSS survival model. In a location-scale survival model, covariates can affect the location component of the survival distribution, while the scale or noise component is modeled separately. In our implementation, the default location formula uses the selected parent variables as predictors, while the default noise formula is intercept-only:
+The \texttt{gamfit} Python library was created to implement this survival model in Python, as existing Python GAM libraries do not have support for survival modeling or serious uncertainty quantification. The fitted model is a right-censored location--scale GAMLSS with a Gompertz--Makeham baseline cumulative hazard,
 \[
-\texttt{Surv(entry, exit, event)} \sim s(x_1) + s(x_2) + \cdots + s(x_m).
+H_0(t) \;=\; \alpha\,t \;+\; \frac{\lambda}{\gamma}\!\left(e^{\gamma t}-1\right),
 \]
+whose free parameters $\alpha,\lambda,\gamma > 0$ are estimated jointly with the smooth terms. Each of the $m$ parent covariates in $x$ contributes two penalized cubic B-spline smooths -- one to a location predictor $\eta_\mu$ and one to a scale predictor $\eta_\sigma$,
+\[
+\eta_\mu(x) \;=\; \sum_{j=1}^{m} f_{j}^{(\mu)}(x_j),
+\qquad
+\eta_\sigma(x) \;=\; \sum_{j=1}^{m} f_{j}^{(\sigma)}(x_j),
+\]
+each built on a $k=5$ cubic B-spline basis with a second-difference penalty whose smoothing parameter is selected by REML. The conditional survival function composes the baseline cumulative hazard with a location--scale shift,
+\[
+S(t \mid x) \;=\; \bar{F}\!\left(\,H_0(t) - \eta_\mu(x)\,e^{-\eta_\sigma(x)}\,\right),
+\]
+where $\bar{F}=1-F$ is the survival function of a fixed parametric residual distribution and start--stop data \texttt{Surv(entry, exit, event)} contribute their left-truncation correction through $H_0(\texttt{entry})$.
 
 The data are represented using start-stop survival notation. Each subject has an entry time, an exit time, and an event indicator. The implementation uses a fixed artificial entry origin and sets
 \[
